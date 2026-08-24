@@ -1,0 +1,149 @@
+{
+	"name": "active-ts",
+	"version": "0.1.0",
+	"description": "Active Record inspired TypeScript ORM with pluggable stores, cache, search, and lazy relations.",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/seo-rii/active-ts.git"
+	},
+	"bugs": {
+		"url": "https://github.com/seo-rii/active-ts/issues"
+	},
+	"homepage": "https://github.com/seo-rii/active-ts#readme",
+	"type": "module",
+	"main": "./build/src/index.js",
+	"types": "./build/src/index.d.ts",
+	"bin": {
+		"active-ts": "./build/src/cli.js"
+	},
+	"exports": {
+		".": {
+			"types": "./build/src/index.d.ts",
+			"import": "./build/src/index.js"
+		},
+		"./adapters/store/datastore": {
+			"types": "./build/src/adapters/store/datastore.d.ts",
+			"import": "./build/src/adapters/store/datastore.js"
+		},
+		"./adapters/store/firestore": {
+			"types": "./build/src/adapters/store/firestore.d.ts",
+			"import": "./build/src/adapters/store/firestore.js"
+		},
+		"./adapters/store/memory": {
+			"types": "./build/src/adapters/store/memory.d.ts",
+			"import": "./build/src/adapters/store/memory.js"
+		},
+		"./adapters/store/mongodb": {
+			"types": "./build/src/adapters/store/mongodb.d.ts",
+			"import": "./build/src/adapters/store/mongodb.js"
+		},
+		"./adapters/store/postgresql": {
+			"types": "./build/src/adapters/store/postgresql.d.ts",
+			"import": "./build/src/adapters/store/postgresql.js"
+		},
+		"./adapters/cache/memory": {
+			"types": "./build/src/adapters/cache/memory.d.ts",
+			"import": "./build/src/adapters/cache/memory.js"
+		},
+		"./adapters/cache/redis-valkey": {
+			"types": "./build/src/adapters/cache/redis-valkey.d.ts",
+			"import": "./build/src/adapters/cache/redis-valkey.js"
+		},
+		"./adapters/search/algolia": {
+			"types": "./build/src/adapters/search/algolia.d.ts",
+			"import": "./build/src/adapters/search/algolia.js"
+		},
+		"./adapters/search/elasticsearch": {
+			"types": "./build/src/adapters/search/elasticsearch.d.ts",
+			"import": "./build/src/adapters/search/elasticsearch.js"
+		},
+		"./adapters/search/memory": {
+			"types": "./build/src/adapters/search/memory.d.ts",
+			"import": "./build/src/adapters/search/memory.js"
+		},
+		"./adapters/search/native": {
+			"types": "./build/src/adapters/search/native.d.ts",
+			"import": "./build/src/adapters/search/native.js"
+		},
+		"./testing": {
+			"types": "./build/src/testing/index.d.ts",
+			"import": "./build/src/testing/index.js"
+		}
+	},
+	"files": [
+		"build/src",
+		"src",
+		"docs/adapters.md",
+		"docs/concepts.md",
+		"docs/extensions.md",
+		"docs/plugins.md",
+		"docs/quickstart.md",
+		"docs/security.md",
+		"docs/testing.md",
+		"README.md",
+		"LICENSE",
+		"CONTRIBUTING.md",
+		"SECURITY.md"
+	],
+	"scripts": {
+		"prepack": "pnpm build",
+		"build": "tsc -p tsconfig.json",
+		"typecheck": "tsc -p tsconfig.json --noEmit",
+		"audit": "pnpm audit --audit-level moderate",
+		"test": "pnpm build && node --test build/test/*.test.js",
+		"test:integration:backends": "pnpm build && node test/integration/backend-smoke.mjs",
+		"pack:smoke": "pnpm build && node test/pack-smoke.mjs",
+		"lint": "tsc -p tsconfig.json --noEmit"
+	},
+	"peerDependencies": {
+		"@elastic/elasticsearch": "^8.0.0 || ^9.0.0",
+		"@google-cloud/datastore": "^10.0.0",
+		"@google-cloud/firestore": "^8.0.0",
+		"algoliasearch": "^5.0.0",
+		"mongodb": "^7.0.0",
+		"pg": "^8.0.0",
+		"redis": "^5.0.0",
+		"typia": "^12.0.0"
+	},
+	"peerDependenciesMeta": {
+		"@elastic/elasticsearch": {
+			"optional": true
+		},
+		"@google-cloud/datastore": {
+			"optional": true
+		},
+		"@google-cloud/firestore": {
+			"optional": true
+		},
+		"algoliasearch": {
+			"optional": true
+		},
+		"mongodb": {
+			"optional": true
+		},
+		"pg": {
+			"optional": true
+		},
+		"redis": {
+			"optional": true
+		},
+		"typia": {
+			"optional": true
+		}
+	},
+	"devDependencies": {
+		"@elastic/elasticsearch": "^8.19.1",
+		"@types/node": "^22.19.19",
+		"@types/pg-format": "^1.0.5",
+		"typescript": "^5.9.3"
+	},
+	"engines": {
+		"node": ">=22"
+	},
+	"packageManager": "pnpm@11.13.0",
+	"dependencies": {
+		"escape-string-regexp": "^5.0.0",
+		"pg-format": "^1.0.4"
+	}
+}

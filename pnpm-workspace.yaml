@@ -1,0 +1,9 @@
+allowBuilds:
+  protobufjs: true
+
+overrides:
+  '@grpc/grpc-js': 1.14.4
+  '@opentelemetry/core': 2.8.0
+  brace-expansion: 2.1.4
+  protobufjs: 7.6.5
+  undici: 7.29.0

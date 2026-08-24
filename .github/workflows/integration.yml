@@ -1,0 +1,160 @@
+name: Backend Integration
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/adapters/**'
+      - 'src/core/**'
+      - 'src/testing/**'
+      - 'test/integration/**'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - '.github/workflows/integration.yml'
+      - '.github/workflows/release.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/adapters/**'
+      - 'src/core/**'
+      - 'src/testing/**'
+      - 'test/integration/**'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - '.github/workflows/integration.yml'
+      - '.github/workflows/release.yml'
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  backend-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16@sha256:ab47a724d0e37131ac950b98ff2beeb3fdb3bfcc592d73c6cc4b4e7626649671
+        env:
+          POSTGRES_DB: active_ts
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d active_ts"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      mongodb:
+        image: mongo:7@sha256:948b635bc126d62274eebb650dd2e2e66c9abc3bb0a336eb2279a5d8489417f5
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ ping: 1 }).ok'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7@sha256:33d7c9a245edd95e6703a0addbeaa48fe40c3b3b4783627a72085155462ebfdb
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      elasticsearch:
+        image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3@sha256:01c1732062b4a846c5ca687b0094b89bad0bfed00c6d71626db32fb8f3131a78
+        env:
+          discovery.type: single-node
+          xpack.security.enabled: false
+          ES_JAVA_OPTS: -Xms512m -Xmx512m
+        ports:
+          - 9200:9200
+        options: >-
+          --health-cmd "curl -fsS http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=1s"
+          --health-interval 15s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/active_ts
+      MONGODB_URL: mongodb://127.0.0.1:27017
+      REDIS_URL: redis://127.0.0.1:6379
+      ELASTICSEARCH_URL: http://127.0.0.1:9200
+      DATASTORE_EMULATOR_HOST: 127.0.0.1:8081
+      FIRESTORE_EMULATOR_HOST: 127.0.0.1:8082
+      GOOGLE_CLOUD_PROJECT: active-ts-emulator
+      GCLOUD_PROJECT: active-ts-emulator
+      ACTIVE_TS_INTEGRATION_TARGETS: postgres,mongodb,redis,elasticsearch,datastore,firestore
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 11.13.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+        with:
+          version: 505.0.0
+          install_components: beta,cloud-datastore-emulator,cloud-firestore-emulator
+      - run: pnpm install --frozen-lockfile
+      - name: Start Google Cloud emulators
+        run: |
+          gcloud config set project "$GOOGLE_CLOUD_PROJECT"
+          gcloud beta emulators datastore start --project="$GOOGLE_CLOUD_PROJECT" --host-port="$DATASTORE_EMULATOR_HOST" --no-store-on-disk --consistency=1.0 > "$RUNNER_TEMP/datastore-emulator.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/datastore-emulator.pid"
+          gcloud emulators firestore start --project="$GOOGLE_CLOUD_PROJECT" --host-port="$FIRESTORE_EMULATOR_HOST" > "$RUNNER_TEMP/firestore-emulator.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/firestore-emulator.pid"
+          node --input-type=module <<'NODE'
+          import { Datastore } from '@google-cloud/datastore';
+          import { Firestore } from '@google-cloud/firestore';
+
+          const projectId = process.env.GOOGLE_CLOUD_PROJECT;
+
+          async function waitFor(name, probe) {
+            let lastError;
+            for (let attempt = 1; attempt <= 60; attempt++) {
+              try {
+                await probe();
+                return;
+              } catch (error) {
+                lastError = error;
+                await new Promise((resolve) => setTimeout(resolve, 1000));
+              }
+            }
+            throw new Error(`${name} emulator did not become ready: ${lastError?.message ?? lastError}`);
+          }
+
+          const datastore = new Datastore({ projectId });
+          const datastoreKey = datastore.key({
+            namespace: 'active_ts_readiness',
+            path: ['readiness', 'probe']
+          });
+          await waitFor('Datastore', async () => {
+            await datastore.save({ key: datastoreKey, data: { ok: true } });
+            const [entity] = await datastore.get(datastoreKey);
+            if (!entity?.ok) throw new Error('Datastore probe read failed');
+            await datastore.delete(datastoreKey);
+          });
+
+          const firestore = new Firestore({ projectId });
+          try {
+            const ref = firestore.collection('active_ts_readiness').doc('probe');
+            await waitFor('Firestore', async () => {
+              await ref.set({ ok: true });
+              const snap = await ref.get();
+              if (!snap.exists || snap.data()?.ok !== true) throw new Error('Firestore probe read failed');
+              await ref.delete();
+            });
+          } finally {
+            await firestore.terminate();
+          }
+          NODE
+      - run: pnpm test:integration:backends
