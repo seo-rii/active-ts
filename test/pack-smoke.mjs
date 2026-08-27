@@ -19,6 +19,7 @@ const PUBLIC_ROOT_RUNTIME_EXPORTS = [
 	'ActiveTsConflictError',
 	'ActiveTsError',
 	'ActiveTsNotFoundError',
+	'ActiveTsUnknownTransactionOutcomeError',
 	'ActiveTsValidationError',
 	'FindBuilder',
 	'LazyRef',
@@ -57,6 +58,8 @@ const PUBLIC_ROOT_RUNTIME_EXPORTS = [
 	'createStoreMiddlewareAdapter',
 	'cursorValues',
 	'datastoreAncestorOptions',
+	'datastoreInt64Id',
+	'datastoreInt64IdValue',
 	'datastoreKey',
 	'datastoreReadOptions',
 	'datastoreSearchDocumentIdentity',
@@ -82,6 +85,7 @@ const PUBLIC_ROOT_RUNTIME_EXPORTS = [
 	'isContextBoundCacheAdapter',
 	'isContextBoundSearchAdapter',
 	'isContextBoundStoreAdapter',
+	'isDatastoreInt64Id',
 	'isPartialModel',
 	'markSearchDocumentIdentity',
 	'mergeHooks',
@@ -120,10 +124,13 @@ const PUBLIC_SUBPATH_SMOKE_EXPORTS = {
 		'createDatastoreIndexYaml',
 		'createDatastoreNamespaceStoreFactory',
 		'createDatastoreStoreAdapter',
+		'datastoreInt64Id',
+		'datastoreInt64IdValue',
 		'datastoreModelTransactionOptions',
 		'datastoreStoreTransactionOptions',
 		'datastoreTransactionOptions',
-		'inventoryDatastoreIds'
+		'inventoryDatastoreIds',
+		'isDatastoreInt64Id'
 	],
 	'./adapters/store/firestore': ['createFirestoreStoreAdapter'],
 	'./adapters/store/memory': ['MemoryStoreAdapter'],
@@ -201,6 +208,38 @@ try {
 		);
 	}
 	await writeFile(
+		path.join(installDir, 'no-peer-runtime-smoke.mjs'),
+		`
+import assert from 'node:assert/strict';
+
+const specifiers = ${JSON.stringify(['active-ts', ...Object.keys(installedPublicSubpathSmokeExports())])};
+for (const specifier of specifiers) {
+  const module = await import(specifier);
+  assert.equal(typeof module, 'object', specifier + ' must load without optional peers installed');
+}
+`
+	);
+	await exec('node', ['no-peer-runtime-smoke.mjs'], { cwd: installDir });
+	const mongodbPackageJson = JSON.parse(
+		await readFile(path.join(root, 'node_modules', 'mongodb', 'package.json'), 'utf8')
+	);
+	await exec(
+		'npm',
+		['install', '--ignore-scripts', '--save-dev', `mongodb@${mongodbPackageJson.version}`],
+		{ cwd: installDir }
+	);
+	await writeFile(
+		path.join(installDir, 'require-smoke.cjs'),
+		"require('active-ts');\n"
+	);
+	await assert.rejects(
+		exec('node', ['require-smoke.cjs'], { cwd: installDir }),
+		(error) =>
+			typeof error?.stderr === 'string' &&
+			error.stderr.includes('ERR_PACKAGE_PATH_NOT_EXPORTED'),
+		'CommonJS require() must remain outside the ESM-only package contract'
+	);
+	await writeFile(
 		path.join(installDir, 'tsconfig.json'),
 		JSON.stringify(
 			{
@@ -224,6 +263,7 @@ try {
 		`
 import {
 	ActiveFunctionCache,
+	ActiveTsUnknownTransactionOutcomeError,
 	createAesGcmCacheCodec,
 	createActiveTs,
 	createCacheMiddlewareAdapter,
@@ -234,6 +274,8 @@ import {
 	createSoftDeletePlugin,
 	createStoreMiddlewareAdapter,
 	datastoreAncestorOptions,
+	datastoreInt64Id,
+	datastoreInt64IdValue,
 	datastoreReadOptions,
 	datastoreKey,
 	datastoreSearchDocumentIdentity,
@@ -243,6 +285,7 @@ import {
 	fromValibot,
 	fromZod,
 	getFunctionCacheDiagnostics,
+	isDatastoreInt64Id,
 	markSearchDocumentIdentity,
 	normalizeOutboxEvent,
 	MemoryCacheAdapter,
@@ -258,6 +301,7 @@ import {
 	type DatastoreAncestorReadOptions,
 	type DatastoreAncestorResolver,
 	type DatastoreAncestorWriteOptions,
+	type DatastoreInt64Id,
 	type DatastoreReadOptions,
 	type DatastoreReadPolicy,
 	type DatastoreKey,
@@ -316,17 +360,26 @@ import {
 	withTestContext
 } from 'active-ts/testing';
 import { createPostgresStoreAdapter, type PostgresStoreOptions } from 'active-ts/adapters/store/postgresql';
-import type { MongoStoreOptions } from 'active-ts/adapters/store/mongodb';
+import {
+	createMongoStoreAdapter,
+	type MongoStoreAdapter,
+	type MongoStoreOptions,
+	type MongoStoreTransactionOptions,
+	type MongoTransactionNativeOptions
+} from 'active-ts/adapters/store/mongodb';
 import {
 	applyDatastoreIdRepairManifest,
 	createDatastoreIdRepairManifest,
 	createDatastoreIndexYaml,
 	createDatastoreNamespaceStoreFactory,
 	createDatastoreStoreAdapter,
+	datastoreInt64Id as datastoreSubpathInt64Id,
+	datastoreInt64IdValue as datastoreSubpathInt64IdValue,
 	datastoreModelTransactionOptions,
 	datastoreStoreTransactionOptions,
 	datastoreTransactionOptions,
 	inventoryDatastoreIds,
+	isDatastoreInt64Id as isDatastoreSubpathInt64Id,
 	type DatastoreBulkDeleteEntry,
 	type DatastoreBulkMutationOptions,
 	type DatastoreBulkOperations,
@@ -340,6 +393,7 @@ import {
 	type DatastoreIdRepairManifest,
 	type DatastoreIdRepairPlanOptions,
 	type DatastoreIdRepairPolicy,
+	type DatastoreInt64Id as DatastoreSubpathInt64Id,
 	type DatastoreKeyEncoding,
 	type DatastoreModelTransactionOptions,
 	type DatastoreNamespaceStoreFactory,
@@ -361,6 +415,12 @@ class PackedUser extends Model<PackedUserData> {}
 class PackedComment extends Model<PackedCommentData> {}
 
 const packedParentKey: DatastoreKey = datastoreKey('packed_parent', 10);
+const packedInt64Id: DatastoreInt64Id = datastoreInt64Id('9223372036854775807');
+const packedSubpathInt64Id: DatastoreSubpathInt64Id = datastoreSubpathInt64Id('-9223372036854775808');
+const packedInt64Decimal: string = datastoreInt64IdValue(packedInt64Id);
+const packedSubpathInt64Decimal: string = datastoreSubpathInt64IdValue(packedSubpathInt64Id);
+const packedInt64Check: boolean = isDatastoreInt64Id(packedSubpathInt64Id);
+const packedSubpathInt64Check: boolean = isDatastoreSubpathInt64Id(packedInt64Id);
 const packedCommentAncestor: DatastoreAncestorResolver<PackedCommentData> = ({ data }) =>
 	data ? datastoreKey('packed_parent', data.parentId) : packedParentKey;
 const packedCommentDatastore = {
@@ -378,6 +438,7 @@ const packedResolvedAncestor: DatastoreKey | undefined = packedCommentAncestor(p
 defineModel<PackedUserData>('packed_user')
   .id('id')
   .validate((input) => input as PackedUserData)
+  .fieldType('name', 'string')
   .attach(PackedUser);
 
 defineModel<PackedCommentData>({ name: 'packed_comment', store: 'datastore', search: 'memory' })
@@ -506,9 +567,31 @@ const searchSyncOptions: SearchSyncWorkerOptions = {
 	outbox: outboxAdapter,
 	search: customSearchAdapter,
 	models: [PackedUser],
-	context,
 	allowUnsafeDrainFallback: false
 };
+const broadLeaseSearchSyncOptions: SearchSyncWorkerOptions = {
+	outbox: storeOutbox,
+	search: customSearchAdapter,
+	models: [PackedUser]
+};
+const memorySearchSyncOptions: SearchSyncWorkerOptions<typeof memoryOutbox> = {
+	outbox: memoryOutbox,
+	search: customSearchAdapter,
+	models: [PackedUser]
+};
+const storeSearchSyncOptions: SearchSyncWorkerOptions<typeof storeOutboxInstance> = {
+	outbox: storeOutboxInstance,
+	search: customSearchAdapter,
+	models: [PackedUser],
+	context
+};
+const storeSearchSyncWithoutContext = {
+	outbox: storeOutboxInstance,
+	search: customSearchAdapter,
+	models: [PackedUser]
+};
+// @ts-expect-error Concrete lease outboxes require context for durable repair reconciliation.
+const invalidStoreSearchSyncOptions: SearchSyncWorkerOptions<typeof storeOutboxInstance> = storeSearchSyncWithoutContext;
 const softDeleteOptions: SoftDeleteOptions = { field: 'deletedAt', materializedNulls: true };
 const softDeletePlugin: ActiveTsPlugin = createSoftDeletePlugin(softDeleteOptions);
 const softDeleteHelper: typeof softDelete = softDelete;
@@ -554,7 +637,38 @@ const integrationContextHandle: IntegrationHarnessContextHandle = await createdI
 await integrationContextHandle.close();
 await createdIntegrationHarness.runStoreContract(storeContractOptions);
 const postgresOptions = { connectionString: 'postgres://localhost/active_ts' } satisfies PostgresStoreOptions;
-const mongoOptions = { dbName: 'active_ts', allowAggregateScanFallback: true } satisfies MongoStoreOptions;
+const mongoOptions = {
+	dbName: 'active_ts',
+	cacheScope: 'mongodb|cluster=primary|db=active_ts',
+	allowAggregateScanFallback: true
+} satisfies MongoStoreOptions;
+const mongoTransactionNativeOptions = {
+	readConcern: { level: 'snapshot' },
+	writeConcern: { w: 'majority' },
+	readPreference: 'primary',
+	maxCommitTimeMS: 1_000
+} satisfies MongoTransactionNativeOptions;
+const mongoTransactionOptions = {
+	readOnly: false,
+	timeoutMs: 2_000,
+	native: mongoTransactionNativeOptions
+} satisfies MongoStoreTransactionOptions;
+declare const packedMongoStore: Awaited<ReturnType<typeof createMongoStoreAdapter>>;
+const packedTypedMongoStore: MongoStoreAdapter = packedMongoStore;
+const packedGenericMongoStore: StoreAdapter = packedMongoStore;
+const packedMongoTransaction = packedMongoStore.transaction?.(async (transactionStore) => {
+	const genericTransactionStore: StoreAdapter = transactionStore;
+	return genericTransactionStore.kind;
+}, mongoTransactionOptions);
+// @ts-expect-error MongoDB does not accept the portable isolation option.
+packedMongoStore.transaction?.(async () => undefined, { isolation: 'serializable' });
+// @ts-expect-error MongoDB driver transaction options reject unknown read-concern levels.
+packedMongoStore.transaction?.(async () => undefined, { native: { readConcern: { level: 'invalid' } } });
+// @ts-expect-error MongoDB transaction native options reject unrelated client options.
+packedMongoStore.transaction?.(async () => undefined, { native: { retryWrites: true } });
+declare const packedUnknownOutcome: ActiveTsUnknownTransactionOutcomeError;
+const packedUnknownOutcomeValue: 'unknown' = packedUnknownOutcome.outcome;
+const packedUnknownOutcomePhase: 'commit' | 'abort' = packedUnknownOutcome.phase;
 const datastoreOptions = {
 	namespace: 'active-ts',
 	keyEncoding: 'native',
@@ -746,12 +860,23 @@ void createdIntegrationHarness;
 void integrationContextHandle;
 void postgresOptions;
 void mongoOptions;
+void packedTypedMongoStore;
+void packedGenericMongoStore;
+void packedMongoTransaction;
+void packedUnknownOutcomeValue;
+void packedUnknownOutcomePhase;
 void datastoreOptions;
 void datastoreNamespaceFactoryOptions;
 void datastoreNamespaceFactoryPromise;
 void packedNamespaceStorePromise;
 void invalidDatastoreNamespaceFactoryOptions;
 void datastoreKeyEncoding;
+void packedInt64Id;
+void packedSubpathInt64Id;
+void packedInt64Decimal;
+void packedSubpathInt64Decimal;
+void packedInt64Check;
+void packedSubpathInt64Check;
 void packedParentKey;
 void packedAncestorOptions;
 void packedAncestorReadOptions;
@@ -782,14 +907,27 @@ void elasticsearchOptions;
 		`
 import assert from 'node:assert/strict';
 import * as activeTs from 'active-ts';
-import { createActiveTs, datastoreKey, datastoreReadOptions, defineModel, MemoryStoreAdapter, Model } from 'active-ts';
+import {
+  createActiveTs,
+  datastoreInt64Id,
+  datastoreInt64IdValue,
+  datastoreKey,
+  datastoreReadOptions,
+  defineModel,
+  isDatastoreInt64Id,
+  MemoryStoreAdapter,
+  Model
+} from 'active-ts';
 import { createTestContext } from 'active-ts/testing';
 import {
   createDatastoreIdRepairManifest,
   createDatastoreIndexYaml,
   createDatastoreNamespaceStoreFactory,
   createDatastoreStoreAdapter,
-  inventoryDatastoreIds
+  datastoreInt64Id as datastoreSubpathInt64Id,
+  datastoreInt64IdValue as datastoreSubpathInt64IdValue,
+  inventoryDatastoreIds,
+  isDatastoreInt64Id as isDatastoreSubpathInt64Id
 } from 'active-ts/adapters/store/datastore';
 import { createPostgresStoreAdapter } from 'active-ts/adapters/store/postgresql';
 import { createRedisValkeyCacheAdapter } from 'active-ts/adapters/cache/redis-valkey';
@@ -804,7 +942,15 @@ class PackedComment extends Model {}
 defineModel('packed_user')
   .id('id')
   .validate((input) => input)
+  .fieldType('name', 'string')
   .attach(PackedUser);
+
+const packedInt64Id = datastoreInt64Id('9223372036854775807');
+const packedSubpathInt64Id = datastoreSubpathInt64Id('-9223372036854775808');
+assert.equal(isDatastoreInt64Id(packedInt64Id), true);
+assert.equal(isDatastoreSubpathInt64Id(packedSubpathInt64Id), true);
+assert.equal(datastoreInt64IdValue(packedInt64Id), '9223372036854775807');
+assert.equal(datastoreSubpathInt64IdValue(packedSubpathInt64Id), '-9223372036854775808');
 
 defineModel({ name: 'packed_comment', store: 'datastore' })
   .id('id')
@@ -977,7 +1123,7 @@ assert.deepEqual(packedDatastoreBulkDeletes[0][0].input, {
   namespace: 'packed'
 });
 const packedDatastorePage = await injectedDatastoreStore.query(context.meta(PackedUser), {
-  where: [{ field: 'profile.city', op: '=', value: 'Seoul' }],
+  where: [{ field: 'name', op: '=', value: 'packed' }],
   or: [],
   sort: [],
   include: [],
@@ -989,7 +1135,7 @@ assert.equal(typeof packedDatastorePage.cursor, 'string');
 assert.deepEqual(packedDatastorePage.list, [{ id: 1, profile: { city: 'Seoul' } }]);
 packedDatastoreResponse = [[], { moreResults: 'NO_MORE_RESULTS' }];
 const packedDatastoreNextPage = await injectedDatastoreStore.query(context.meta(PackedUser), {
-  where: [{ field: 'profile.city', op: '=', value: 'Seoul' }],
+  where: [{ field: 'name', op: '=', value: 'packed' }],
   or: [],
   sort: [],
   include: [],
@@ -999,8 +1145,8 @@ const packedDatastoreNextPage = await injectedDatastoreStore.query(context.meta(
 });
 assert.equal(packedDatastoreNextPage.more, false);
 assert.deepEqual(packedDatastoreFilters, [
-  { field: 'profile.city', operator: '=', value: 'Seoul' },
-  { field: 'profile.city', operator: '=', value: 'Seoul' }
+  { field: 'name', operator: '=', value: 'packed' },
+  { field: 'name', operator: '=', value: 'packed' }
 ]);
 assert.deepEqual(packedDatastoreStarts, ['packed-sdk-cursor']);
 await injectedDatastoreStore.query(context.meta(PackedUser), {

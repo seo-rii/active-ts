@@ -158,9 +158,26 @@ Native encoding preserves the ID type in every root and ancestor key segment.
 Thus number `17`, string `"17"`, and string `"number:17"` address three distinct
 Datastore keys. Returned SDK keys are decoded from their `id` versus `name`
 fields, and transactions use the same encoding as their parent adapter.
-Numeric native IDs must be positive because Datastore reserves numeric ID `0`
-for incomplete keys. Payload IDs must use the same string or number type as
-their physical key.
+Numeric native IDs must be nonzero because Datastore reserves numeric ID `0`
+for incomplete keys. Negative IDs round-trip for legacy data, but Google
+discourages them and warns that future support is not guaranteed. Safe integers
+use JavaScript numbers. For a signed 64-bit numeric ID outside JavaScript's
+safe-integer range, use the opaque branded value returned by
+`datastoreInt64Id()` in payload IDs, direct reads, query operands, bulk entries,
+and every ancestor segment:
+
+```ts doc-test=fragment
+import { datastoreInt64Id, datastoreInt64IdValue } from 'active-ts';
+
+const accountId = datastoreInt64Id('9223372036854775807');
+const decimal = datastoreInt64IdValue(accountId);
+```
+
+Do not construct or persist the reserved wrapper representation manually.
+`datastoreInt64Id()` accepts only canonical, nonzero signed int64 decimals that
+cannot be represented safely as a number, and native key construction requires
+the SDK client's `int()` helper. Payload IDs must use the same ID representation
+as their physical key.
 
 Before moving an existing kind to active-ts, inventory the SDK key `id`/`name`
 and the payload ID for every row. Legacy data may contain a numeric physical key
@@ -306,7 +323,11 @@ opaque and pass it back unchanged. A page that reports more results without an
 advancing SDK `endCursor` fails instead of returning a looping cursor. Cursor
 pagination is intentionally rejected for query scan fallback and buffered
 transaction queries because those paths merge or reorder rows outside one SDK
-query. Native query callbacks remain responsible for their own cursor format.
+query. The envelope's SHA-256 query fingerprint binds accidental reuse to the
+resolved project, database, namespace, model, query, read policy, and key
+encoding. It is a consistency check, not a keyed MAC or an authorization
+mechanism; do not treat cursor contents as authenticated application input.
+Native query callbacks remain responsible for their own cursor format.
 
 Existing page-number routes can use the portable `offset()` API during a
 migration:
@@ -385,6 +406,11 @@ const snapshot = await context.store('datastore').get(meta, 42, options);
 to the second SDK argument for `get()`, `runQuery()`, and
 `runAggregationQuery()`, including every query-scan fallback page and min/max
 probe. Reuse the same `readAt()` value when following a continuation cursor.
+Low-level `getMany()` calls with more than 1,000 unique IDs are split into SDK
+lookup chunks only inside a Datastore transaction or with an explicit
+`datastoreReadOptions({ readTime })`; otherwise they fail before backend access
+instead of combining rows from different snapshots. Multi-spec aggregate scan
+fallbacks likewise require a transaction or explicit `readTime`.
 Datastore transactions reject per-operation read policies because the SDK does
 not allow `readTime` or read consistency inside a transaction. Native query and
 aggregate callbacks also reject the high-level policy because active-ts cannot
@@ -483,7 +509,12 @@ Datastore can also partially apply the mutations within one failed
 non-transactional commit. Use `{ atomic: true }` when all mutations must commit
 together; it opens one Datastore transaction and cannot be combined with
 `chunkSize`. The whole transaction must remain within Datastore's transaction
-size and runtime limits.
+size and runtime limits. Before any SDK write, active-ts applies a defensive
+protobuf-size estimate with an 8 MiB request budget below Datastore's 10 MiB API
+request limit and the documented per-entity limit. Non-atomic batches split on
+that budget; an oversized atomic batch is rejected in full before its
+transaction starts. The estimate is intentionally conservative and does not
+replace backend limits.
 
 This is intentionally a raw adapter API. Its `data` is the encoded store
 representation, and it does not run model validation, field codecs, hooks,
@@ -498,10 +529,15 @@ and atomic mode follows the
 Entity caches also use the physical store identity. The Datastore adapter
 derives `StoreAdapter.cacheScope` from configured project, database, and
 namespace values. Native key encoding adds a distinct suffix while the default
-active-ts scope remains backward compatible. Injected clients are isolated with a random per-client
-identity and their own SDK namespace; active-ts does not call `getProjectId()`
-during adapter construction. Pass an explicit stable scope when separate
-injected client objects or process restarts should reuse the same cache keys:
+active-ts scope remains backward compatible. For an internally created SDK
+client, adapter construction awaits `client.getProjectId()`, so Application
+Default Credentials are bound to the resolved project in cache scopes and
+cursor fingerprints. An injected client is caller-owned and may implement that
+method with arbitrary work, so active-ts does not call it during registration;
+only an own `client.options.projectId` data property is used. If either project
+or database identity cannot be verified, injected clients receive a random
+per-client scope component. Pass an explicit stable scope when separate client
+objects or process restarts should reuse the same cache keys:
 
 ```ts doc-test=fragment
 const datastore = await createDatastoreStoreAdapter({
@@ -511,14 +547,13 @@ const datastore = await createDatastoreStoreAdapter({
 });
 ```
 
-The adapter snapshots an explicit synchronous SDK `options.projectId` as
-`StoreAdapter.datastoreProjectId`. `undefined` means the client did not expose a
-verifiable project identity; adapter construction never calls the asynchronous
-`getProjectId()` credential-discovery path. It also snapshots the SDK's
-synchronous `getDatabaseId()` as `StoreAdapter.datastoreDatabaseId`: `null`
-means the SDK default database and a string names an explicit database.
-`undefined` means an injected client or custom adapter did not expose a
-verifiable database identity.
+The resolved or explicitly configured project is exposed as
+`StoreAdapter.datastoreProjectId`; `undefined` means an injected client did not
+declare one. An internal SDK resolution failure or any invalid project ID fails
+adapter construction. The adapter also snapshots the SDK's synchronous
+`getDatabaseId()` as `StoreAdapter.datastoreDatabaseId`:
+`null` means the SDK default database and a string names an explicit database;
+`undefined` means the client did not expose a verifiable database identity.
 `StoreAdapter.datastoreKeyEncoding` similarly exposes `"active-ts"` or
 `"native"`. Context, transaction, savepoint, read-only, and middleware handles
 preserve all three values so migration integrations can verify the physical store
@@ -551,11 +586,58 @@ keep Datastore native function queries enabled and pass the transaction-scoped c
 read-only transactions reject native store reads because native callbacks can
 perform arbitrary SDK work. Datastore transaction `native` options may pass SDK
 call options with `gaxOptions`, `commitGaxOptions`, and `rollbackGaxOptions` for
-the SDK begin/commit/rollback calls. Datastore mode databases using
+the SDK begin/commit/rollback calls. `maxAttempts` opts into retrying `ABORTED`
+conflicts; `retryInitialDelayMs`, `retryMaxDelayMs`, and `retryJitter` control
+bounded exponential backoff with jitter. The transaction callback can run up to
+`maxAttempts` times, so it must be idempotent and must not perform irreversible
+external side effects unless the application deduplicates or defers them.
+Definitive commit rejections are returned as ordinary failures, while transport
+errors with an unknowable commit outcome fail closed as unknown outcomes.
+Datastore mode databases using
 `OPTIMISTIC_WITH_ENTITY_GROUPS` can set
 `requireAncestorTransactionQueries: true` on `createDatastoreStoreAdapter()` to
 reject transaction `query()` and `aggregate()` calls, including native callback
 plans, unless they carry `meta.datastoreAncestor`.
+
+MongoDB adapters expose active-ts transaction support when the client provides
+`startSession()`. All portable reads and writes receive the same MongoDB session,
+and active-ts serializes their driver calls because the MongoDB driver does not
+support parallel operations within one transaction. Transaction-scoped handles
+close after callback settlement, do not expose schema or nested transaction
+methods, and reject native query payloads so a callback cannot silently execute
+outside the session. Read-only transactions reject portable writes.
+
+Set `cacheScope` to an opaque, stable identity for the complete physical MongoDB
+store when multiple processes share a distributed entity cache. Include every
+boundary that can hold different rows for the same model name and id, such as
+cluster and database identity. active-ts does not derive this value from `url`
+because connection strings can contain credentials and aliases; adapters without
+an explicit scope can only use local cache ownership, and models configured for
+distributed cache consistency reject them. Empty scopes and scopes containing
+null bytes are rejected. Transaction-scoped MongoDB adapters preserve the parent
+scope.
+
+MongoDB does not map portable `isolation` levels and does not expose savepoints.
+`timeoutMs` becomes the session's client-side timeout and is also applied to
+commit and abort. `native` accepts MongoDB `readConcern`, `writeConcern`,
+`readPreference`, and `maxCommitTimeMS` transaction options. active-ts uses the
+MongoDB Core API rather than `withTransaction()`: it runs the application
+callback exactly once and invokes `commitTransaction()` once. MongoDB 7 may
+internally retry a retryable commit command; that driver behavior never reruns
+the application callback. Only an error carrying MongoDB's
+`UnknownTransactionCommitResult` label is exposed as
+`ActiveTsUnknownTransactionOutcomeError` with `phase === "commit"`,
+`outcome === "unknown"`, and the driver error in `cause`. It suppresses both
+commit and rollback hooks. `TransientTransactionError`, `NoSuchTransaction`,
+`WriteConflict`, and unlabeled commit failures use definitive rollback
+semantics. Applications must reconcile an unknown outcome rather than blindly
+retrying the unit of work.
+
+The MongoDB 7 driver retries one retryable abort command and normally suppresses
+abort command failures as required by the transactions specification. If an
+injected session implementation does reject `abortTransaction()`, active-ts
+reports `ActiveTsUnknownTransactionOutcomeError` with `phase === "abort"`.
+MongoDB transactions require a replica set or sharded cluster.
 
 Firestore adapters expose active-ts transaction support through
 `client.runTransaction()`. Transaction-scoped `get`, `getMany`, `query`,
@@ -621,7 +703,7 @@ const redisWithCodec = await createRedisValkeyCacheAdapter({
 Supported peer ranges:
 
 - `algoliasearch`: `^5.0.0`
-- `@elastic/elasticsearch`: `^8.0.0 || ^9.0.0`
+- `@elastic/elasticsearch`: `^8.0.0`
 
 Example:
 
@@ -830,7 +912,10 @@ Built-in optimized paths:
 - Datastore uses aggregation queries for `count`, `sum`, and `avg`; with
   `allowAggregateScanFallback: true`, it can instead run a validated full-row
   query scan. `min` and `max` use ordered `limit(1)` lookups for fields declared
-  with scalar `fieldType()` metadata unless scan fallback is enabled
+  with scalar `fieldType()` metadata unless scan fallback is enabled. At most
+  five aggregate specs are accepted. Specs that would require more than one
+  native backend request are rejected rather than combining different
+  snapshots; a multi-spec scan requires an explicit `readTime` or transaction
 - Firestore uses aggregate queries for `count`, `sum`, and `avg`; `min` and
   `max` use an ordered `limit(1)` lookup only for fields declared with
   scalar `fieldType()` metadata
@@ -848,11 +933,18 @@ Custom store adapters can omit `aggregate()` while prototyping by enabling the
 explicit fallback in test/dev contexts. Production adapters should implement
 native aggregate support or leave aggregate helpers unsupported.
 
-Datastore also exposes `allowQueryScanFallback: true` for dev/test environments
-that run against the legacy Datastore emulator. The fallback handles emulator
-gaps such as `!=`, `isNotNull`, and `IN` filters by scanning the kind and
-applying active-ts' portable query evaluator in process. Leave it disabled for
-production unless a bounded full scan is intentionally acceptable.
+Datastore array properties have different scalar-filter semantics from the
+portable active-ts evaluator. For scalar fields without `fieldType()` metadata,
+the adapter therefore treats native `=`, `in`, `between`, and range filters only
+as candidate selectors, reads every candidate page, applies portable filtering
+and stable sorting, and only then applies `offset` and `limit`. Untyped `!=` and
+`isNotNull`, and every `isNull`, can require a whole-kind scan because a native
+filter may omit portable matches; these paths require
+`allowQueryScanFallback: true`. All portable post-filter paths reject
+continuation cursors because one SDK cursor cannot represent the resulting
+page boundary. Declare truly scalar fields with `fieldType()` to enable direct
+native filtering where its semantics are equivalent. Leave full-scan fallback
+disabled in production unless a bounded scan is intentionally acceptable.
 
 Firestore and Datastore portable `orderBy()` plans require the sorted field to
 be the model id field or a declared `fieldType()` path. Google backends can omit

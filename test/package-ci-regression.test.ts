@@ -11,11 +11,11 @@ test('Elasticsearch peer range and integration smoke client stay aligned', () =>
 	const adapterDocs = readFileSync('docs/adapters.md', 'utf8');
 	const lockfile = readFileSync('pnpm-lock.yaml', 'utf8');
 
-	assert.equal(packageJson.peerDependencies['@elastic/elasticsearch'], '^8.0.0 || ^9.0.0');
+	assert.equal(packageJson.peerDependencies['@elastic/elasticsearch'], '^8.0.0');
 	assert.equal(packageJson.devDependencies['@elastic/elasticsearch'], '^8.19.1');
 	assert.match(integrationWorkflow, /image: docker\.elastic\.co\/elasticsearch\/elasticsearch:8\.15\.3/);
 	assert.match(integrationWorkflow, /ACTIVE_TS_INTEGRATION_TARGETS: postgres,mongodb,redis,elasticsearch,datastore,firestore/);
-	assert.match(adapterDocs, /@elastic\/elasticsearch`: `\^8\.0\.0 \|\| \^9\.0\.0`/);
+	assert.match(adapterDocs, /@elastic\/elasticsearch`: `\^8\.0\.0`/);
 	assert.match(lockfile, /devDependencies:\n\s+'@elastic\/elasticsearch':\n\s+specifier: \^8\.19\.1\n\s+version: 8\.19\.1/);
 });
 
@@ -162,8 +162,37 @@ test('npm package metadata and prepack publish guard are present', () => {
 	assert.equal(packageJson.homepage, 'https://github.com/seo-rii/active-ts#readme');
 });
 
+test('release-independent installation and ESM-only package contract are explicit', () => {
+	const packageJson = JSON.parse(readFileSync('package.json', 'utf8')) as {
+		type?: string;
+		exports: Record<string, Record<string, string>>;
+	};
+	const readme = readFileSync('README.md', 'utf8');
+	const concepts = readFileSync('docs/concepts.md', 'utf8');
+	const quickstart = readFileSync('docs/quickstart.md', 'utf8');
+	const smoke = readFileSync('test/pack-smoke.mjs', 'utf8');
+
+	assert.equal(packageJson.type, 'module');
+	for (const entry of Object.values(packageJson.exports)) {
+		assert.equal(typeof entry.import, 'string');
+		assert.equal(entry.require, undefined);
+	}
+	assert.match(readme, /For a version published to npm/);
+	assert.match(readme, /pnpm add active-ts/);
+	assert.doesNotMatch(readme, /has not been published|not yet published/i);
+	assert.match(readme, /pnpm pack --pack-destination/);
+	assert.match(quickstart, /pnpm pack --pack-destination/);
+	assert.doesNotMatch(quickstart, /pnpm add active-ts(?:\s|$)/m);
+	assert.match(readme, /ESM-only/);
+	assert.match(concepts, /ESM-only/);
+	assert.match(quickstart, /ESM-only/);
+	assert.match(smoke, /require-smoke\.cjs/);
+	assert.match(smoke, /ERR_PACKAGE_PATH_NOT_EXPORTED/);
+});
+
 test('backend integration workflow runs for adapter pull requests and main pushes', () => {
 	const integrationWorkflow = readFileSync('.github/workflows/integration.yml', 'utf8');
+	const releaseWorkflow = readFileSync('.github/workflows/release.yml', 'utf8');
 
 	assert.match(integrationWorkflow, /push:\s*\n\s+branches:\s*\[main\]/);
 	assert.match(integrationWorkflow, /pull_request:/);
@@ -175,6 +204,14 @@ test('backend integration workflow runs for adapter pull requests and main pushe
 	assert.match(integrationWorkflow, /'\.github\/workflows\/release\.yml'/);
 	assert.match(integrationWorkflow, /pnpm test:integration:backends/);
 	assert.match(integrationWorkflow, /ACTIVE_TS_INTEGRATION_TARGETS: postgres,mongodb,redis,elasticsearch,datastore,firestore/);
+	assert.match(integrationWorkflow, /MONGODB_URL: mongodb:\/\/127\.0\.0\.1:27017\/\?replicaSet=active-ts-rs/);
+	assert.match(integrationWorkflow, /Start MongoDB replica set/);
+	assert.match(integrationWorkflow, /--replSet active-ts-rs --bind_ip_all/);
+	assert.match(integrationWorkflow, /rs\.initiate/);
+	assert.match(releaseWorkflow, /MONGODB_URL: mongodb:\/\/127\.0\.0\.1:27017\/\?replicaSet=active-ts-rs/);
+	assert.match(releaseWorkflow, /Start MongoDB replica set/);
+	assert.match(releaseWorkflow, /--replSet active-ts-rs --bind_ip_all/);
+	assert.match(releaseWorkflow, /rs\.initiate/);
 	assert.match(integrationWorkflow, /DATASTORE_EMULATOR_HOST: 127\.0\.0\.1:8081/);
 	assert.match(integrationWorkflow, /FIRESTORE_EMULATOR_HOST: 127\.0\.0\.1:8082/);
 });
@@ -300,7 +337,11 @@ test('backend integration smoke runs real cache and search contracts', () => {
 	assert.match(smoke, /if \(postgresSchemaCreated\) \{\s*try \{\s*await pool\.query\(`drop schema if exists \$\{postgresSchemaSql\} cascade`\)/);
 	assert.match(smoke, /new AggregateError\(\s*\[\s*postgresSmokeError,\s*postgresCleanupError\s*\]/);
 	assert.doesNotMatch(smoke, /drop schema if exists \$\{postgresSchemaSql\} cascade`\)\.catch\(\(\) => undefined\)/);
-	assert.match(smoke, /createMongoStoreAdapter\(\{\s*client,\s*dbName,\s*allowAggregateScanFallback: true\s*\}\)/);
+	assert.match(
+		smoke,
+		/createMongoStoreAdapter\(\{\s*client,\s*dbName,\s*cacheScope,\s*allowAggregateScanFallback: true\s*\}\)/
+	);
+	assert.match(smoke, /assert\.equal\(adapter\.cacheScope, cacheScope\)/);
 	assert.match(smoke, /runCacheAdapterContract\(cache\)/);
 	assert.match(smoke, /runSearchAdapterContract\(search,\s*\{/);
 	assert.match(smoke, /settleMs: 10000/);
@@ -654,6 +695,7 @@ test('package root export keeps internal helpers out of the public surface', asy
 		'ActiveTsConflictError',
 		'ActiveTsError',
 		'ActiveTsNotFoundError',
+		'ActiveTsUnknownTransactionOutcomeError',
 		'ActiveTsValidationError',
 		'FindBuilder',
 		'LazyRef',
@@ -692,6 +734,8 @@ test('package root export keeps internal helpers out of the public surface', asy
 		'createStoreMiddlewareAdapter',
 		'cursorValues',
 		'datastoreAncestorOptions',
+		'datastoreInt64Id',
+		'datastoreInt64IdValue',
 		'datastoreKey',
 		'datastoreReadOptions',
 		'datastoreSearchDocumentIdentity',
@@ -717,6 +761,7 @@ test('package root export keeps internal helpers out of the public surface', asy
 		'isContextBoundCacheAdapter',
 		'isContextBoundSearchAdapter',
 		'isContextBoundStoreAdapter',
+		'isDatastoreInt64Id',
 		'isPartialModel',
 		'markSearchDocumentIdentity',
 		'mergeHooks',

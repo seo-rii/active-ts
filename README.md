@@ -40,8 +40,23 @@ expected to move while real applications exercise the adapter contracts.
 
 ## Installation
 
+For a version published to npm, install the package normally:
+
 ```sh
 pnpm add active-ts
+```
+
+To evaluate an exact source revision, including changes that have not been
+released, build a tarball from a reviewed commit and install it in the consumer:
+
+```sh
+git clone https://github.com/seo-rii/active-ts.git
+cd active-ts
+pnpm install --frozen-lockfile
+pnpm pack --pack-destination ./artifacts
+
+# Run this in the consumer project, using the tarball path printed above.
+pnpm add /path/to/active-ts/artifacts/active-ts-0.1.0.tgz
 ```
 
 The examples use typia for runtime validation:
@@ -53,13 +68,13 @@ pnpm add typia
 Install only the SDKs for the adapters your app uses:
 
 ```sh
-pnpm add active-ts pg redis typia
-pnpm add active-ts @google-cloud/datastore redis
-pnpm add active-ts mongodb @elastic/elasticsearch
+pnpm add pg redis typia
+pnpm add @google-cloud/datastore redis
+pnpm add mongodb @elastic/elasticsearch
 ```
 
-active-ts requires Node.js 22 or newer because it uses the platform
-`structuredClone` implementation.
+active-ts is ESM-only and requires Node.js 22 or newer. Use `import` or dynamic
+`import()` from an ESM application; CommonJS `require()` is not supported.
 
 ## Quick Example
 

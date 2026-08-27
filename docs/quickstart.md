@@ -7,18 +7,25 @@ Elasticsearch once those adapters are registered in the context.
 ## Install
 
 ```sh
-pnpm add active-ts typia
+git clone https://github.com/seo-rii/active-ts.git
+cd active-ts
+pnpm install --frozen-lockfile
+pnpm pack --pack-destination ./artifacts
+
+# Run this in the consumer project, using the tarball path printed above.
+pnpm add /path/to/active-ts/artifacts/active-ts-0.1.0.tgz typia
 ```
 
 For production adapters, install the matching SDKs:
 
 ```sh
-pnpm add active-ts pg redis typia
-pnpm add active-ts @google-cloud/datastore redis typia
-pnpm add active-ts mongodb algoliasearch typia
+pnpm add pg redis
+pnpm add @google-cloud/datastore redis
+pnpm add mongodb algoliasearch
 ```
 
-active-ts requires Node.js 22 or newer.
+active-ts is ESM-only and requires Node.js 22 or newer. CommonJS `require()` is
+not supported.
 
 ## Define Models
 

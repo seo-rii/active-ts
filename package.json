@@ -97,7 +97,7 @@
 		"lint": "tsc -p tsconfig.json --noEmit"
 	},
 	"peerDependencies": {
-		"@elastic/elasticsearch": "^8.0.0 || ^9.0.0",
+		"@elastic/elasticsearch": "^8.0.0",
 		"@google-cloud/datastore": "^10.0.0",
 		"@google-cloud/firestore": "^8.0.0",
 		"algoliasearch": "^5.0.0",

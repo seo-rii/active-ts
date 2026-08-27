@@ -253,6 +253,7 @@ Built-in store adapters support different transaction options and savepoints:
 | --- | --- | --- | --- | --- |
 | Memory | Yes | Yes | `readOnly` | Rejects `isolation`, `timeoutMs`, and `native`; intended for deterministic tests. |
 | PostgreSQL | Yes | Yes | `isolation`, `readOnly`, `timeoutMs` | Rejects transaction `native`; native SQL is still available through query builders outside read-only transaction guards. |
+| MongoDB | When the client exposes `startSession()` | No | `readOnly`, `timeoutMs`, plus `native.readConcern`, `native.writeConcern`, `native.readPreference`, and `native.maxCommitTimeMS` | Requires a replica set or sharded cluster; transaction handles reject native query payloads and serialize portable driver operations on one session. |
 | Datastore | When the SDK client exposes `transaction()` | No | `readOnly`, plus `native.gaxOptions`, `native.commitGaxOptions`, and `native.rollbackGaxOptions` | Write transactions allow native query callbacks before buffered writes; read-only transactions reject native callbacks. |
 | Firestore | Yes | No | `readOnly`, plus `native.maxAttempts`, `native.readOnly`, and `native.readTime` | Transaction queries reject native function payloads; Firestore requires all unbuffered reads before writes. Queries wait for earlier pending mutations before enforcing that boundary. |
 
@@ -277,6 +278,25 @@ unknown outcome without running rollback callbacks, and the indeterminate
 PostgreSQL client is discarded rather than returned to the connection pool.
 Await each `query()` result when later callback code depends on it or needs to
 handle its error locally.
+
+MongoDB uses `startSession()` and the driver's Core transaction API. It invokes
+the application callback once and does not use `withTransaction()`, so active-ts
+never retries user hooks or model work implicitly. It also serializes portable
+operations because the MongoDB driver does not support parallel commands in one
+transaction. A callback or tracked operation failure is rolled back with
+`abortTransaction()`. The MongoDB 7 driver can internally retry retryable commit
+commands and one retryable abort command, but active-ts never repeats the
+callback. A commit rejection is indeterminate only when it carries
+`UnknownTransactionCommitResult`; active-ts exposes that case as
+`ActiveTsUnknownTransactionOutcomeError` with `outcome === "unknown"`,
+`phase === "commit"`, and the driver error in `cause`. A
+`TransientTransactionError` or other definitive commit failure runs rollback
+semantics. The driver normally suppresses abort command errors; a rejecting
+injected session is exposed with `phase === "abort"`. Unknown outcomes suppress
+both transaction-finalization hook groups. A session cleanup failure after a
+successful commit is reported as `ActiveTsCommittedTransactionError` with the
+callback result. MongoDB transaction deployments must be replica sets or
+sharded clusters.
 
 Firestore likewise reports a transport failure after its transaction callback
 completes as an unknown commit outcome. Neither `afterCommit` nor
@@ -371,9 +391,12 @@ await context.afterRollback(() => metrics.increment('rollback'));
 ```
 
 `afterCommit` tasks run after the store commit. If one fails, active-ts still
-runs the remaining tasks and then rejects the transaction with an
-`AggregateError`; the committed store write is not rolled back. `afterRollback`
-task failures are logged without hiding the original rollback reason.
+runs the remaining tasks and then rejects with
+`ActiveTsCommittedTransactionError`. Its `committed` property is `true`,
+`result` preserves the transaction callback result, and `cause` is an
+`AggregateError` containing every failed task. The committed store write is not
+rolled back. `afterRollback` task failures are logged without hiding the
+original rollback reason.
 External search adapters cannot be read inside transactions because their
 indexes do not include uncommitted writes. Native search adapters are rebound to
 the transaction-scoped store and remain available; run other search reads after

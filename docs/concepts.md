@@ -3,6 +3,9 @@
 active-ts keeps the public API small. The important pieces are models, model
 metadata, contexts, adapters, relations, and query plans.
 
+active-ts is an ESM-only Node.js package. Consumers must use `import` or dynamic
+`import()`; CommonJS `require()` is intentionally outside the package contract.
+
 ## Model
 
 Models extend `Model<TData>` and wrap a plain data object:
