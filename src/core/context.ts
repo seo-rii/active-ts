@@ -77,10 +77,13 @@ import { dateIsoString } from './date-intrinsics.js';
 import {
 	iterableToArray,
 	MAP_CLEAR,
+	MAP_DELETE,
 	MAP_FOR_EACH,
 	MAP_GET,
 	MAP_HAS,
+	MAP_KEYS,
 	MAP_SET,
+	MAP_SIZE,
 	MAP_VALUES,
 	SET_ADD,
 	SET_CLEAR,
@@ -94,9 +97,14 @@ import {
 	WEAKSET_ADD,
 	WEAKSET_HAS
 } from './collection-intrinsics.js';
-import { markCacheAdapterSource } from './cache-utils.js';
-import { cacheAdapterSourceChain } from './cache-utils.js';
-import { markStoreAdapterSource, storeAdapterSourceChain } from './store-utils.js';
+import { cacheAdapterSource, cacheAdapterSourceChain, markCacheAdapterSource } from './cache-utils.js';
+import {
+	cacheSupportsVersioning,
+	normalizeCacheVersionedEntries,
+	normalizeCacheVersionedSetResult,
+	normalizeCacheVersionedValues
+} from './cache-versioning.js';
+import { markStoreAdapterSource, storeAdapterSource, storeAdapterSourceChain } from './store-utils.js';
 import {
 	assertStoreNativeAdapterTag,
 	assertStoreDataMatchesId,
@@ -293,6 +301,21 @@ const SAFE_PROMISE_RESOLVE = Promise.resolve.bind(Promise);
 const SAFE_PROMISE_REJECT = Promise.reject.bind(Promise);
 const PROMISE_THEN = Promise.prototype.then;
 const NOOP_REJECTION_OBSERVER = () => undefined;
+const SHARED_CACHE_INVALIDATION_EPOCH_LIMIT = 4096;
+const SHARED_CACHE_INVALIDATION_FAILURE_LIMIT = 4096;
+const adapterRegistrationSources = new WeakMap<object, object>();
+const sharedCacheInvalidationEpochs = new WeakMap<object, {
+	epochs: Map<string, number>;
+	defaultEpoch: number;
+}>();
+const sharedCacheInvalidationFailures = new WeakMap<object, {
+	failures: Set<string>;
+	poisonGeneration: number;
+	recovered: Map<string, number>;
+}>();
+const sharedCachePrimaryStores = new WeakMap<object, WeakSet<object>>();
+const localStoreCacheScopes = new WeakMap<object, string>();
+let nextLocalStoreCacheScope = 0;
 
 function contextOperationPromise<T>(run: () => Promise<T>): Promise<T> {
 	try {
@@ -335,7 +358,8 @@ function assertDirectIdReadAllowed(meta: ResolvedModelMeta) {
 function normalizeAdapterRegistry<T>(
 	registry: Record<string, T> | undefined,
 	context: string,
-	validate: (adapter: unknown, context: string) => asserts adapter is T
+	validate: (adapter: unknown, context: string) => asserts adapter is T,
+	markSource: (adapter: T, source: T) => T
 ) {
 	if (!registry || typeof registry !== 'object' || Array.isArray(registry)) {
 		throw new ActiveTsConfigurationError(`${context} registry must be an object.`);
@@ -350,11 +374,59 @@ function normalizeAdapterRegistry<T>(
 	const normalized = Object.create(null) as Record<string, T>;
 	for (const name of Object.getOwnPropertyNames(registry)) {
 		const safeName = assertSafeSchemaIdentifier(name, context);
-		const adapter = ownValue(registry, name, `${context} registry`);
+		const source = ownValue(registry, name, `${context} registry`);
+		const adapter = snapshotAdapterRegistrationObject(source, `${context} "${safeName}"`);
+		markSource(adapter as T, source as T);
 		validate(adapter, `${context} "${safeName}"`);
 		defineDataProperty(normalized, safeName, adapter, { enumerable: true, configurable: true, writable: true });
 	}
 	return Object.freeze(normalized);
+}
+
+function normalizeStoreAdapterRegistry(registry: Record<string, StoreAdapter> | undefined) {
+	return normalizeAdapterRegistry(
+		registry,
+		'store adapter name',
+		assertStoreAdapter,
+		(adapter, source) => {
+			const sourced = markStoreAdapterSource(adapter, source);
+			return storeTrustsDatastoreEntityKeyRows(source)
+				? markStoreTrustsDatastoreEntityKeyRows(sourced)
+				: sourced;
+		}
+	);
+}
+
+function snapshotAdapterRegistrationObject(value: unknown, context: string): object {
+	if (!value || typeof value !== 'object' || Array.isArray(value)) {
+		throw new ActiveTsConfigurationError(`${context} must be an adapter object.`);
+	}
+	const source = value as object;
+	const snapshot = Object.create(Object.getPrototypeOf(source)) as object;
+	WEAKMAP_SET.call(adapterRegistrationSources, snapshot, source);
+	const properties: Array<string | symbol> = [];
+	for (const property of Object.getOwnPropertyNames(source)) properties[properties.length] = property;
+	for (const property of Object.getOwnPropertySymbols(source)) properties[properties.length] = property;
+	for (const property of properties) {
+		const sourceDescriptor = Object.getOwnPropertyDescriptor(source, property);
+		if (!sourceDescriptor) continue;
+		const descriptor = Object.create(null) as PropertyDescriptor;
+		descriptor.enumerable = sourceDescriptor.enumerable;
+		descriptor.configurable = true;
+		if ('value' in sourceDescriptor) {
+			descriptor.value = sourceDescriptor.value;
+			descriptor.writable = true;
+		} else {
+			descriptor.get = sourceDescriptor.get?.bind(source);
+			descriptor.set = sourceDescriptor.set?.bind(source);
+		}
+		Object.defineProperty(snapshot, property, descriptor);
+	}
+	return snapshot;
+}
+
+function adapterRegistrationSource(adapter: object) {
+	return (WEAKMAP_GET.call(adapterRegistrationSources, adapter) as object | undefined) ?? adapter;
 }
 
 function assertRegisteredDefaultAdapter<T>(
@@ -393,7 +465,7 @@ function functionProperty(adapter: object, property: string, context: string) {
 	if (typeof value !== 'function') {
 		throw new ActiveTsConfigurationError(`${context}.${property} must be a function.`);
 	}
-	return value.bind(adapter);
+	return value.bind(adapterRegistrationSource(adapter));
 }
 
 function snapshotFunctionProperty(adapter: object, property: string, context: string) {
@@ -419,7 +491,7 @@ function snapshotOptionalFunctionProperty(
 	if (value === undefined) shadowAdapterProperty(adapter, property, context);
 	else {
 		try {
-			defineAdapterProperty(adapter, property, value.bind(adapter), true);
+			defineAdapterProperty(adapter, property, value.bind(adapterRegistrationSource(adapter)), true);
 		} catch (error) {
 			throw new ActiveTsConfigurationError(
 				`${context}.${property} could not be snapshotted: ${safeErrorMessage(error)}`
@@ -556,10 +628,11 @@ function assertStoreAdapter(adapter: unknown, context: string): asserts adapter 
 		if (!schema || typeof schema !== 'object' || Array.isArray(schema)) {
 			throw new ActiveTsConfigurationError(`${context}.schema must be an object.`);
 		}
-		snapshotFunctionProperty(schema, 'plan', `${context}.schema`);
-		snapshotFunctionProperty(schema, 'apply', `${context}.schema`);
+		const schemaSnapshot = snapshotAdapterRegistrationObject(schema, `${context}.schema`);
+		snapshotFunctionProperty(schemaSnapshot, 'plan', `${context}.schema`);
+		snapshotFunctionProperty(schemaSnapshot, 'apply', `${context}.schema`);
 		try {
-			defineAdapterProperty(record, 'schema', schema, true);
+			defineAdapterProperty(record, 'schema', schemaSnapshot, true);
 		} catch (error) {
 			throw new ActiveTsConfigurationError(
 				`${context}.schema could not be snapshotted: ${safeErrorMessage(error)}`
@@ -582,6 +655,18 @@ function assertCacheAdapter(adapter: unknown, context: string): asserts adapter 
 	for (const property of ['getMany', 'setMany', 'deleteMany']) {
 		snapshotFunctionProperty(record, property, context);
 	}
+	for (const property of ['getManyVersioned', 'setManyVersioned', 'invalidateMany']) {
+		snapshotOptionalFunctionProperty(record, property, context);
+	}
+	let versionedMethodCount = 0;
+	for (const method of [record.getManyVersioned, record.setManyVersioned, record.invalidateMany]) {
+		if (method !== undefined) versionedMethodCount++;
+	}
+	if (versionedMethodCount !== 0 && versionedMethodCount !== 3) {
+		throw new ActiveTsConfigurationError(
+			`${context} must provide getManyVersioned(), setManyVersioned(), and invalidateMany() together.`
+		);
+	}
 	snapshotOptionalFunctionProperty(record, 'codecKey', context);
 }
 
@@ -598,10 +683,11 @@ function assertSearchAdapter(adapter: unknown, context: string): asserts adapter
 		if (!schema || typeof schema !== 'object' || Array.isArray(schema)) {
 			throw new ActiveTsConfigurationError(`${context}.schema must be an object.`);
 		}
-		snapshotFunctionProperty(schema, 'plan', `${context}.schema`);
-		snapshotFunctionProperty(schema, 'apply', `${context}.schema`);
+		const schemaSnapshot = snapshotAdapterRegistrationObject(schema, `${context}.schema`);
+		snapshotFunctionProperty(schemaSnapshot, 'plan', `${context}.schema`);
+		snapshotFunctionProperty(schemaSnapshot, 'apply', `${context}.schema`);
 		try {
-			defineAdapterProperty(record, 'schema', schema, true);
+			defineAdapterProperty(record, 'schema', schemaSnapshot, true);
 		} catch (error) {
 			throw new ActiveTsConfigurationError(
 				`${context}.schema could not be snapshotted: ${safeErrorMessage(error)}`
@@ -885,8 +971,6 @@ export class ActiveContext {
 	private readonly storeHandles = new Map<string, StoreAdapter>();
 	private readonly cacheHandles = new Map<string, CacheAdapter>();
 	private readonly searchHandles = new Map<string, SearchAdapter>();
-	private cacheInvalidationEpochs = new Map<string, number>();
-	private cacheInvalidationFailures = new WeakMap<CacheAdapter, Set<string>>();
 	private cacheKeyOwners = new Map<string, string>();
 	private entityCacheKeys = new Map<string, string>();
 	private readonly config: Required<Pick<ActiveTsConfig, 'defaultStore' | 'defaultCache' | 'defaultSearch'>> &
@@ -899,14 +983,20 @@ export class ActiveContext {
 		assertActiveTsConfig(config);
 		setTransactionModelTracker(this, (item) => this.#trackTransactionModelInstance(item));
 		const configRecord = config as ActiveTsConfig & Record<string, unknown>;
-		const stores = normalizeAdapterRegistry(ownValue(configRecord, 'stores') as ActiveTsConfig['stores'], 'store adapter name', assertStoreAdapter);
+		const stores = normalizeStoreAdapterRegistry(
+			ownValue(configRecord, 'stores') as ActiveTsConfig['stores']
+		);
 		if (!Object.keys(stores).length) {
 			throw new ActiveTsConfigurationError('At least one store adapter is required.');
 		}
 		const rawCaches = ownValue(configRecord, 'caches') as ActiveTsConfig['caches'];
 		const rawSearch = ownValue(configRecord, 'search') as ActiveTsConfig['search'];
-		const caches = rawCaches !== undefined ? normalizeAdapterRegistry(rawCaches, 'cache adapter name', assertCacheAdapter) : undefined;
-		const search = rawSearch !== undefined ? normalizeAdapterRegistry(rawSearch, 'search adapter name', assertSearchAdapter) : undefined;
+		const caches = rawCaches !== undefined
+			? normalizeAdapterRegistry(rawCaches, 'cache adapter name', assertCacheAdapter, markCacheAdapterSource)
+			: undefined;
+		const search = rawSearch !== undefined
+			? normalizeAdapterRegistry(rawSearch, 'search adapter name', assertSearchAdapter, markSearchAdapterSource)
+			: undefined;
 		const plugins = ownValue(configRecord, 'plugins') as ActiveTsConfig['plugins'];
 		const schema = ownValue(configRecord, 'schema') as ActiveTsConfig['schema'];
 		const batch = ownValue(configRecord, 'batch') as ActiveTsConfig['batch'];
@@ -998,7 +1088,17 @@ export class ActiveContext {
 			};
 			WEAKMAP_SET.call(this.metaCache, sourceModel, cached);
 		}
-		return cached.meta;
+		const meta = cached.meta;
+		if (meta.cache?.consistency === 'distributed') {
+			const cache = this.internalCache(meta.cache.adapter);
+			if (!cache) {
+				throw new ActiveTsConfigurationError(
+					`Model "${meta.name}" uses distributed cache consistency, but cache adapter "${meta.cache.adapter}" is not registered.`
+				);
+			}
+			this.assertDistributedCache(meta, cache);
+		}
+		return meta;
 	}
 
 	store(name: string): StoreAdapter {
@@ -1449,6 +1549,41 @@ export class ActiveContext {
 					}
 				: undefined
 		};
+		if (cacheSupportsVersioning(adapter)) {
+			handle.getManyVersioned = (keys) => this.trackOperation(async () => {
+				const safeKeys = normalizeContextCacheKeys(keys, 'context cache getManyVersioned keys');
+				const retained = this.cacheForRetainedHandle(name);
+				if (!retained || !cacheSupportsVersioning(retained)) {
+					throw new ActiveTsConfigurationError(`Cache adapter "${name}" no longer supports versioned reads.`);
+				}
+				return normalizeCacheVersionedValues(
+					await retained.getManyVersioned(safeKeys),
+					safeKeys.length,
+					'context cache getManyVersioned result'
+				);
+			});
+			handle.setManyVersioned = (entries, options) => this.trackOperation(async () => {
+				const safeEntries = normalizeCacheVersionedEntries(entries, 'context cache setManyVersioned entries');
+				const safeOptions = normalizeContextCacheWriteOptions(options, 'context cache setManyVersioned options');
+				const retained = this.cacheForRetainedHandle(name);
+				if (!retained || !cacheSupportsVersioning(retained)) {
+					throw new ActiveTsConfigurationError(`Cache adapter "${name}" no longer supports versioned writes.`);
+				}
+				return normalizeCacheVersionedSetResult(
+					await retained.setManyVersioned(safeEntries, safeOptions),
+					safeEntries.length,
+					'context cache setManyVersioned result'
+				);
+			});
+			handle.invalidateMany = (keys) => this.trackOperation(async () => {
+				const safeKeys = normalizeContextCacheKeys(keys, 'context cache invalidateMany keys');
+				const retained = this.cacheForRetainedHandle(name);
+				if (!retained || !cacheSupportsVersioning(retained)) {
+					throw new ActiveTsConfigurationError(`Cache adapter "${name}" no longer supports atomic invalidation.`);
+				}
+				await retained.invalidateMany(safeKeys);
+			});
+		}
 		defineDataProperty(handle, CONTEXT_BOUND_CACHE_SOURCE, adapter, { enumerable: false, configurable: false });
 		markAdapterTransactionOperationCarrier(handle, (run) => this.trackOperation(run));
 		return markCacheAdapterSource(handle, adapter);
@@ -1748,6 +1883,9 @@ export class ActiveContext {
 				for (const id of ids) mapSet(idsByKey, entityIdKey(id), id);
 				const uniqueIds = iterableToArray(MAP_VALUES.call(idsByKey) as Iterable<EntityId>);
 				const cache = meta.cache && !this.transactionState ? this.internalCache(meta.cache.adapter) : undefined;
+				const distributedCache = cache && meta.cache?.consistency === 'distributed'
+					? this.assertDistributedCache(meta, cache)
+					: undefined;
 				const cacheKeys: string[] = [];
 				if (cache) {
 					for (let index = 0; index < uniqueIds.length; index++) {
@@ -1755,20 +1893,26 @@ export class ActiveContext {
 					}
 				}
 				const cacheEpochs = cache ? new Map<string, number>() : undefined;
-				if (cacheEpochs) {
+				const cacheVersions = distributedCache ? new Map<string, string>() : undefined;
+				if (cache && cacheEpochs) {
 					for (let index = 0; index < cacheKeys.length; index++) {
 						const key = cacheKeys[index];
-						mapSet(cacheEpochs, key, this.cacheEpoch(key));
+						mapSet(cacheEpochs, key, this.cacheEpoch(cache, key));
 					}
 				}
-				const dirtyKeys = this.transactionState?.dirtyCacheKeys;
-				const cacheReadableIndexes: number[] = [];
-				if (cache) {
-					for (let index = 0; index < cacheKeys.length; index++) {
-						const key = cacheKeys[index];
-						if ((dirtyKeys && SET_HAS.call(dirtyKeys, key)) || this.hasCacheInvalidationFailure(cache, key)) continue;
-						cacheReadableIndexes[cacheReadableIndexes.length] = index;
-					}
+					const dirtyKeys = this.transactionState?.dirtyCacheKeys;
+					const cacheReadableIndexes: number[] = [];
+					const failedDistributedCacheIndexes: number[] = [];
+					if (cache) {
+						for (let index = 0; index < cacheKeys.length; index++) {
+							const key = cacheKeys[index];
+							if (dirtyKeys && SET_HAS.call(dirtyKeys, key)) continue;
+							if (this.hasCacheInvalidationFailure(cache, key)) {
+								if (distributedCache) failedDistributedCacheIndexes[failedDistributedCacheIndexes.length] = index;
+								continue;
+							}
+							cacheReadableIndexes[cacheReadableIndexes.length] = index;
+						}
 				}
 				const cached = new Array(uniqueIds.length) as any[];
 				for (let index = 0; index < uniqueIds.length; index++) cached[index] = undefined;
@@ -1786,12 +1930,32 @@ export class ActiveContext {
 						operation: 'read',
 						meta: { keys: cloneArray(readableKeys) }
 					});
-					let readableCached = sanitizeCacheGetResult(
-						await cache.getMany(readableKeys),
-						readableIds,
-						meta.idField,
-						`Cache adapter "${cache.kind}" getMany`
-					);
+					let readableCached: any[];
+					if (distributedCache && cacheVersions) {
+						const snapshots = normalizeCacheVersionedValues(
+							await distributedCache.getManyVersioned(readableKeys),
+							readableKeys.length,
+							`Cache adapter "${cache.kind}" getManyVersioned`
+						);
+						const values: any[] = [];
+						for (let index = 0; index < snapshots.length; index++) {
+							values[index] = snapshots[index].value;
+							mapSet(cacheVersions, readableKeys[index], snapshots[index].version);
+						}
+						readableCached = sanitizeCacheGetResult(
+							values,
+							readableIds,
+							meta.idField,
+							`Cache adapter "${cache.kind}" getManyVersioned values`
+						);
+					} else {
+						readableCached = sanitizeCacheGetResult(
+							await cache.getMany(readableKeys),
+							readableIds,
+							meta.idField,
+							`Cache adapter "${cache.kind}" getMany`
+						);
+					}
 					readableCached = applyNegativeCachePolicy(readableCached, meta);
 					const afterCacheGet = await this.runHooks('afterCacheGet', {
 						model: meta,
@@ -1809,13 +1973,31 @@ export class ActiveContext {
 						if (
 							(!dirtyKeys || !SET_HAS.call(dirtyKeys, key)) &&
 							!this.hasCacheInvalidationFailure(cache, key) &&
-							this.cacheEpochUnchanged(key, cacheEpochs)
+							this.cacheEpochUnchanged(cache, key, cacheEpochs)
 						) {
 							cached[sourceIndex] = value;
 						}
+						}
 					}
-				}
-				const missingIds: EntityId[] = [];
+					if (distributedCache && cacheVersions && failedDistributedCacheIndexes.length) {
+						const failedKeys: string[] = [];
+						for (let index = 0; index < failedDistributedCacheIndexes.length; index++) {
+							failedKeys[index] = cacheKeys[failedDistributedCacheIndexes[index]];
+						}
+						try {
+							const snapshots = normalizeCacheVersionedValues(
+								await distributedCache.getManyVersioned(failedKeys),
+								failedKeys.length,
+								`Cache adapter "${distributedCache.kind}" invalidation recovery getManyVersioned`
+							);
+							for (let index = 0; index < snapshots.length; index++) {
+								mapSet(cacheVersions, failedKeys[index], snapshots[index].version);
+							}
+						} catch {
+							// Keep serving authoritative store reads while the cache remains unavailable.
+						}
+					}
+					const missingIds: EntityId[] = [];
 				for (let index = 0; index < uniqueIds.length; index++) {
 					if (cached[index] === undefined) missingIds[missingIds.length] = uniqueIds[index];
 				}
@@ -1845,7 +2027,11 @@ export class ActiveContext {
 					for (let index = 0; index < missingIds.length; index++) {
 						const id = missingIds[index];
 						const key = this.cacheKey(meta, id);
-						if ((!dirtyKeys || !SET_HAS.call(dirtyKeys, key)) && this.cacheEpochUnchanged(key, cacheEpochs)) {
+						if (
+							(!dirtyKeys || !SET_HAS.call(dirtyKeys, key)) &&
+							this.cacheEpochUnchanged(cache, key, cacheEpochs) &&
+							(!distributedCache || (cacheVersions !== undefined && mapHas(cacheVersions, key)))
+						) {
 							cacheableMissingIds[cacheableMissingIds.length] = id;
 						}
 					}
@@ -1869,8 +2055,26 @@ export class ActiveContext {
 					for (let index = 0; index < negativeIds.length; index++) {
 						negatives[index] = [this.cacheKey(meta, negativeIds[index]), null];
 					}
-					await this.writeCacheEntries(cache, meta, positiveIds, positives, meta.cache?.ttl, 'positive', cacheEpochs);
-					await this.writeCacheEntries(cache, meta, negativeIds, negatives, meta.cache?.negativeTtl, 'negative', cacheEpochs);
+					await this.writeCacheEntries(
+						cache,
+						meta,
+						positiveIds,
+						positives,
+						meta.cache?.ttl,
+						'positive',
+						cacheEpochs,
+						cacheVersions
+					);
+					await this.writeCacheEntries(
+						cache,
+						meta,
+						negativeIds,
+						negatives,
+						meta.cache?.negativeTtl,
+						'negative',
+						cacheEpochs,
+						cacheVersions
+					);
 				}
 				const rawById = new Map<string, any | null>();
 				for (let index = 0; index < uniqueIds.length; index++) {
@@ -2106,7 +2310,10 @@ export class ActiveContext {
 			(scoped) => scoped.invalidate(meta, id),
 			async () => {
 				this.assertTransactionOpen('invalidate cache entries');
-				if (!meta.cache || !this.internalCache(meta.cache.adapter)) return;
+				if (!meta.cache) return;
+				const cache = this.internalCache(meta.cache.adapter);
+				if (!cache) return;
+				if (meta.cache.consistency === 'distributed') this.assertDistributedCache(meta, cache);
 				if (this.transactionState) {
 					this.assertTransactionWritable('invalidate cache entries');
 					const txState = this.transactionState;
@@ -2152,8 +2359,11 @@ export class ActiveContext {
 		if (!meta.cache) return;
 		const cache = this.internalCache(meta.cache.adapter);
 		if (!cache) return;
+		const distributedCache = meta.cache.consistency === 'distributed'
+			? this.assertDistributedCache(meta, cache)
+			: undefined;
 		const key = this.cacheKey(meta, id);
-		this.bumpCacheEpoch(key);
+		this.bumpCacheEpoch(cache, key);
 		try {
 			await this.runHooks('beforeCacheInvalidate', {
 				model: meta,
@@ -2161,8 +2371,9 @@ export class ActiveContext {
 				operation: 'cache',
 				meta: { keys: [key] }
 			});
-			await cache.deleteMany([key]);
-			this.bumpCacheEpoch(key);
+			if (distributedCache) await distributedCache.invalidateMany([key]);
+			else await cache.deleteMany([key]);
+			this.bumpCacheEpoch(cache, key);
 		} catch (error) {
 			this.markCacheInvalidationFailure(cache, key);
 			throw error;
@@ -2816,10 +3027,24 @@ export class ActiveContext {
 				if (!attemptState) {
 					throw new ActiveTsConfigurationError(`Store adapter "${store.kind}" completed transaction without running the callback.`);
 				}
-				attemptState.closed = 'committed';
-				rebindTransactionModels(result, attemptState, attemptState.root);
-				await runAfterCommitTasks(attemptState);
-				return result;
+					attemptState.closed = 'committed';
+					rebindTransactionModels(result, attemptState, attemptState.root);
+					try {
+						await runAfterCommitTasks(attemptState);
+					} catch (afterCommitError) {
+						const cause = afterCommitError instanceof AggregateError
+							? afterCommitError
+							: new AggregateError(
+									[afterCommitError],
+									'active-ts afterCommit task failed after transaction commit.'
+								);
+						throw new ActiveTsCommittedTransactionError(
+							`Transaction committed but ${safeErrorMessage(cause)}`,
+							cause,
+							result
+						);
+					}
+					return result;
 			})();
 		} catch (error) {
 			return SAFE_PROMISE_REJECT(error);
@@ -2984,14 +3209,70 @@ export class ActiveContext {
 
 	private cacheKey(meta: ResolvedModelMeta, id: EntityId) {
 		const entityKey = `${meta.name}:${entityIdKey(id)}`;
-		const cacheScope = this.internalStore(meta.store).cacheScope;
-		const owner = cacheScope === undefined
-			? meta.store === this.config.defaultStore ? entityKey : `${meta.store}:${entityKey}`
-			: `store:${meta.store.length}:${meta.store}:scope:${cacheScope.length}:${cacheScope}:${entityKey}`;
-		const baseKey = owner;
-		const key = assertSafeCacheKey(this.config.cacheKey?.({ model: meta, id, baseKey }) ?? baseKey, 'cache key');
+		const store = this.internalStore(meta.store);
+		const explicitCacheScope = store.cacheScope;
+		const localCacheScope = explicitCacheScope === undefined ? this.localCacheScope(meta, store) : undefined;
+		const physicalPrefix = explicitCacheScope !== undefined
+			? `store:${meta.store.length}:${meta.store}:scope:${explicitCacheScope.length}:${explicitCacheScope}`
+			: localCacheScope !== undefined
+				? `store:${meta.store.length}:${meta.store}:local-scope:${localCacheScope.length}:${localCacheScope}`
+				: meta.store === this.config.defaultStore
+					? undefined
+					: `store:${meta.store.length}:${meta.store}`;
+		const owner = physicalPrefix === undefined ? entityKey : `${physicalPrefix}:${entityKey}`;
+		const customCacheKey = this.config.cacheKey;
+		const resolvedKey = assertSafeCacheKey(customCacheKey?.({ model: meta, id, baseKey: owner }) ?? owner, 'cache key');
+		const key = customCacheKey !== undefined && resolvedKey !== owner
+			? assertSafeCacheKey(
+				physicalPrefix === undefined
+					? resolvedKey
+					: `${physicalPrefix}:custom:${resolvedKey.length}:${resolvedKey}`,
+				'scoped cache key'
+			)
+			: resolvedKey;
 		this.assertStableEntityCacheKey(owner, key);
 		return key;
+	}
+
+	private localCacheScope(meta: ResolvedModelMeta, store: StoreAdapter) {
+		if (!meta.cache) return undefined;
+		const cache = this.internalCache(meta.cache.adapter);
+		if (!cache) return undefined;
+		const cacheSource = cacheAdapterSource(cache);
+		const storeSource = storeAdapterSource(store);
+		let primaryStores = WEAKMAP_GET.call(sharedCachePrimaryStores, cacheSource) as WeakSet<object> | undefined;
+		if (primaryStores === undefined) {
+			primaryStores = new WeakSet<object>();
+			WEAKSET_ADD.call(primaryStores, storeSource);
+			WEAKMAP_SET.call(sharedCachePrimaryStores, cacheSource, primaryStores);
+			return undefined;
+		}
+		if (WEAKSET_HAS.call(primaryStores, storeSource)) return undefined;
+		let scope = WEAKMAP_GET.call(localStoreCacheScopes, storeSource) as string | undefined;
+		if (scope === undefined) {
+			nextLocalStoreCacheScope++;
+			if (!Number.isSafeInteger(nextLocalStoreCacheScope)) {
+				throw new ActiveTsConfigurationError('Local store cache scope counter exceeded the safe integer range.');
+			}
+			scope = `local-${nextLocalStoreCacheScope}`;
+			WEAKMAP_SET.call(localStoreCacheScopes, storeSource, scope);
+		}
+		return scope;
+	}
+
+	private assertDistributedCache(meta: ResolvedModelMeta, cache: CacheAdapter) {
+		const store = this.internalStore(meta.store);
+		if (store.cacheScope === undefined) {
+			throw new ActiveTsConfigurationError(
+				`Model "${meta.name}" uses distributed cache consistency, so store "${meta.store}" must expose an explicit cacheScope.`
+			);
+		}
+		if (!cacheSupportsVersioning(cache)) {
+			throw new ActiveTsConfigurationError(
+				`Model "${meta.name}" uses distributed cache consistency, but cache adapter "${cache.kind}" does not support versioned reads, conditional writes, and atomic invalidation.`
+			);
+		}
+		return cache;
 	}
 
 	private assertStableEntityCacheKey(owner: string, key: string) {
@@ -3045,35 +3326,99 @@ export class ActiveContext {
 		for (const [owner, key] of state.entityCacheKeys) mapSet(this.entityCacheKeys, owner, key);
 	}
 
-	private cacheEpoch(key: string) {
-		return mapGet(this.cacheInvalidationEpochs, key) ?? 0;
+	private cacheEpochState(cache: CacheAdapter) {
+		const source = cacheAdapterSource(cache);
+		let state = WEAKMAP_GET.call(sharedCacheInvalidationEpochs, source) as {
+			epochs: Map<string, number>;
+			defaultEpoch: number;
+		} | undefined;
+		if (!state) {
+			state = { epochs: new Map<string, number>(), defaultEpoch: 0 };
+			WEAKMAP_SET.call(sharedCacheInvalidationEpochs, source, state);
+		}
+		return state;
 	}
 
-	private bumpCacheEpoch(key: string) {
-		mapSet(this.cacheInvalidationEpochs, key, this.cacheEpoch(key) + 1);
+	private cacheEpoch(cache: CacheAdapter, key: string) {
+		const state = this.cacheEpochState(cache);
+		return mapGet(state.epochs, key) ?? state.defaultEpoch;
 	}
 
-	private cacheEpochUnchanged(key: string, expectedEpochs: Map<string, number> | undefined) {
+	private bumpCacheEpoch(cache: CacheAdapter, key: string) {
+		const state = this.cacheEpochState(cache);
+		const current = mapGet(state.epochs, key) ?? state.defaultEpoch;
+		if (!Number.isSafeInteger(current) || current < 0 || current >= Number.MAX_SAFE_INTEGER - 1) {
+			throw new ActiveTsConfigurationError('Cache invalidation epoch counter is exhausted.');
+		}
+		MAP_DELETE.call(state.epochs, key);
+		mapSet(state.epochs, key, current + 1);
+		while (MAP_SIZE.call(state.epochs) > SHARED_CACHE_INVALIDATION_EPOCH_LIMIT) {
+			const oldest = (MAP_KEYS.call(state.epochs) as IterableIterator<string>).next();
+			if (oldest.done) break;
+			const evictedEpoch = mapGet(state.epochs, oldest.value) ?? state.defaultEpoch;
+			MAP_DELETE.call(state.epochs, oldest.value);
+			state.defaultEpoch = Math.max(state.defaultEpoch, evictedEpoch + 1);
+		}
+	}
+
+	private cacheEpochUnchanged(cache: CacheAdapter, key: string, expectedEpochs: Map<string, number> | undefined) {
 		if (!expectedEpochs) return true;
-		return mapGet(expectedEpochs, key) === this.cacheEpoch(key);
+		return mapGet(expectedEpochs, key) === this.cacheEpoch(cache, key);
 	}
 
 	private hasCacheInvalidationFailure(cache: CacheAdapter, key: string) {
-		const keys = WEAKMAP_GET.call(this.cacheInvalidationFailures, cache) as Set<string> | undefined;
-		return keys ? SET_HAS.call(keys, key) : false;
+		const state = WEAKMAP_GET.call(sharedCacheInvalidationFailures, cacheAdapterSource(cache)) as {
+			failures: Set<string>;
+			poisonGeneration: number;
+			recovered: Map<string, number>;
+		} | undefined;
+		if (!state) return false;
+		if (SET_HAS.call(state.failures, key)) return true;
+		return state.poisonGeneration > 0 && mapGet(state.recovered, key) !== state.poisonGeneration;
 	}
 
 	private markCacheInvalidationFailure(cache: CacheAdapter, key: string) {
-		const keys = (WEAKMAP_GET.call(this.cacheInvalidationFailures, cache) as Set<string> | undefined) ?? new Set<string>();
-		SET_ADD.call(keys, key);
-		WEAKMAP_SET.call(this.cacheInvalidationFailures, cache, keys);
+		const source = cacheAdapterSource(cache);
+		let state = WEAKMAP_GET.call(sharedCacheInvalidationFailures, source) as {
+			failures: Set<string>;
+			poisonGeneration: number;
+			recovered: Map<string, number>;
+		} | undefined;
+		if (!state) {
+			state = { failures: new Set<string>(), poisonGeneration: 0, recovered: new Map<string, number>() };
+			WEAKMAP_SET.call(sharedCacheInvalidationFailures, source, state);
+		}
+		SET_ADD.call(state.failures, key);
+		MAP_DELETE.call(state.recovered, key);
+		if (SET_SIZE.call(state.failures) <= SHARED_CACHE_INVALIDATION_FAILURE_LIMIT) return;
+		if (!Number.isSafeInteger(state.poisonGeneration) || state.poisonGeneration >= Number.MAX_SAFE_INTEGER) {
+			throw new ActiveTsConfigurationError('Cache invalidation failure generation is exhausted.');
+		}
+		state.poisonGeneration++;
+		SET_CLEAR.call(state.failures);
+		MAP_CLEAR.call(state.recovered);
 	}
 
 	private clearCacheInvalidationFailure(cache: CacheAdapter, key: string) {
-		const keys = WEAKMAP_GET.call(this.cacheInvalidationFailures, cache) as Set<string> | undefined;
-		if (!keys) return;
-		SET_DELETE.call(keys, key);
-		if (!SET_SIZE.call(keys)) WEAKMAP_DELETE.call(this.cacheInvalidationFailures, cache);
+		const source = cacheAdapterSource(cache);
+		const state = WEAKMAP_GET.call(sharedCacheInvalidationFailures, source) as {
+			failures: Set<string>;
+			poisonGeneration: number;
+			recovered: Map<string, number>;
+		} | undefined;
+		if (!state) return;
+		SET_DELETE.call(state.failures, key);
+		if (state.poisonGeneration > 0) {
+			MAP_DELETE.call(state.recovered, key);
+			mapSet(state.recovered, key, state.poisonGeneration);
+			while (MAP_SIZE.call(state.recovered) > SHARED_CACHE_INVALIDATION_FAILURE_LIMIT) {
+				const oldest = (MAP_KEYS.call(state.recovered) as IterableIterator<string>).next();
+				if (oldest.done) break;
+				MAP_DELETE.call(state.recovered, oldest.value);
+			}
+			return;
+		}
+		if (!SET_SIZE.call(state.failures)) WEAKMAP_DELETE.call(sharedCacheInvalidationFailures, source);
 	}
 
 	private async writeCacheEntries(
@@ -3083,39 +3428,40 @@ export class ActiveContext {
 		entries: Array<[string, any]>,
 		ttl: number | undefined,
 		mode: 'positive' | 'negative',
-		expectedEpochs?: Map<string, number>
+		expectedEpochs?: Map<string, number>,
+		expectedVersions?: Map<string, string>
 	) {
 		if (!entries.length) return;
 		const pending: Array<{ id: EntityId; entry: [string, any] }> = [];
 		for (let index = 0; index < entries.length; index++) {
 			const entry = entries[index];
-			if (this.cacheEpochUnchanged(entry[0], expectedEpochs)) {
+			if (this.cacheEpochUnchanged(cache, entry[0], expectedEpochs)) {
 				pending[pending.length] = { id: ids[index], entry };
 			}
 		}
 		if (!pending.length) return;
-		const hookIds: EntityId[] = [];
+		const expectedIds: EntityId[] = [];
 		const pendingEntries: Array<[string, any]> = [];
 		for (let index = 0; index < pending.length; index++) {
-			hookIds[index] = pending[index].id;
+			expectedIds[index] = pending[index].id;
 			pendingEntries[index] = pending[index].entry;
 		}
 		const hookEntries = cloneCacheSetEntries(pendingEntries);
-		const hookEntryKeys = cacheEntryKeys(hookEntries);
+		const expectedEntryKeys = cacheEntryKeys(pendingEntries);
 		const before = await this.runHooks('beforeCacheSet', {
 			model: meta,
-			ids: hookIds,
+			ids: cloneArray(expectedIds),
 			data: hookEntries,
 			operation: 'read',
-			meta: { keys: hookEntryKeys }
+			meta: { keys: cloneArray(expectedEntryKeys) }
 		});
-		const nextEntries = sanitizeCacheSetEntries(before.data, 'beforeCacheSet', hookEntryKeys);
-		assertCacheSetEntryValues(nextEntries, hookIds, meta.idField, mode, 'beforeCacheSet');
+		const nextEntries = sanitizeCacheSetEntries(before.data, 'beforeCacheSet', expectedEntryKeys);
+		assertCacheSetEntryValues(nextEntries, expectedIds, meta.idField, mode, 'beforeCacheSet');
 		const writable: Array<{ id: EntityId; entry: [string, any] }> = [];
 		for (let index = 0; index < nextEntries.length; index++) {
 			const entry = nextEntries[index];
-			if (this.cacheEpochUnchanged(entry[0], expectedEpochs)) {
-				writable[writable.length] = { id: hookIds[index], entry };
+			if (this.cacheEpochUnchanged(cache, entry[0], expectedEpochs)) {
+				writable[writable.length] = { id: expectedIds[index], entry };
 			}
 		}
 		if (!writable.length) return;
@@ -3125,17 +3471,52 @@ export class ActiveContext {
 			writeIds[index] = writable[index].id;
 			writeEntries[index] = writable[index].entry;
 		}
-		await cache.setMany(writeEntries, { ttl });
-		const staleKeys: string[] = [];
-		if (expectedEpochs) {
+		let committedEntries = writeEntries;
+		let committedIds = writeIds;
+		if (expectedVersions) {
+			if (!cacheSupportsVersioning(cache)) {
+				throw new ActiveTsConfigurationError(
+					`Cache adapter "${cache.kind}" lost distributed versioning support during a cache write.`
+				);
+			}
+			const versionedEntries = [] as Array<[string, any, string]>;
+			for (let index = 0; index < writeEntries.length; index++) {
+				const [key, value] = writeEntries[index];
+				const version = mapGet(expectedVersions, key);
+				if (version === undefined) continue;
+				versionedEntries[versionedEntries.length] = [key, value, version];
+			}
+			const results = normalizeCacheVersionedSetResult(
+				await cache.setManyVersioned(versionedEntries, { ttl }),
+				versionedEntries.length,
+				`Cache adapter "${cache.kind}" setManyVersioned result`
+			);
+			committedEntries = [];
+			committedIds = [];
+			let versionedIndex = 0;
 			for (let index = 0; index < writeEntries.length; index++) {
 				const key = writeEntries[index][0];
-				if (!this.cacheEpochUnchanged(key, expectedEpochs)) staleKeys[staleKeys.length] = key;
+				if (!mapHas(expectedVersions, key)) continue;
+				if (results[versionedIndex]) {
+					committedEntries[committedEntries.length] = writeEntries[index];
+					committedIds[committedIds.length] = writeIds[index];
+				}
+				versionedIndex++;
+			}
+		} else {
+			await cache.setMany(writeEntries, { ttl });
+		}
+		const staleKeys: string[] = [];
+		if (expectedEpochs) {
+			for (let index = 0; index < committedEntries.length; index++) {
+				const key = committedEntries[index][0];
+				if (!this.cacheEpochUnchanged(cache, key, expectedEpochs)) staleKeys[staleKeys.length] = key;
 			}
 		}
 		if (staleKeys.length) {
 			try {
-				await cache.deleteMany(staleKeys);
+				if (expectedVersions && cacheSupportsVersioning(cache)) await cache.invalidateMany(staleKeys);
+				else await cache.deleteMany(staleKeys);
 			} catch (error) {
 				for (const key of staleKeys) this.markCacheInvalidationFailure(cache, key);
 				throw error;
@@ -3143,11 +3524,11 @@ export class ActiveContext {
 		}
 		const stableEntries: Array<[string, any]> = [];
 		const stableIds: EntityId[] = [];
-		for (let index = 0; index < writeEntries.length; index++) {
-			const entry = writeEntries[index];
-			if (this.cacheEpochUnchanged(entry[0], expectedEpochs)) {
+		for (let index = 0; index < committedEntries.length; index++) {
+			const entry = committedEntries[index];
+			if (this.cacheEpochUnchanged(cache, entry[0], expectedEpochs)) {
 				stableEntries[stableEntries.length] = entry;
-				stableIds[stableIds.length] = writeIds[index];
+				stableIds[stableIds.length] = committedIds[index];
 			}
 		}
 		if (!stableEntries.length) return;
@@ -3161,16 +3542,25 @@ export class ActiveContext {
 				meta: { keys: cacheEntryKeys(stableEntries) }
 			});
 		} catch (error) {
-			await this.poisonCommittedCacheSet(cache, stableEntries, error);
+			await this.poisonCommittedCacheSet(cache, meta, stableEntries, error);
 			throw error;
 		}
 	}
 
-	private async poisonCommittedCacheSet(cache: CacheAdapter, entries: Array<[string, any]>, cause: unknown) {
+	private async poisonCommittedCacheSet(
+		cache: CacheAdapter,
+		meta: ResolvedModelMeta,
+		entries: Array<[string, any]>,
+		cause: unknown
+	) {
 		const keys = cacheEntryKeys(entries);
-		for (const key of keys) this.bumpCacheEpoch(key);
+		for (const key of keys) this.bumpCacheEpoch(cache, key);
 		try {
-			await cache.deleteMany(keys);
+			if (meta.cache?.consistency === 'distributed' && cacheSupportsVersioning(cache)) {
+				await cache.invalidateMany(keys);
+			} else {
+				await cache.deleteMany(keys);
+			}
 			for (const key of keys) this.clearCacheInvalidationFailure(cache, key);
 		} catch (error) {
 			for (const key of keys) this.markCacheInvalidationFailure(cache, key);
@@ -3182,15 +3572,15 @@ export class ActiveContext {
 		const override = snapshotPartialActiveTsConfig(config, 'fork config');
 		const overrideStores =
 			override.stores !== undefined
-				? normalizeAdapterRegistry(override.stores, 'store adapter name', assertStoreAdapter)
+				? normalizeStoreAdapterRegistry(override.stores)
 				: undefined;
 		const overrideCaches =
 			override.caches !== undefined
-				? normalizeAdapterRegistry(override.caches, 'cache adapter name', assertCacheAdapter)
+				? normalizeAdapterRegistry(override.caches, 'cache adapter name', assertCacheAdapter, markCacheAdapterSource)
 				: undefined;
 		const overrideSearch =
 			override.search !== undefined
-				? normalizeAdapterRegistry(override.search, 'search adapter name', assertSearchAdapter)
+				? normalizeAdapterRegistry(override.search, 'search adapter name', assertSearchAdapter, markSearchAdapterSource)
 				: undefined;
 		const stores = { ...this.config.stores, ...(overrideStores ?? {}) };
 		const caches =
@@ -3217,15 +3607,19 @@ export class ActiveContext {
 			caches: transactionCaches,
 			search: transactionSearch
 		};
-		if (!caches && !Object.prototype.hasOwnProperty.call(override, 'defaultCache')) {
+		if (
+			(!transactionCaches || !Object.prototype.hasOwnProperty.call(transactionCaches, this.config.defaultCache)) &&
+			!Object.prototype.hasOwnProperty.call(override, 'defaultCache')
+		) {
 			delete childConfig.defaultCache;
 		}
-		if (!transactionSearch && !Object.prototype.hasOwnProperty.call(override, 'defaultSearch')) {
+		if (
+			(!transactionSearch || !Object.prototype.hasOwnProperty.call(transactionSearch, this.config.defaultSearch)) &&
+			!Object.prototype.hasOwnProperty.call(override, 'defaultSearch')
+		) {
 			delete childConfig.defaultSearch;
 		}
 		const child = new ActiveContext(childConfig, { skipPluginSetup: true });
-		child.cacheInvalidationEpochs = this.cacheInvalidationEpochs;
-		child.cacheInvalidationFailures = this.cacheInvalidationFailures;
 		child.cacheKeyOwners = this.cacheKeyOwners;
 		child.entityCacheKeys = this.entityCacheKeys;
 		child.transactionState = transactionState;
@@ -3700,13 +4094,18 @@ function createTransactionReadOnlyStore(
 		enumerable: false,
 		configurable: false
 	});
+	const sourced = markStoreAdapterSource(readOnlyStore, adapter);
 	return storeTrustsDatastoreEntityKeyRows(adapter)
-		? markStoreTrustsDatastoreEntityKeyRows(readOnlyStore)
-		: readOnlyStore;
+		? markStoreTrustsDatastoreEntityKeyRows(sourced)
+		: sourced;
 }
 
 function createTransactionScopedStore(adapter: StoreAdapter, source?: StoreAdapter): StoreAdapter {
-	assertStoreAdapter(adapter, 'transaction callback store adapter');
+	const transactionSource = adapter;
+	const snapshot = snapshotAdapterRegistrationObject(adapter, 'transaction callback store adapter') as StoreAdapter;
+	markStoreAdapterSource(snapshot, transactionSource);
+	assertStoreAdapter(snapshot, 'transaction callback store adapter');
+	adapter = snapshot;
 	let scoped!: StoreAdapter;
 	scoped = {
 		kind: adapter.kind,
@@ -4387,8 +4786,10 @@ function findNativeSearchSourceStoreRoute(sourceStore: StoreAdapter, sourceStore
 	for (let sourceIndex = 0; sourceIndex < sourceChain.length; sourceIndex++) {
 		const source = sourceChain[sourceIndex];
 		for (const [storeName, store] of OBJECT_ENTRIES(sourceStores)) {
-			if (source !== store) continue;
-			return { storeName, sourceStore: store };
+			for (const registeredSource of storeAdapterSourceChain(store)) {
+				if (source !== registeredSource) continue;
+				return { storeName, sourceStore: store };
+			}
 		}
 	}
 	return undefined;
@@ -4435,13 +4836,19 @@ function createTransactionScopedCacheAdapter(adapter: CacheAdapter, routeName: s
 			`Cache adapter "${routeName}" cannot be mutated directly inside a transaction. Use context.invalidate() so cache changes are deferred until commit.`
 		);
 	};
-	return {
+	const scoped: CacheAdapter = {
 		kind: adapter.kind,
 		getMany: (...args) => adapter.getMany(...args),
 		setMany: rejectMutation,
 		deleteMany: rejectMutation,
 		codecKey: adapter.codecKey ? (...args) => adapter.codecKey!(...args) : undefined
 	};
+	if (cacheSupportsVersioning(adapter)) {
+		scoped.getManyVersioned = (...args) => adapter.getManyVersioned(...args);
+		scoped.setManyVersioned = rejectMutation;
+		scoped.invalidateMany = rejectMutation;
+	}
+	return markCacheAdapterSource(scoped, adapter);
 }
 
 function createTransactionScopedSearchAdapter(adapter: SearchAdapter, routeName: string): SearchAdapter {

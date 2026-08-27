@@ -1768,10 +1768,14 @@ test('transaction user afterCommit callbacks run even when internal afterCommit 
 				events.push('user');
 				throw new Error('user afterCommit failed');
 			});
+			return 'committed-result';
 		}),
 		(error: unknown) => {
-			assert.ok(error instanceof AggregateError);
-			const errors = error.errors as Error[];
+			assert.ok(error instanceof ActiveTsCommittedTransactionError);
+			assert.equal(error.committed, true);
+			assert.equal(error.result, 'committed-result');
+			assert.ok(error.cause instanceof AggregateError);
+			const errors = error.cause.errors as Error[];
 			assert.equal(errors.length, 2);
 			assert.match(errors[0]!.message, /internal afterCommit failed/);
 			assert.match(errors[1]!.message, /user afterCommit failed/);
@@ -1897,8 +1901,11 @@ test('afterCommit failures leave captured committed models rebound to the root c
 				return captured;
 			}),
 		(error: unknown) => {
-			assert.ok(error instanceof AggregateError);
-			assert.match(((error.errors as Error[])[0] as Error).message, /afterCommit failed after commit/);
+			assert.ok(error instanceof ActiveTsCommittedTransactionError);
+			assert.equal(error.committed, true);
+			assert.equal(error.result, captured);
+			assert.ok(error.cause instanceof AggregateError);
+			assert.match(((error.cause.errors as Error[])[0] as Error).message, /afterCommit failed after commit/);
 			return true;
 		}
 	);
@@ -2214,16 +2221,19 @@ test('transaction cache invalidation failures reject after the store commits', a
 			() =>
 				context.transaction(async (tx) => {
 					const TxRecord = TransactionCacheRecord.use(tx) as unknown as typeof TransactionCacheRecord;
-					const loaded = await TxRecord.find(12).load();
-					loaded!.data.value = 'after';
-					await loaded!.save();
-				}),
-			(error: unknown) => {
-				assert.ok(error instanceof AggregateError);
-				assert.match(error.message, /afterCommit task failed/);
-				assert.match((error.errors[0] as Error).message, /cache unavailable/);
-				return true;
-			}
+						const loaded = await TxRecord.find(12).load();
+						loaded!.data.value = 'after';
+						await loaded!.save();
+					}),
+				(error: unknown) => {
+					assert.ok(error instanceof ActiveTsCommittedTransactionError);
+					assert.equal(error.committed, true);
+					assert.equal(error.result, undefined);
+					assert.ok(error.cause instanceof AggregateError);
+					assert.match(error.message, /afterCommit task failed/);
+					assert.match((error.cause.errors[0] as Error).message, /cache unavailable/);
+					return true;
+				}
 		);
 	} finally {
 		console.warn = originalWarn;
@@ -2284,7 +2294,7 @@ test('transaction reads bypass stale positive and negative cache entries after w
 	assert.equal((await Record.find(21).load())?.data.value, 'created');
 });
 
-test('transaction reads bypass external cache entries to preserve store snapshot isolation', async () => {
+test('transaction reads preserve their store snapshot and reject concurrent external writes', async () => {
 	const store = new MemoryStoreAdapter();
 	const cache = new MemoryCacheAdapter();
 	const context = createActiveTs({
@@ -2294,14 +2304,21 @@ test('transaction reads bypass external cache entries to preserve store snapshot
 	const meta = context.meta(TransactionCacheRecord);
 	await store.seed(meta, [{ id: 22, value: 'snapshot' }]);
 
-	await context.transaction(async (tx) => {
-		await store.update(meta, 22, { id: 22, value: 'outside' });
-		await cache.setMany([['transaction_cache_record:number:22', { id: 22, value: 'outside' }]], { ttl: 60 });
+	await assert.rejects(
+		() =>
+			context.transaction(async (tx) => {
+				const TxRecord = TransactionCacheRecord.use(tx) as unknown as typeof TransactionCacheRecord;
+				assert.equal((await TxRecord.find(22).load())?.data.value, 'snapshot');
+				await store.update(meta, 22, { id: 22, value: 'outside' });
+				await cache.setMany([['transaction_cache_record:number:22', { id: 22, value: 'outside' }]], { ttl: 60 });
 
-		const TxRecord = TransactionCacheRecord.use(tx) as unknown as typeof TransactionCacheRecord;
-		assert.equal((await TxRecord.find(22).load())?.data.value, 'snapshot');
-		assert.equal(cache.stats.getMany, 0);
-	});
+				assert.equal((await TxRecord.find(22).load())?.data.value, 'snapshot');
+				assert.equal(cache.stats.getMany, 0);
+			}),
+		(error: unknown) =>
+			error instanceof ActiveTsConflictError && /transactional point read/.test(error.message)
+	);
+	assert.deepEqual(store.dump(meta.name), [{ id: 22, value: 'outside' }]);
 });
 
 test('transaction contexts share entity cache key collision guards with the root context', async () => {

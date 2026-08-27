@@ -17,7 +17,7 @@ import {
 	type Validator,
 	type ViewResolver
 } from './types.js';
-import { ActiveTsConfigurationError } from './errors.js';
+import { ActiveTsConfigurationError, ActiveTsValidationError } from './errors.js';
 import {
 	MAP_ENTRIES,
 	MAP_SET,
@@ -538,7 +538,8 @@ export function resolveModelMeta(
 			: {
 					adapter: entity.cache?.adapter ?? defaults.cache ?? 'default',
 					ttl: entity.cache?.ttl,
-					negativeTtl: entity.cache?.negativeTtl
+					negativeTtl: entity.cache?.negativeTtl,
+					consistency: entity.cache?.consistency
 				};
 	return freezeResolvedModelMeta({
 		model,
@@ -850,14 +851,19 @@ function sanitizeCacheOptions(entity: EntityOptions, entityName: string) {
 	if (cache === undefined || cache === false) return cache;
 	assertPlainDataObject(cache, `${entityName} cache options`);
 	const cacheRecord = cache as Record<string, unknown>;
-	assertKnownMetadataKeys(cacheRecord, ['adapter', 'ttl', 'negativeTtl'], `${entityName} cache options`);
+	assertKnownMetadataKeys(cacheRecord, ['adapter', 'ttl', 'negativeTtl', 'consistency'], `${entityName} cache options`);
+	const consistency = ownOptionValue(cacheRecord, 'consistency');
+	if (consistency !== undefined && consistency !== 'local' && consistency !== 'distributed') {
+		throw new ActiveTsValidationError(`${entityName} cache consistency must be "local" or "distributed".`);
+	}
 	return {
 		adapter: sanitizeAdapterName(ownOptionValue(cacheRecord, 'adapter') as string | undefined, 'cache adapter name'),
 		ttl: assertSafeTtl(ownOptionValue(cacheRecord, 'ttl') as number | undefined, `${entityName} cache ttl`),
 		negativeTtl: assertSafeTtl(
 			ownOptionValue(cacheRecord, 'negativeTtl') as number | undefined,
 			`${entityName} cache negativeTtl`
-		)
+		),
+		consistency: consistency as 'local' | 'distributed' | undefined
 	};
 }
 

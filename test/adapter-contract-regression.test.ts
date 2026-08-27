@@ -246,6 +246,70 @@ test('store adapter contract rejects transaction adapters that ignore optimistic
 	);
 });
 
+test('store adapter contract rejects advertised get conflict detection that loses writes', async () => {
+	const base = new MemoryStoreAdapter();
+	const broken: StoreAdapter = {
+		kind: 'broken-transaction-conflict-detection-store',
+		capabilities: { ...base.capabilities, transactionConflictDetection: true },
+		schema: base.schema,
+		get: (model, id, options) => base.get(model, id, options),
+		getMany: (model, ids, options) => base.getMany(model, ids, options),
+		query: (model, plan, options) => base.query(model, plan, options),
+		aggregate: (model, plan) => base.aggregate(model, plan),
+		create: (model, id, data, options) => base.create(model, id, data, options),
+		update: (model, id, data, options) => base.update(model, id, data, options),
+		delete: (model, id, options) => base.delete(model, id, options),
+		transaction: (callback, options) =>
+			base.transaction(
+				(tx) =>
+					callback({
+						...tx,
+						get: (model, id, readOptions) =>
+							id === 915 ? base.get(model, id, readOptions) : tx.get(model, id, readOptions)
+					}),
+				options
+			)
+	};
+
+	await assert.rejects(
+		() => runStoreAdapterContract(broken),
+		/advertises transactionConflictDetection: true but lost a concurrent write/
+	);
+});
+
+test('store adapter contract rejects advertised getMany conflict detection that loses writes', async () => {
+	const base = new MemoryStoreAdapter();
+	const broken: StoreAdapter = {
+		kind: 'broken-transaction-get-many-conflict-detection-store',
+		capabilities: { ...base.capabilities, transactionConflictDetection: true },
+		schema: base.schema,
+		get: (model, id, options) => base.get(model, id, options),
+		getMany: (model, ids, options) => base.getMany(model, ids, options),
+		query: (model, plan, options) => base.query(model, plan, options),
+		aggregate: (model, plan) => base.aggregate(model, plan),
+		create: (model, id, data, options) => base.create(model, id, data, options),
+		update: (model, id, data, options) => base.update(model, id, data, options),
+		delete: (model, id, options) => base.delete(model, id, options),
+		transaction: (callback, options) =>
+			base.transaction(
+				(tx) =>
+					callback({
+						...tx,
+						getMany: (model, ids, readOptions) =>
+							ids.length === 1 && ids[0] === 916
+								? base.getMany(model, ids, readOptions)
+								: tx.getMany(model, ids, readOptions)
+					}),
+				options
+			)
+	};
+
+	await assert.rejects(
+		() => runStoreAdapterContract(broken),
+		/advertises transactionConflictDetection: true but lost a concurrent write/
+	);
+});
+
 test('store adapter contract rejects unsupported expectedVersion deletes that are accepted', async () => {
 	const base = new MemoryStoreAdapter();
 	const broken: StoreAdapter = {

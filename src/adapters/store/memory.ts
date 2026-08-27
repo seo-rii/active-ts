@@ -76,6 +76,15 @@ type DirtyChange =
 	| { operation: 'update'; value: any; expectedVersion?: number }
 	| { operation: 'delete'; expectedVersion?: number };
 
+type PointReadSet = Map<string, Map<string, true>>;
+
+export type MemoryStoreOptions = {
+	cacheScope?: string;
+};
+
+const NUMBER_IS_SAFE_INTEGER = Number.isSafeInteger;
+const MAX_ROW_REVISION = 9_007_199_254_740_991;
+
 function cloneRow<T>(value: T | null | undefined, context: string): T | null {
 	if (value === null || value === undefined) return null;
 	return cloneSafeDataObject(value, context) as T;
@@ -127,6 +136,10 @@ export class MemoryStoreAdapter implements StoreAdapter {
 		native: false
 	};
 	private readonly collections = new Map<string, Map<string, any>>();
+	private readonly rowRevisions = new Map<string, Map<string, number>>();
+	private readonly rowRevisionTombstones = new Map<string, Map<string, number>>();
+	private readonly activeTransactionSnapshots = new Map<number, number>();
+	private rowRevisionGeneration = 0;
 	readonly stats = {
 		get: 0,
 		getMany: 0,
@@ -136,6 +149,35 @@ export class MemoryStoreAdapter implements StoreAdapter {
 		update: 0,
 		delete: 0
 	};
+
+	constructor(options: MemoryStoreOptions = {}) {
+		if (!options || typeof options !== 'object' || Array.isArray(options)) {
+			throw new ActiveTsConfigurationError('Memory store adapter options must be a plain object.');
+		}
+		const prototype = Object.getPrototypeOf(options);
+		if (prototype !== Object.prototype && prototype !== null) {
+			throw new ActiveTsConfigurationError('Memory store adapter options must be a plain object.');
+		}
+		if (Object.getOwnPropertySymbols(options).length) {
+			throw new ActiveTsConfigurationError('Memory store adapter options cannot contain symbol fields.');
+		}
+		for (const property of Object.getOwnPropertyNames(options)) {
+			if (property !== 'cacheScope') {
+				throw new ActiveTsConfigurationError(`Memory store adapter options contain unknown option "${property}".`);
+			}
+		}
+		const descriptor = Object.getOwnPropertyDescriptor(options, 'cacheScope');
+		if (descriptor && (!('value' in descriptor) || !descriptor.enumerable)) {
+			throw new ActiveTsConfigurationError('Memory store adapter option "cacheScope" must be an enumerable data property.');
+		}
+		const cacheScope = descriptor && 'value' in descriptor ? descriptor.value : undefined;
+		if (cacheScope !== undefined && (typeof cacheScope !== 'string' || !cacheScope || cacheScope.includes('\0'))) {
+			throw new ActiveTsConfigurationError(
+				'Memory store adapter cacheScope must be a non-empty string without null bytes.'
+			);
+		}
+		this.cacheScope = cacheScope as string | undefined;
+	}
 
 	async get(model: ResolvedModelMeta, id: EntityId, options?: unknown) {
 		model = snapshotAdapterModel(model, 'memory store model metadata');
@@ -222,12 +264,15 @@ export class MemoryStoreAdapter implements StoreAdapter {
 		this.stats.create++;
 		const clean = clonePortableDataObject(data, `${model.name} stored data`);
 		assertStoreDataMatchesId(model, id, clean);
-		const collection = this.collection(model.name);
 		const key = entityIdKey(id);
-		if (mapHas(collection, key)) {
+		const existing = this.existingCollection(model.name);
+		if (mapHas(existing, key)) {
 			throw new ActiveTsConflictError(`Cannot create ${model.name}:${String(id)} because it already exists.`);
 		}
+		const revision = this.reserveRowRevisions(1);
+		const collection = this.collection(model.name);
 		mapSet(collection, key, clean);
+		this.recordRowRevision(model.name, key, revision, true);
 	}
 
 	async update(model: ResolvedModelMeta, id: EntityId, data: any, options: StoreWriteOptions = {}) {
@@ -253,7 +298,9 @@ export class MemoryStoreAdapter implements StoreAdapter {
 				);
 			}
 		}
+		const revision = this.reserveRowRevisions(1);
 		mapSet(collection, key, clean);
+		this.recordRowRevision(model.name, key, revision, true);
 	}
 
 	async delete(model: ResolvedModelMeta, id: EntityId, options = {}) {
@@ -277,7 +324,11 @@ export class MemoryStoreAdapter implements StoreAdapter {
 				);
 			}
 		}
-		mapDelete(collection, key);
+		if (mapHas(collection, key)) {
+			const revision = this.reserveRowRevisions(1);
+			mapDelete(collection, key);
+			this.recordRowRevision(model.name, key, revision, false);
+		}
 	}
 
 	async transaction<T>(fn: (tx: StoreAdapter) => Promise<T>, options?: StoreTransactionOptions): Promise<T> {
@@ -297,6 +348,8 @@ export class MemoryStoreAdapter implements StoreAdapter {
 		const txStore = new MemoryStoreAdapter();
 		txStore.replaceCollections(this.cloneCollections());
 		const dirty = new Map<string, Map<string, DirtyChange>>();
+		const pointReads: PointReadSet = new Map();
+		let revisionSnapshot = 0;
 		const cloneDirty = () => {
 			const snapshot = new Map<string, Map<string, DirtyChange>>();
 			for (const [name, changes] of MAP_ENTRIES.call(dirty)) {
@@ -320,6 +373,28 @@ export class MemoryStoreAdapter implements StoreAdapter {
 		const restoreDirty = (snapshot: Map<string, Map<string, DirtyChange>>) => {
 			MAP_CLEAR.call(dirty);
 			for (const [name, changes] of MAP_ENTRIES.call(snapshot)) mapSet(dirty, name, changes);
+		};
+		const clonePointReads = () => {
+			const snapshot: PointReadSet = new Map();
+			for (const [name, reads] of MAP_ENTRIES.call(pointReads)) {
+				const clonedReads = new Map<string, true>();
+				for (const [id] of MAP_ENTRIES.call(reads)) mapSet(clonedReads, id, true);
+				mapSet(snapshot, name, clonedReads);
+			}
+			return snapshot;
+		};
+		const restorePointReads = (snapshot: PointReadSet) => {
+			MAP_CLEAR.call(pointReads);
+			for (const [name, reads] of MAP_ENTRIES.call(snapshot)) mapSet(pointReads, name, reads);
+		};
+		const recordPointRead = (model: ResolvedModelMeta, id: EntityId) => {
+			const key = entityIdKey(id);
+			let reads = mapGet(pointReads, model.name);
+			if (!reads) {
+				reads = new Map();
+				mapSet(pointReads, model.name, reads);
+			}
+			mapSet(reads, key, true);
 		};
 		const dirtyCollection = (model: ResolvedModelMeta) => {
 			const collection = mapGet(dirty, model.name) ?? new Map<string, DirtyChange>();
@@ -385,8 +460,20 @@ export class MemoryStoreAdapter implements StoreAdapter {
 			datastoreDatabaseId: this.datastoreDatabaseId,
 			datastoreKeyEncoding: this.datastoreKeyEncoding,
 			capabilities: { ...txStore.capabilities, transaction: false, savepoint: true },
-			get: (model, id, options) => txStore.get(model, id, options),
-			getMany: (model, ids, options) => txStore.getMany(model, ids, options),
+			get: async (model, id, options) => {
+				const safeModel = snapshotAdapterModel(model, 'memory store model metadata');
+				assertSafeEntityId(id, `${safeModel.name} store id`);
+				const row = await txStore.get(safeModel, id, options);
+				recordPointRead(safeModel, id);
+				return row;
+			},
+			getMany: async (model, ids, options) => {
+				const safeModel = snapshotAdapterModel(model, 'memory store model metadata');
+				const safeIds = assertSafeEntityIdArray(ids, 'memory store ids');
+				const rows = await txStore.getMany(safeModel, safeIds, options);
+				for (let index = 0; index < safeIds.length; index++) recordPointRead(safeModel, safeIds[index]);
+				return rows;
+			},
 			query: (model, plan, options) => txStore.query(model, plan, options),
 			aggregate: (model, plan) => txStore.aggregate(model, plan),
 			create: async (model, id, data, options) => {
@@ -425,11 +512,13 @@ export class MemoryStoreAdapter implements StoreAdapter {
 				}
 				const collectionsCheckpoint = txStore.cloneCollections();
 				const dirtyCheckpoint = cloneDirty();
+				const pointReadsCheckpoint = clonePointReads();
 				try {
 					return await savepointFn(tx);
 				} catch (error) {
 					txStore.replaceCollections(collectionsCheckpoint);
 					restoreDirty(dirtyCheckpoint);
+					restorePointReads(pointReadsCheckpoint);
 					throw error;
 				}
 			}
@@ -459,11 +548,12 @@ export class MemoryStoreAdapter implements StoreAdapter {
 			: tx;
 		let closed: string | undefined;
 		const guardedTx = createCloseGuardedStoreAdapter(scopedTx, () => closed, 'memory store');
+		revisionSnapshot = this.beginTransactionSnapshot();
 		try {
 			const result = await fn(guardedTx.adapter);
 			closed = 'callback finished';
 			await guardedTx.waitForPendingOperations();
-			this.applyDirty(dirty);
+			this.applyDirty(dirty, pointReads, revisionSnapshot);
 			closed = 'commit';
 			return result;
 		} catch (error) {
@@ -475,7 +565,11 @@ export class MemoryStoreAdapter implements StoreAdapter {
 			}
 			throw error;
 		} finally {
-			this.mergeStats(txStore.stats);
+			try {
+				this.mergeStats(txStore.stats);
+			} finally {
+				this.releaseTransactionSnapshot(revisionSnapshot);
+			}
 		}
 	}
 
@@ -515,8 +609,13 @@ export class MemoryStoreAdapter implements StoreAdapter {
 				throw new ActiveTsConflictError(`Cannot seed ${modelName}:${key} because it already exists.`);
 			}
 		}
+		const firstRevision = prepared.length === 0 ? 0 : this.reserveRowRevisions(prepared.length);
 		const collection = this.collection(modelName);
-		for (const [key, row] of prepared) mapSet(collection, key, row);
+		let revisionOffset = 0;
+		for (const [key, row] of prepared) {
+			mapSet(collection, key, row);
+			this.recordRowRevision(modelName, key, firstRevision + revisionOffset++, true);
+		}
 	}
 
 	async seedModel(model: ResolvedModelMeta, rows: any[]) {
@@ -552,8 +651,36 @@ export class MemoryStoreAdapter implements StoreAdapter {
 	}
 
 	reset(modelName?: string) {
-		if (modelName) mapDelete(this.collections, assertSafeSchemaIdentifier(modelName, 'memory collection name'));
-		else MAP_CLEAR.call(this.collections);
+		if (modelName) {
+			modelName = assertSafeSchemaIdentifier(modelName, 'memory collection name');
+			const collection = mapGet(this.collections, modelName);
+			let firstRevision = 0;
+			if (collection && MAP_SIZE.call(collection) > 0) {
+				firstRevision = this.reserveRowRevisions(MAP_SIZE.call(collection));
+			}
+			mapDelete(this.collections, modelName);
+			if (collection) {
+				let revisionOffset = 0;
+				for (const [id] of MAP_ENTRIES.call(collection)) {
+					this.recordRowRevision(modelName, id, firstRevision + revisionOffset++, false);
+				}
+			}
+		} else {
+			const removedCollections: Array<readonly [string, Map<string, any>]> = [];
+			let removedCount = 0;
+			for (const [name, collection] of MAP_ENTRIES.call(this.collections)) {
+				removedCollections[removedCollections.length] = [name, collection];
+				removedCount += MAP_SIZE.call(collection);
+			}
+			const firstRevision = removedCount === 0 ? 0 : this.reserveRowRevisions(removedCount);
+			MAP_CLEAR.call(this.collections);
+			let revisionOffset = 0;
+			for (const [name, collection] of removedCollections) {
+				for (const [id] of MAP_ENTRIES.call(collection)) {
+					this.recordRowRevision(name, id, firstRevision + revisionOffset++, false);
+				}
+			}
+		}
 		this.resetStats();
 	}
 
@@ -632,7 +759,94 @@ export class MemoryStoreAdapter implements StoreAdapter {
 		for (const [name, collection] of MAP_ENTRIES.call(next)) mapSet(this.collections, name, collection);
 	}
 
-	private applyDirty(dirty: Map<string, Map<string, DirtyChange>>) {
+	private reserveRowRevisions(count: number) {
+		if (
+			!NUMBER_IS_SAFE_INTEGER(this.rowRevisionGeneration) ||
+			this.rowRevisionGeneration < 0 ||
+			!NUMBER_IS_SAFE_INTEGER(count) ||
+			count <= 0 ||
+			this.rowRevisionGeneration > MAX_ROW_REVISION - count
+		) {
+			throw new ActiveTsConfigurationError('memory store row revision counter is exhausted.');
+		}
+		const firstRevision = this.rowRevisionGeneration + 1;
+		this.rowRevisionGeneration += count;
+		return firstRevision;
+	}
+
+	private recordRowRevision(name: string, id: string, revision: number, rowExists: boolean) {
+		let revisions = mapGet(this.rowRevisions, name);
+		if (!revisions) {
+			revisions = new Map();
+			mapSet(this.rowRevisions, name, revisions);
+		}
+		mapSet(revisions, id, revision);
+		let tombstones = mapGet(this.rowRevisionTombstones, name);
+		if (rowExists) {
+			if (tombstones && mapDelete(tombstones, id) && MAP_SIZE.call(tombstones) === 0) {
+				mapDelete(this.rowRevisionTombstones, name);
+			}
+			return;
+		}
+		if (this.hasSnapshotBefore(revision)) {
+			if (!tombstones) {
+				tombstones = new Map();
+				mapSet(this.rowRevisionTombstones, name, tombstones);
+			}
+			mapSet(tombstones, id, revision);
+		} else {
+			mapDelete(revisions, id);
+			if (MAP_SIZE.call(revisions) === 0) mapDelete(this.rowRevisions, name);
+			if (tombstones && mapDelete(tombstones, id) && MAP_SIZE.call(tombstones) === 0) {
+				mapDelete(this.rowRevisionTombstones, name);
+			}
+		}
+	}
+
+	private beginTransactionSnapshot() {
+		const snapshot = this.rowRevisionGeneration;
+		const count = mapGet(this.activeTransactionSnapshots, snapshot) ?? 0;
+		mapSet(this.activeTransactionSnapshots, snapshot, count + 1);
+		return snapshot;
+	}
+
+	private releaseTransactionSnapshot(snapshot: number) {
+		const count = mapGet(this.activeTransactionSnapshots, snapshot);
+		if (count === 1) mapDelete(this.activeTransactionSnapshots, snapshot);
+		else if (count !== undefined) mapSet(this.activeTransactionSnapshots, snapshot, count - 1);
+		this.compactRowRevisionTombstones();
+	}
+
+	private hasSnapshotBefore(revision: number) {
+		for (const [snapshot] of MAP_ENTRIES.call(this.activeTransactionSnapshots)) {
+			if (snapshot < revision) return true;
+		}
+		return false;
+	}
+
+	private compactRowRevisionTombstones() {
+		let oldestSnapshot: number | undefined;
+		for (const [snapshot] of MAP_ENTRIES.call(this.activeTransactionSnapshots)) {
+			if (oldestSnapshot === undefined || snapshot < oldestSnapshot) oldestSnapshot = snapshot;
+		}
+		for (const [name, tombstones] of MAP_ENTRIES.call(this.rowRevisionTombstones)) {
+			const revisions = mapGet(this.rowRevisions, name);
+			for (const [id, revision] of MAP_ENTRIES.call(tombstones)) {
+				if (oldestSnapshot === undefined || revision <= oldestSnapshot) {
+					if (revisions && mapGet(revisions, id) === revision) mapDelete(revisions, id);
+					mapDelete(tombstones, id);
+				}
+			}
+			if (revisions && MAP_SIZE.call(revisions) === 0) mapDelete(this.rowRevisions, name);
+			if (MAP_SIZE.call(tombstones) === 0) mapDelete(this.rowRevisionTombstones, name);
+		}
+	}
+
+	private applyDirty(
+		dirty: Map<string, Map<string, DirtyChange>>,
+		pointReads: PointReadSet,
+		revisionSnapshot: number
+	) {
 		for (const [name, changes] of MAP_ENTRIES.call(dirty)) {
 			const collection = mapGet(this.collections, name);
 			for (const [id, change] of MAP_ENTRIES.call(changes)) {
@@ -656,11 +870,41 @@ export class MemoryStoreAdapter implements StoreAdapter {
 				}
 			}
 		}
+		for (const [name, reads] of MAP_ENTRIES.call(pointReads)) {
+			const currentRevisions = mapGet(this.rowRevisions, name);
+			for (const [id] of MAP_ENTRIES.call(reads)) {
+				const currentRevision = currentRevisions === undefined ? undefined : mapGet(currentRevisions, id);
+				if (currentRevision !== undefined && currentRevision > revisionSnapshot) {
+					throw new ActiveTsConflictError(
+						`Transaction conflict for ${name}:${id} because it changed after a transactional point read.`
+					);
+				}
+			}
+		}
+		let mutationCount = 0;
 		for (const [name, changes] of MAP_ENTRIES.call(dirty)) {
-			const collection = this.collection(name);
+			const collection = mapGet(this.collections, name);
 			for (const [id, change] of MAP_ENTRIES.call(changes)) {
-				if (change.operation === 'delete') mapDelete(collection, id);
-				else mapSet(collection, id, cloneSafeDataObject(change.value, `${name} stored row`));
+				if (change.operation !== 'delete' || (collection !== undefined && mapHas(collection, id))) {
+					mutationCount++;
+				}
+			}
+		}
+		const firstRevision = mutationCount === 0 ? 0 : this.reserveRowRevisions(mutationCount);
+		let revisionOffset = 0;
+		for (const [name, changes] of MAP_ENTRIES.call(dirty)) {
+			for (const [id, change] of MAP_ENTRIES.call(changes)) {
+				if (change.operation === 'delete') {
+					const collection = mapGet(this.collections, name);
+					if (collection !== undefined && mapHas(collection, id)) {
+						mapDelete(collection, id);
+						this.recordRowRevision(name, id, firstRevision + revisionOffset++, false);
+					}
+				} else {
+					const collection = this.collection(name);
+					mapSet(collection, id, cloneSafeDataObject(change.value, `${name} stored row`));
+					this.recordRowRevision(name, id, firstRevision + revisionOffset++, true);
+				}
 			}
 		}
 	}

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+	ActiveTsCommittedTransactionError,
 	ActiveTsCommittedWriteError,
 	ActiveTsValidationError,
 	clearDefaultContext,
@@ -3176,10 +3177,13 @@ test('entity cache keys isolate same-named models across stores', async () => {
 	assert.equal((await Archive.find(1).load())?.data.value, 'archive');
 	assert.equal(primary.stats.getMany, 1);
 	assert.equal(archive.stats.getMany, 1);
-	assert.deepEqual(Object.keys(cache.snapshot()).sort(), [
-		'archive:cross_store_cache_record:number:1',
-		'cross_store_cache_record:number:1'
-	]);
+	const keys = Object.keys(cache.snapshot()).sort();
+	assert.equal(keys.length, 2);
+	assert.ok(keys.includes('cross_store_cache_record:number:1'));
+	assert.match(
+		keys.find((key) => key !== 'cross_store_cache_record:number:1') ?? '',
+		/^store:7:archive:local-scope:\d+:local-\d+:cross_store_cache_record:number:1$/
+	);
 });
 
 test('custom entity cache keys cannot collapse same-named models across stores', async () => {
@@ -3196,10 +3200,11 @@ test('custom entity cache keys cannot collapse same-named models across stores',
 
 	const primary = new MemoryStoreAdapter();
 	const archive = new MemoryStoreAdapter();
+	const cache = new MemoryCacheAdapter();
 	const context = createActiveTs({
 		defaultStore: 'primary',
 		stores: { primary, archive },
-		caches: { default: new MemoryCacheAdapter() },
+		caches: { default: cache },
 		cacheKey: ({ model, id }) => `${model.name}:${typeof id}:${String(id)}`
 	});
 	await primary.seed(context.meta(PrimaryRecord), [{ id: 1, value: 'primary' }]);
@@ -3208,11 +3213,9 @@ test('custom entity cache keys cannot collapse same-named models across stores',
 	const Archive = ArchiveRecord.use(context) as unknown as typeof ArchiveRecord;
 
 	assert.equal((await Primary.find(1).load())?.data.value, 'primary');
-	await assert.rejects(
-		() => Archive.find(1).load(),
-		/Entity cache key "custom_cross_store_cache_record:number:1" is already associated/
-	);
-	assert.equal(archive.stats.getMany, 0);
+	assert.equal((await Archive.find(1).load())?.data.value, 'archive');
+	assert.equal(archive.stats.getMany, 1);
+	assert.equal(Object.keys(cache.snapshot()).length, 2);
 });
 
 test('entity cache scopes isolate positive and negative entries across store instances', async () => {
@@ -4779,9 +4782,10 @@ test('function cache transaction invalidation failures poison root cache handle 
 				await lookup.invalidate(1);
 			}),
 		(error: unknown) => {
-			assert.ok(error instanceof AggregateError);
+			assert.ok(error instanceof ActiveTsCommittedTransactionError);
+			assert.ok(error.cause instanceof AggregateError);
 			assert.match(error.message, /afterCommit task failed/);
-			assert.match((error.errors[0] as Error).message, /function cache transaction delete failed/);
+			assert.match((error.cause.errors[0] as Error).message, /function cache transaction delete failed/);
 			return true;
 		}
 	);
@@ -5739,9 +5743,10 @@ test('function cache beforeCacheSet failures poison stale persistent hits', asyn
 				await lookup.set(2, 'new-transaction');
 			}),
 		(error: unknown) => {
-			assert.ok(error instanceof AggregateError);
+			assert.ok(error instanceof ActiveTsCommittedTransactionError);
+			assert.ok(error.cause instanceof AggregateError);
 			assert.match(error.message, /afterCommit task failed/);
-			assert.match((error.errors[0] as Error).message, /function cache before set failed/);
+			assert.match((error.cause.errors[0] as Error).message, /function cache before set failed/);
 			return true;
 		}
 	);
@@ -5788,9 +5793,10 @@ test('function cache set failures poison stale persistent hits', async () => {
 				await lookup.set(2, 'new-transaction');
 			}),
 		(error: unknown) => {
-			assert.ok(error instanceof AggregateError);
+			assert.ok(error instanceof ActiveTsCommittedTransactionError);
+			assert.ok(error.cause instanceof AggregateError);
 			assert.match(error.message, /afterCommit task failed/);
-			assert.match((error.errors[0] as Error).message, /function cache set failed/);
+			assert.match((error.cause.errors[0] as Error).message, /function cache set failed/);
 			return true;
 		}
 	);
@@ -6301,6 +6307,71 @@ test('entity cache set hooks cannot rewrite cache value identity', async () => {
 	await assert.rejects(
 		() => Record.find(1).load(),
 		/beforeCacheSet data\[0\] value id field "id" must match the requested id/
+	);
+	assert.deepEqual(cache.snapshot(), {});
+});
+
+test('entity cache set hooks cannot realign values by mutating hook ids', async () => {
+	const store = new MemoryStoreAdapter();
+	const cache = new MemoryCacheAdapter();
+	const context = createActiveTs({
+		stores: { default: store },
+		caches: { default: cache },
+		plugins: [
+			{
+				name: 'cache-id-realigner',
+				hooks: {
+					beforeCacheSet(payload) {
+						payload.ids?.reverse();
+						const first = payload.data[0][1];
+						payload.data[0][1] = payload.data[1][1];
+						payload.data[1][1] = first;
+					}
+				}
+			}
+		]
+	});
+	await store.seed('cache_hook_record', [
+		{ id: 1, value: 'one' },
+		{ id: 2, value: 'two' }
+	]);
+
+	await assert.rejects(
+		() => context.loadManyNow(CacheHookRecord, [1, 2]),
+		/beforeCacheSet data\[0\] value id field "id" must match the requested id/
+	);
+	assert.deepEqual(cache.snapshot(), {});
+});
+
+test('entity cache set hooks cannot rewrite keys through hook metadata', async () => {
+	const store = new MemoryStoreAdapter();
+	const cache = new MemoryCacheAdapter();
+	const context = createActiveTs({
+		stores: { default: store },
+		caches: { default: cache },
+		plugins: [
+			{
+				name: 'cache-meta-key-rewriter',
+				hooks: {
+					beforeCacheSet(payload) {
+						const firstKey = payload.data[0][0];
+						payload.data[0][0] = payload.data[1][0];
+						payload.data[1][0] = firstKey;
+						const hookKeys = payload.meta?.keys;
+						if (Array.isArray(hookKeys)) hookKeys.reverse();
+					}
+				}
+			}
+		]
+	});
+	await store.seed('cache_hook_record', [
+		{ id: 1, value: 'one' },
+		{ id: 2, value: 'two' }
+	]);
+
+	await assert.rejects(
+		() => context.loadManyNow(CacheHookRecord, [1, 2]),
+		/beforeCacheSet data cannot change cache entry keys/
 	);
 	assert.deepEqual(cache.snapshot(), {});
 });

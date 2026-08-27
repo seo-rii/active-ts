@@ -9,7 +9,12 @@ import {
 	setDefaultContext,
 	type ActiveContext
 } from '../core/context.js';
-import { ActiveTsConfigurationError, ActiveTsNotFoundError, safeErrorMessage } from '../core/errors.js';
+import {
+	ActiveTsConfigurationError,
+	ActiveTsConflictError,
+	ActiveTsNotFoundError,
+	safeErrorMessage
+} from '../core/errors.js';
 import { MemoryCacheAdapter } from '../adapters/cache/memory.js';
 import { MemorySearchAdapter } from '../adapters/search/memory.js';
 import { MemoryStoreAdapter } from '../adapters/store/memory.js';
@@ -697,7 +702,7 @@ export async function runStoreAdapterContract(
 			ancestorFields: ['parentId']
 		}
 	};
-	const cleanupIds: EntityId[] = [1, 2, 4, '1', 900, '900', 777, 778, 780, 781, 880, 881, 882, 883, 885, 886, 887, 888, 889, 890, 891, 892, 893, 894, 910, 911, 912, 913, 914, 'codec-token', 998, 999];
+	const cleanupIds: EntityId[] = [1, 2, 4, '1', 900, '900', 777, 778, 780, 781, 880, 881, 882, 883, 885, 886, 887, 888, 889, 890, 891, 892, 893, 894, 910, 911, 912, 913, 914, 915, 916, 'codec-token', 998, 999];
 	let datastoreAncestorCleanupFixtures: Array<{ id: EntityId; ancestor: DatastoreKey }> = [];
 
 	if (adapter.schema) {
@@ -2254,9 +2259,96 @@ export async function runStoreAdapterContract(
 			callbackPrecedenceResult,
 			callbackPrecedenceError,
 			`Store contract adapter "${adapter.kind}" must preserve callback errors over unobserved operation failures during rollback.`
-		);
-		assert.equal(await runStoreContractGet(adapter, model, 892), null);
-	}
+			);
+			assert.equal(await runStoreContractGet(adapter, model, 892), null);
+			if (capabilities.transactionConflictDetection === true) {
+				for (const probe of [
+					{ id: 915 as EntityId, method: 'get' as const },
+					{ id: 916 as EntityId, method: 'getMany' as const }
+				]) {
+					await adapter.create(model, probe.id, {
+						id: probe.id,
+						name: `tx-conflict-${probe.method}`,
+						score: 0
+					});
+					const probeContext =
+						`Store contract adapter "${adapter.kind}" advertises transactionConflictDetection: true` +
+						` but lost a concurrent write after a transactional ${probe.method} point read.`;
+					let markFirstRead!: () => void;
+					let releaseFirst!: () => void;
+					const firstRead = new SAFE_PROMISE<void>((resolve) => {
+						markFirstRead = resolve;
+					});
+					const firstMayCommit = new SAFE_PROMISE<void>((resolve) => {
+						releaseFirst = resolve;
+					});
+					const first = adapter.transaction!(async (tx) => {
+						const row = probe.method === 'get'
+							? await runStoreContractGet(tx, model, probe.id)
+							: (await runStoreContractGetMany(tx, model, [probe.id]))[0];
+						assert.ok(row, `${probeContext} The fixture could not be read.`);
+						markFirstRead();
+						await firstMayCommit;
+						await tx.update(model, probe.id, { ...row, score: row.score + 1 });
+					});
+					const firstOutcome = PROMISE_THEN.call(
+						first,
+						() => ({ status: 'fulfilled' as const }),
+						(reason: unknown) => ({ status: 'rejected' as const, reason })
+					) as Promise<
+						| { status: 'fulfilled' }
+						| { status: 'rejected'; reason: unknown }
+					>;
+					await SAFE_PROMISE.race([
+						firstRead,
+						PROMISE_THEN.call(firstOutcome, (outcome) => {
+							if (outcome.status === 'rejected') throw outcome.reason;
+							throw new ActiveTsConfigurationError(`${probeContext} The first callback completed before its read barrier.`);
+						})
+					]);
+					let secondOutcome: Promise<
+						| { status: 'fulfilled' }
+						| { status: 'rejected'; reason: unknown }
+					>;
+					try {
+						const second = adapter.transaction!(async (tx) => {
+							const row = probe.method === 'get'
+								? await runStoreContractGet(tx, model, probe.id)
+								: (await runStoreContractGetMany(tx, model, [probe.id]))[0];
+							assert.ok(row, `${probeContext} The fixture could not be read.`);
+							await tx.update(model, probe.id, { ...row, score: row.score + 1 });
+						});
+						secondOutcome = PROMISE_THEN.call(
+							second,
+							() => ({ status: 'fulfilled' as const }),
+							(reason: unknown) => ({ status: 'rejected' as const, reason })
+						) as typeof secondOutcome;
+					} catch (reason) {
+						secondOutcome = SAFE_PROMISE.resolve({ status: 'rejected' as const, reason });
+					} finally {
+						releaseFirst();
+					}
+					const outcomes = await SAFE_PROMISE.all([firstOutcome, secondOutcome]);
+					let fulfilled = 0;
+					const rejected: unknown[] = [];
+					for (let index = 0; index < outcomes.length; index++) {
+						const outcome = outcomes[index];
+						if (outcome.status === 'fulfilled') fulfilled++;
+						else rejected[rejected.length] = outcome.reason;
+					}
+					const conflictRow = await runStoreContractGet(adapter, model, probe.id);
+					if (fulfilled === 2) {
+						assert.equal(rejected.length, 0, probeContext);
+						assert.equal(conflictRow?.score, 2, probeContext);
+					} else {
+						assert.equal(fulfilled, 1, probeContext);
+						assert.equal(rejected.length, 1, probeContext);
+						assert.ok(rejected[0] instanceof ActiveTsConflictError, probeContext);
+						assert.equal(conflictRow?.score, 1, probeContext);
+					}
+				}
+			}
+		}
 
 	if (capabilities?.select === true) {
 		const projected = await runStoreContractQuery(adapter, model, {

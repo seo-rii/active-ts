@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+	ActiveTsConfigurationError,
 	ActiveTsConflictError,
 	ActiveTsNotFoundError,
 	ActiveTsValidationError,
@@ -556,6 +557,183 @@ test('memory store optimistic locks require an own version field', async () => {
 		delete (Object.prototype as Record<string, unknown>).version;
 	}
 	assert.deepEqual(store.dump(meta.name), [{ id: 10, name: 'unversioned', profile: { city: 'Seoul' } }]);
+});
+
+test('memory transactions reject concurrent writes after unversioned point reads', async () => {
+	for (const readMany of [false, true]) {
+		const store = new MemoryStoreAdapter();
+		await store.seed(meta, [{ id: 20, name: 'initial', profile: { city: 'Seoul' } }]);
+		let markFirstRead!: () => void;
+		let releaseFirst!: () => void;
+		const firstRead = new Promise<void>((resolve) => {
+			markFirstRead = resolve;
+		});
+		const firstMayCommit = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		const first = store.transaction(async (tx) => {
+			const row = readMany ? (await tx.getMany(meta, [20]))[0] : await tx.get(meta, 20);
+			assert.equal(row?.name, 'initial');
+			markFirstRead();
+			await firstMayCommit;
+			await tx.update(meta, 20, { id: 20, name: 'first', profile: { city: 'Busan' } });
+		});
+
+		await firstRead;
+		let secondError: unknown;
+		try {
+			await store.transaction(async (tx) => {
+				assert.equal((await tx.get(meta, 20))?.name, 'initial');
+				await tx.update(meta, 20, { id: 20, name: 'second', profile: { city: 'Incheon' } });
+			});
+		} catch (error) {
+			secondError = error;
+		} finally {
+			releaseFirst();
+		}
+
+		await assert.rejects(
+			() => first,
+			(error: unknown) =>
+				error instanceof ActiveTsConflictError && /transactional point read/.test(error.message)
+		);
+		if (secondError !== undefined) throw secondError;
+		assert.deepEqual(store.dump(meta.name), [
+			{ id: 20, name: 'second', profile: { city: 'Incheon' } }
+		]);
+	}
+});
+
+test('memory transaction conflict revisions do not depend on the global Symbol constructor', async () => {
+	const store = new MemoryStoreAdapter();
+	await store.seed(meta, [{ id: 21, name: 'initial', profile: { city: 'Seoul' } }]);
+	const symbolDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'Symbol')!;
+	const fixedSymbol = Symbol('fixed-memory-revision');
+	Object.defineProperty(globalThis, 'Symbol', {
+		...symbolDescriptor,
+		value: new Proxy(Symbol, { apply: () => fixedSymbol })
+	});
+	try {
+		let markFirstRead!: () => void;
+		let releaseFirst!: () => void;
+		const firstRead = new Promise<void>((resolve) => {
+			markFirstRead = resolve;
+		});
+		const firstMayCommit = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		const first = store.transaction(async (tx) => {
+			const row = await tx.get(meta, 21);
+			assert.equal(row?.name, 'initial');
+			markFirstRead();
+			await firstMayCommit;
+			await tx.update(meta, 21, { id: 21, name: 'first', profile: { city: 'Busan' } });
+		});
+
+		await firstRead;
+		try {
+			await store.transaction(async (tx) => {
+				const row = await tx.get(meta, 21);
+				assert.ok(row);
+				await tx.update(meta, 21, { ...row, name: 'second', profile: { city: 'Incheon' } });
+			});
+		} finally {
+			releaseFirst();
+		}
+
+		await assert.rejects(
+			() => first,
+			(error: unknown) => error instanceof ActiveTsConflictError
+		);
+	} finally {
+		Object.defineProperty(globalThis, 'Symbol', symbolDescriptor);
+	}
+	assert.equal((await store.get(meta, 21))?.name, 'second');
+});
+
+test('memory store retains missing-row tombstones only while an older transaction needs them', async () => {
+	const store = new MemoryStoreAdapter();
+	await store.seed(meta, [
+		{ id: 31, name: 'reset-one', profile: { city: 'Seoul' } },
+		{ id: 32, name: 'reset-two', profile: { city: 'Busan' } }
+	]);
+	store.reset();
+	for (let id = 100; id < 1_100; id++) {
+		await store.create(meta, id, { id, name: 'temporary', profile: { city: 'Seoul' } });
+		await store.delete(meta, id);
+	}
+	const internal = store as unknown as {
+		rowRevisions: Map<string, Map<string, number>>;
+		rowRevisionTombstones: Map<string, Map<string, number>>;
+		activeTransactionSnapshots: Map<number, number>;
+	};
+	assert.equal(internal.rowRevisions.size, 0);
+	assert.equal(internal.rowRevisionTombstones.size, 0);
+
+	let markMissingRead!: () => void;
+	let releaseTransaction!: () => void;
+	const missingRead = new Promise<void>((resolve) => {
+		markMissingRead = resolve;
+	});
+	const mayFinish = new Promise<void>((resolve) => {
+		releaseTransaction = resolve;
+	});
+	const transaction = store.transaction(async (tx) => {
+		assert.equal(await tx.get(meta, 30), null);
+		markMissingRead();
+		await mayFinish;
+	});
+
+	await missingRead;
+	assert.equal(internal.activeTransactionSnapshots.size, 1);
+	await store.create(meta, 30, { id: 30, name: 'created', profile: { city: 'Busan' } });
+	await store.delete(meta, 30);
+	assert.equal(internal.rowRevisions.get(meta.name)?.size, 1);
+	assert.equal(internal.rowRevisionTombstones.get(meta.name)?.size, 1);
+	releaseTransaction();
+
+	await assert.rejects(
+		() => transaction,
+		(error: unknown) => error instanceof ActiveTsConflictError
+	);
+	assert.equal(internal.activeTransactionSnapshots.size, 0);
+	assert.equal(internal.rowRevisions.size, 0);
+	assert.equal(internal.rowRevisionTombstones.size, 0);
+});
+
+test('memory store row revision overflow rejects every mutation before changing data', async () => {
+	const store = new MemoryStoreAdapter();
+	await store.seed(meta, [{ id: 40, name: 'original', profile: { city: 'Seoul' } }]);
+	const internal = store as unknown as {
+		rowRevisionGeneration: number;
+		activeTransactionSnapshots: Map<number, number>;
+	};
+	internal.rowRevisionGeneration = Number.MAX_SAFE_INTEGER;
+	const exhausted = (error: unknown) =>
+		error instanceof ActiveTsConfigurationError && /row revision counter is exhausted/.test(error.message);
+
+	await assert.rejects(
+		() => store.create(meta, 41, { id: 41, name: 'new', profile: { city: 'Busan' } }),
+		exhausted
+	);
+	await assert.rejects(
+		() => store.update(meta, 40, { id: 40, name: 'updated', profile: { city: 'Busan' } }),
+		exhausted
+	);
+	await assert.rejects(() => store.delete(meta, 40), exhausted);
+	await assert.rejects(
+		() =>
+			store.transaction(async (tx) => {
+				await tx.update(meta, 40, { id: 40, name: 'transaction', profile: { city: 'Incheon' } });
+			}),
+		exhausted
+	);
+	assert.throws(() => store.reset(), exhausted);
+
+	assert.deepEqual(store.dump(meta.name), [
+		{ id: 40, name: 'original', profile: { city: 'Seoul' } }
+	]);
+	assert.equal(internal.activeTransactionSnapshots.size, 0);
 });
 
 test('memory cache returns cloned values and snapshots set input values', async () => {

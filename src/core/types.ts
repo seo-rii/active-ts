@@ -197,7 +197,7 @@ export type StoreAdapter = {
 	create: (model: ResolvedModelMeta, id: EntityId, data: any, options?: StoreWriteOptions) => Promise<void>;
 	update: (model: ResolvedModelMeta, id: EntityId, data: any, options?: StoreWriteOptions) => Promise<void>;
 	delete: (model: ResolvedModelMeta, id: EntityId, options?: StoreWriteOptions) => Promise<void>;
-	transaction?: <T>(fn: (tx: StoreAdapter) => Promise<T>, options?: StoreTransactionOptions) => Promise<T>;
+	transaction?<T>(fn: (tx: StoreAdapter) => Promise<T>, options?: StoreTransactionOptions): Promise<T>;
 	savepoint?: <T>(fn: (tx: StoreAdapter) => Promise<T>) => Promise<T>;
 	schema?: {
 		plan: (models: ResolvedModelMeta[]) => Promise<SchemaPlan>;
@@ -210,8 +210,22 @@ export type CacheAdapter = {
 	getMany: (keys: string[]) => Promise<Array<any | undefined>>;
 	setMany: (entries: Array<[string, any]>, options?: CacheWriteOptions) => Promise<void>;
 	deleteMany: (keys: string[]) => Promise<void>;
+	getManyVersioned?: (keys: string[]) => Promise<CacheVersionedValue[]>;
+	setManyVersioned?: (
+		entries: CacheVersionedEntry[],
+		options?: CacheWriteOptions
+	) => Promise<boolean[]>;
+	invalidateMany?: (keys: string[]) => Promise<void>;
 	codecKey?: (key: string) => string;
 };
+
+export type CacheVersionedValue = {
+	value: any | undefined;
+	/** Opaque compare-and-set token. Consumers must not parse or order it. */
+	version: string;
+};
+
+export type CacheVersionedEntry = [key: string, value: any, expectedVersion: string];
 
 export type SearchAdapter = {
 	kind: string;
@@ -449,7 +463,12 @@ export type DatastoreModelMeta<TData = any> = {
 export type EntityOptions = {
 	name: string;
 	store?: string;
-	cache?: false | { adapter?: string; ttl?: number; negativeTtl?: number };
+	cache?: false | {
+		adapter?: string;
+		ttl?: number;
+		negativeTtl?: number;
+		consistency?: 'local' | 'distributed';
+	};
 	search?: string;
 };
 
@@ -506,7 +525,12 @@ export type ResolvedModelMeta<TData = any> = {
 	model: ModelConstructor;
 	name: string;
 	store: string;
-	cache?: { adapter: string; ttl?: number; negativeTtl?: number };
+	cache?: {
+		adapter: string;
+		ttl?: number;
+		negativeTtl?: number;
+		consistency?: 'local' | 'distributed';
+	};
 	search?: string;
 	searchDocumentIdentity?: string;
 	idField: string;

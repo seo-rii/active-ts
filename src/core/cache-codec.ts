@@ -6,6 +6,13 @@ import { snapshotArrayInput } from './array-input.js';
 import { markCacheAdapterSource } from './cache-utils.js';
 import { SET_ADD, SET_HAS, WEAKSET_ADD, WEAKSET_DELETE, WEAKSET_HAS } from './collection-intrinsics.js';
 import { JSON_PARSE, JSON_STRINGIFY } from './json-intrinsics.js';
+import {
+	assertCompleteCacheVersioning,
+	cacheSupportsVersioning,
+	normalizeCacheVersionedEntries,
+	normalizeCacheVersionedSetResult,
+	normalizeCacheVersionedValues
+} from './cache-versioning.js';
 
 export type CodecCacheAdapterOptions = {
 	kind?: string;
@@ -61,6 +68,50 @@ export function createCodecCacheAdapter(
 			await wrapped.deleteMany(keys);
 		}
 	};
+	if (cacheSupportsVersioning(wrapped)) {
+		codecAdapter.getManyVersioned = async (keys) => {
+			keys = normalizeCodecCacheKeys(keys, 'codec versioned cache keys');
+			const snapshots = normalizeCacheVersionedValues(
+				await wrapped.getManyVersioned(keys),
+				keys.length,
+				`codec cache adapter "${wrapped.kind}" getManyVersioned`
+			);
+			const codecKeys = codecContextKeys(wrapped, keys);
+			const tasks: Array<Promise<{ value: any | undefined; version: string }>> = [];
+			for (let index = 0; index < snapshots.length; index++) {
+				const snapshot = snapshots[index];
+				tasks[index] = (async () => ({
+					value: snapshot.value === undefined
+						? undefined
+						: await decodeCodecCacheValue(normalizedCodec, wrapped.kind, codecKeys[index], snapshot.value),
+					version: snapshot.version
+				}))();
+			}
+			return await Promise.all(tasks);
+		};
+		codecAdapter.setManyVersioned = async (entries, writeOptions = {}) => {
+			entries = normalizeCacheVersionedEntries(entries, 'codec versioned cache entries');
+			writeOptions = normalizeCodecCacheWriteOptions(writeOptions, 'codec versioned cache write options');
+			const tasks: Array<Promise<[string, any, string]>> = [];
+			for (let index = 0; index < entries.length; index++) {
+				const [key, value, version] = entries[index];
+				tasks[index] = (async () => {
+					const encoded = await encodeCodecCacheEntry(normalizedCodec, wrapped, key, value);
+					return [encoded[0], encoded[1], version];
+				})();
+			}
+			const encoded = await Promise.all(tasks);
+			return normalizeCacheVersionedSetResult(
+				await wrapped.setManyVersioned(encoded, writeOptions),
+				encoded.length,
+				`codec cache adapter "${wrapped.kind}" setManyVersioned`
+			);
+		};
+		codecAdapter.invalidateMany = async (keys) => {
+			keys = normalizeCodecCacheKeys(keys, 'codec cache invalidation keys');
+			await wrapped.invalidateMany(keys);
+		};
+	}
 	return markCacheAdapterSource(codecAdapter, adapter);
 }
 
@@ -185,6 +236,9 @@ function normalizeCacheAdapterShape(adapter: unknown, context: string): CacheAda
 	const getMany = objectMember(adapter, 'getMany');
 	const setMany = objectMember(adapter, 'setMany');
 	const deleteMany = objectMember(adapter, 'deleteMany');
+	const getManyVersioned = objectMember(adapter, 'getManyVersioned');
+	const setManyVersioned = objectMember(adapter, 'setManyVersioned');
+	const invalidateMany = objectMember(adapter, 'invalidateMany');
 	const codecKey = objectMember(adapter, 'codecKey');
 	if (
 		typeof kind !== 'string' ||
@@ -206,7 +260,16 @@ function normalizeCacheAdapterShape(adapter: unknown, context: string): CacheAda
 		if (typeof codecKey !== 'function') throw new ActiveTsValidationError(`${context}.codecKey must be a function.`);
 		normalized.codecKey = codecKey.bind(candidate);
 	}
+	if (getManyVersioned !== undefined) normalized.getManyVersioned = bindOptionalCacheMethod(candidate, getManyVersioned, `${context}.getManyVersioned`);
+	if (setManyVersioned !== undefined) normalized.setManyVersioned = bindOptionalCacheMethod(candidate, setManyVersioned, `${context}.setManyVersioned`);
+	if (invalidateMany !== undefined) normalized.invalidateMany = bindOptionalCacheMethod(candidate, invalidateMany, `${context}.invalidateMany`);
+	assertCompleteCacheVersioning(normalized, context);
 	return normalized;
+}
+
+function bindOptionalCacheMethod(adapter: CacheAdapter, value: unknown, context: string) {
+	if (typeof value !== 'function') throw new ActiveTsValidationError(`${context} must be a function.`);
+	return value.bind(adapter);
 }
 
 function codecContextKeys(adapter: CacheAdapter, keys: string[]) {

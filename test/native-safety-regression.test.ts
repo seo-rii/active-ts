@@ -14,7 +14,7 @@ import {
 	isPartialModel
 } from '../src/index.js';
 import type { ActiveTsPlugin } from '../src/index.js';
-import type { SearchAdapter, StoreAdapter } from '../src/index.js';
+import type { CacheAdapter, SearchAdapter, StoreAdapter, StoreTransactionOptions } from '../src/index.js';
 import { createDatastoreStoreAdapter } from '../src/adapters/store/datastore.js';
 import { createFirestoreStoreAdapter } from '../src/adapters/store/firestore.js';
 import { createMongoStoreAdapter } from '../src/adapters/store/mongodb.js';
@@ -2142,6 +2142,105 @@ test('context snapshots adapter registries at creation time', async () => {
 
 	assert.equal((await Record.find(1).load())?.data.title, 'from first store');
 	assert.throws(() => context.store('late'), /Store adapter "late" is not registered/);
+});
+
+test('context registration accepts frozen adapters without mutating caller-owned objects', async () => {
+	class PrivateFieldStore implements StoreAdapter {
+		readonly kind = 'private-field-store';
+		readonly capabilities: StoreAdapter['capabilities'];
+		readonly #store: StoreAdapter;
+
+		constructor(store: StoreAdapter, transaction = true) {
+			this.#store = store;
+			this.capabilities = Object.freeze({
+				...(store.capabilities ?? {}),
+				transaction: transaction && store.transaction !== undefined,
+				savepoint: false
+			});
+		}
+
+		get(...args: Parameters<StoreAdapter['get']>) {
+			return this.#store.get(...args);
+		}
+
+		getMany(...args: Parameters<StoreAdapter['getMany']>) {
+			return this.#store.getMany(...args);
+		}
+
+		query(...args: Parameters<StoreAdapter['query']>) {
+			return this.#store.query(...args);
+		}
+
+		aggregate(...args: Parameters<NonNullable<StoreAdapter['aggregate']>>) {
+			if (!this.#store.aggregate) throw new Error('aggregate is unavailable');
+			return this.#store.aggregate(...args);
+		}
+
+		create(...args: Parameters<StoreAdapter['create']>) {
+			return this.#store.create(...args);
+		}
+
+		update(...args: Parameters<StoreAdapter['update']>) {
+			return this.#store.update(...args);
+		}
+
+		delete(...args: Parameters<StoreAdapter['delete']>) {
+			return this.#store.delete(...args);
+		}
+
+		async transaction<T>(fn: (tx: StoreAdapter) => Promise<T>, options?: StoreTransactionOptions): Promise<T> {
+			if (!this.#store.transaction) throw new Error('transaction is unavailable');
+			return await this.#store.transaction(
+				async (tx): Promise<T> => await fn(Object.freeze(new PrivateFieldStore(tx, false))),
+				options
+			);
+		}
+	}
+
+	class PrivateFieldCache implements CacheAdapter {
+		readonly kind = 'private-field-cache';
+		readonly #values = new Map<string, unknown>();
+
+		async getMany(keys: string[]) {
+			return keys.map((key) => this.#values.get(key));
+		}
+
+		async setMany(entries: Array<[string, unknown]>) {
+			for (const [key, value] of entries) this.#values.set(key, value);
+		}
+
+		async deleteMany(keys: string[]) {
+			for (const key of keys) this.#values.delete(key);
+		}
+	}
+
+	const store = new PrivateFieldStore(new MemoryStoreAdapter());
+	const search = new MemorySearchAdapter();
+	const cache = new PrivateFieldCache();
+	Object.freeze(store);
+	Object.freeze(search);
+	Object.freeze(cache);
+
+	const context = createActiveTs({
+		stores: { default: store },
+		caches: { default: cache },
+		search: { memory: search }
+	});
+	const Record = NativeSafetyRecord.use(context) as unknown as typeof NativeSafetyRecord;
+	await Record.create({ id: 41, title: 'frozen adapters' });
+	assert.equal((await Record.find(41).load())?.data.title, 'frozen adapters');
+	await context.transaction(async (transaction) => {
+		const TransactionRecord = NativeSafetyRecord.use(transaction) as unknown as typeof NativeSafetyRecord;
+		await TransactionRecord.create({ id: 42, title: 'frozen transaction adapter' });
+	});
+	assert.equal((await Record.find(42).load())?.data.title, 'frozen transaction adapter');
+
+	const cacheHandle = context.cache('default')!;
+	await cacheHandle.setMany([['frozen-key', { value: 1 }]]);
+	assert.deepEqual(await cacheHandle.getMany(['frozen-key']), [{ value: 1 }]);
+	assert.equal(Object.prototype.hasOwnProperty.call(store, 'get'), false);
+	assert.equal(Object.prototype.hasOwnProperty.call(search, 'index'), false);
+	assert.equal(Object.prototype.hasOwnProperty.call(cache, 'getMany'), false);
 });
 
 test('context config normalizers ignore inherited option keys', async () => {

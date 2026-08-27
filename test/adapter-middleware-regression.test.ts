@@ -669,6 +669,236 @@ test('cache middleware mutation next function is one-shot', async () => {
 	assert.deepEqual(calls, ['setMany', 'deleteMany']);
 });
 
+test('cache middleware preserves atomic versioning methods', async () => {
+	const operations: string[] = [];
+	const base: CacheAdapter = {
+		kind: 'versioned-cache',
+		getMany: async (keys) => keys.map(() => undefined),
+		setMany: async () => undefined,
+		deleteMany: async () => undefined,
+		getManyVersioned: async (keys) => keys.map(() => ({ value: undefined, version: 'v1' })),
+		setManyVersioned: async (entries) => entries.map(() => true),
+		invalidateMany: async () => undefined
+	};
+	const cache = createCacheMiddlewareAdapter(base, [async (operation, next) => {
+		operations.push(operation.operation);
+		return await next();
+	}]);
+	assert.ok(cache.getManyVersioned && cache.setManyVersioned && cache.invalidateMany);
+	assert.deepEqual(await cache.getManyVersioned(['one']), [{ value: undefined, version: 'v1' }]);
+	assert.deepEqual(await cache.setManyVersioned([['one', { value: 1 }, 'v1']]), [true]);
+	await cache.invalidateMany(['one']);
+	assert.deepEqual(operations, ['getManyVersioned', 'setManyVersioned', 'invalidateMany']);
+
+	assert.throws(
+		() => createCacheMiddlewareAdapter({ ...base, invalidateMany: undefined }, []),
+		/must provide getManyVersioned\(\), setManyVersioned\(\), and invalidateMany\(\) together/
+	);
+});
+
+test('mutation middleware cannot run a late next after the operation rejects', async () => {
+	let mutations = 0;
+	let lateNext: Promise<unknown> | undefined;
+	const cache = createCacheMiddlewareAdapter(
+		{
+			kind: 'late-next-cache',
+			getMany: async (keys) => keys.map(() => undefined),
+			setMany: async () => {
+				mutations++;
+			},
+			deleteMany: async () => undefined
+		},
+		[
+			async (_operation, next) => {
+				setTimeout(() => {
+					lateNext = next();
+				}, 5);
+			}
+		]
+	);
+
+	await assert.rejects(
+		() => cache.setMany([['one', { value: 1 }]]),
+		/must call next\(\) for cache mutations/
+	);
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.equal(mutations, 0);
+	assert.ok(lateNext);
+	await assert.rejects(lateNext, /cannot call next\(\) after it settles/);
+});
+
+test('search middleware mutations must call next exactly once', async () => {
+	const context = createActiveTs({ stores: { default: new MemoryStoreAdapter() } });
+	const meta = context.meta(MiddlewareReadRecord);
+	const base = new MemorySearchAdapter();
+	const skipped = createSearchMiddlewareAdapter(base, [async () => undefined]);
+
+	await assert.rejects(
+		() => skipped.index(meta, 1, { id: 1, value: 'skipped' }),
+		/Search middleware adapter "memory\+middleware" index middleware must call next\(\)/
+	);
+	await assert.rejects(
+		() => skipped.delete(meta, 1),
+		/Search middleware adapter "memory\+middleware" delete middleware must call next\(\)/
+	);
+	assert.equal(base.stats.index, 0);
+	assert.equal(base.stats.delete, 0);
+
+	const calledTwice = createSearchMiddlewareAdapter(base, [
+		async (_context, next) => {
+			await next();
+			return await next();
+		}
+	]);
+	await assert.rejects(
+		() => calledTwice.index(meta, 2, { id: 2, value: 'twice' }),
+		/Search middleware adapter "memory\+middleware" index middleware must call next\(\) exactly once/
+	);
+	await assert.rejects(
+		() => calledTwice.delete(meta, 2),
+		/Search middleware adapter "memory\+middleware" delete middleware must call next\(\) exactly once/
+	);
+	assert.equal(base.stats.index, 1);
+	assert.equal(base.stats.delete, 1);
+});
+
+test('search middleware waits for an unawaited next mutation to settle', async () => {
+	const context = createActiveTs({ stores: { default: new MemoryStoreAdapter() } });
+	const meta = context.meta(MiddlewareReadRecord);
+	let releaseLeaf!: () => void;
+	let leafStarted!: () => void;
+	const started = new Promise<void>((resolve) => {
+		leafStarted = resolve;
+	});
+	const blocked = new Promise<void>((resolve) => {
+		releaseLeaf = resolve;
+	});
+	let indexed = false;
+	let indexedValue: unknown;
+	const search = createSearchMiddlewareAdapter(
+		{
+			kind: 'unawaited-next-search',
+			capabilities: { index: true },
+			search: async () => ({ list: [], more: false }),
+			index: async (_model, _id, data) => {
+				leafStarted();
+				await blocked;
+				indexed = true;
+				indexedValue = data.value;
+			},
+			delete: async () => undefined
+		} satisfies SearchAdapter,
+		[
+			async (operation, next) => {
+				void next();
+				(operation.args[1] as { value: string }).value = 'late overwrite';
+			}
+		]
+	);
+
+	let settled = false;
+	const indexing = search.index(meta, 1, { id: 1, value: 'one' }).finally(() => {
+		settled = true;
+	});
+	await started;
+	await Promise.resolve();
+	assert.equal(settled, false);
+	assert.equal(indexed, false);
+	releaseLeaf();
+	await indexing;
+	assert.equal(indexed, true);
+	assert.equal(indexedValue, 'one');
+});
+
+test('search middleware rejects a swallowed second next after the first leaf settles', async () => {
+	const context = createActiveTs({ stores: { default: new MemoryStoreAdapter() } });
+	const meta = context.meta(MiddlewareReadRecord);
+	let releaseLeaf!: () => void;
+	let leafStarted!: () => void;
+	const started = new Promise<void>((resolve) => {
+		leafStarted = resolve;
+	});
+	const blocked = new Promise<void>((resolve) => {
+		releaseLeaf = resolve;
+	});
+	let leafCalls = 0;
+	let swallowed: unknown;
+	const search = createSearchMiddlewareAdapter(
+		{
+			kind: 'swallowed-second-next-search',
+			capabilities: { index: true },
+			search: async () => ({ list: [], more: false }),
+			index: async () => {
+				leafCalls++;
+				leafStarted();
+				await blocked;
+			},
+			delete: async () => undefined
+		} satisfies SearchAdapter,
+		[
+			async (_operation, next) => {
+				void next();
+				try {
+					await next();
+				} catch (error) {
+					swallowed = error;
+				}
+			}
+		]
+	);
+
+	let settled = false;
+	const indexing = search.index(meta, 1, { id: 1, value: 'one' }).finally(() => {
+		settled = true;
+	});
+	const rejection = assert.rejects(
+		indexing,
+		/Search middleware adapter "swallowed-second-next-search\+middleware" index middleware must call next\(\) exactly once/
+	);
+	await started;
+	await Promise.resolve();
+	assert.equal(settled, false);
+	assert.match(String((swallowed as Error).message), /must call next\(\) exactly once/);
+	releaseLeaf();
+	await rejection;
+	assert.equal(leafCalls, 1);
+});
+
+test('search middleware preserves middleware and escaped mutation failures', async () => {
+	const context = createActiveTs({ stores: { default: new MemoryStoreAdapter() } });
+	const meta = context.meta(MiddlewareReadRecord);
+	const middlewareFailure = new Error('middleware failed first');
+	const mutationFailure = new Error('escaped mutation failed later');
+	const search = createSearchMiddlewareAdapter(
+		{
+			kind: 'unawaited-next-errors',
+			capabilities: { index: true },
+			search: async () => ({ list: [], more: false }),
+			index: async () => {
+				await Promise.resolve();
+				throw mutationFailure;
+			},
+			delete: async () => undefined
+		} satisfies SearchAdapter,
+		[
+			async (_operation, next) => {
+				void next();
+				throw middlewareFailure;
+			}
+		]
+	);
+
+	await assert.rejects(
+		() => search.index(meta, 1, { id: 1, value: 'one' }),
+		(error: AggregateError) => {
+			assert.equal(error instanceof AggregateError, true);
+			assert.deepEqual(error.errors, [middlewareFailure, mutationFailure]);
+			assert.match(error.message, /middleware and search mutation both failed/);
+			return true;
+		}
+	);
+});
+
 test('store middleware aggregate results reject unknown aliases without invoking accessors', async () => {
 	const context = createActiveTs({ stores: { default: new MemoryStoreAdapter() } });
 	const meta = context.meta(MiddlewareReadRecord);

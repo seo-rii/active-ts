@@ -84,6 +84,13 @@ import {
 import { snapshotArrayInput } from './array-input.js';
 import { cloneDate } from './date-intrinsics.js';
 import { markCacheAdapterSource } from './cache-utils.js';
+import {
+	assertCompleteCacheVersioning,
+	cacheSupportsVersioning,
+	normalizeCacheVersionedEntries,
+	normalizeCacheVersionedSetResult,
+	normalizeCacheVersionedValues
+} from './cache-versioning.js';
 import { markStoreAdapterSource } from './store-utils.js';
 import { entityIdKey } from './query-utils.js';
 import { SET_ADD, SET_HAS, WEAKMAP_GET, WEAKMAP_HAS, WEAKMAP_SET, WEAKSET_ADD, WEAKSET_HAS } from './collection-intrinsics.js';
@@ -114,7 +121,7 @@ export type StoreMiddleware = (
 ) => Promise<any>;
 
 export type CacheMiddlewareContext = {
-	operation: 'getMany' | 'setMany' | 'deleteMany';
+	operation: 'getMany' | 'setMany' | 'deleteMany' | 'getManyVersioned' | 'setManyVersioned' | 'invalidateMany';
 	keys: string[];
 	args: unknown[];
 };
@@ -473,6 +480,46 @@ export function createCacheMiddlewareAdapter(
 			return await runMutation({ operation: 'deleteMany', keys: safeKeys, args: snapshotMiddlewareArgs([safeKeys]) }, () => wrapped.deleteMany(safeKeys));
 		})
 	};
+	if (cacheSupportsVersioning(wrapped)) {
+		middlewareAdapter.getManyVersioned = (keys) => track(async () => {
+			const safeKeys = normalizeCacheMiddlewareKeys(keys, 'cache middleware getManyVersioned keys');
+			return normalizeCacheVersionedValues(
+				await run(
+					{ operation: 'getManyVersioned', keys: safeKeys, args: snapshotMiddlewareArgs([safeKeys]) },
+					() => wrapped.getManyVersioned(safeKeys)
+				),
+				safeKeys.length,
+				`cache middleware adapter "${adapterKind}" getManyVersioned`
+			);
+		});
+		middlewareAdapter.setManyVersioned = (entries, options) => track(async () => {
+			const normalizedEntries = normalizeCacheVersionedEntries(entries, 'cache middleware setManyVersioned entries');
+			const keys: string[] = [];
+			for (let index = 0; index < normalizedEntries.length; index++) keys[index] = normalizedEntries[index][0];
+			const writeOptions = normalizeCacheMiddlewareWriteOptions(options, 'cache middleware setManyVersioned options');
+			if (!normalizedEntries.length) return [];
+			return normalizeCacheVersionedSetResult(
+				await runMutation(
+					{
+						operation: 'setManyVersioned',
+						keys,
+						args: snapshotMiddlewareArgs([normalizedEntries, writeOptions])
+					},
+					() => wrapped.setManyVersioned(normalizedEntries, writeOptions)
+				),
+				normalizedEntries.length,
+				`cache middleware adapter "${adapterKind}" setManyVersioned`
+			);
+		});
+		middlewareAdapter.invalidateMany = (keys) => track(async () => {
+			const safeKeys = normalizeCacheMiddlewareKeys(keys, 'cache middleware invalidateMany keys');
+			if (!safeKeys.length) return;
+			await runMutation(
+				{ operation: 'invalidateMany', keys: safeKeys, args: snapshotMiddlewareArgs([safeKeys]) },
+				() => wrapped.invalidateMany(safeKeys)
+			);
+		});
+	}
 	markCacheAdapterSource(middlewareAdapter, adapter);
 	return inheritAdapterTransactionOperationCarrier(middlewareAdapter, adapter);
 }
@@ -489,6 +536,8 @@ export function createSearchMiddlewareAdapter(
 	const layers = normalizeMiddleware(middleware, 'search middleware');
 	const run = (context: SearchMiddlewareContext, leaf: () => Promise<any>) =>
 		runMiddlewareLayers(layers, context, leaf);
+	const runMutation = (context: SearchMiddlewareContext, leaf: () => Promise<any>) =>
+		runRequiredSearchMutationMiddleware(layers, context, leaf, adapterKind);
 	const track = <T>(operation: () => Promise<T>) => trackAdapterTransactionOperation(
 		adapter,
 		() => nativeSource ? trackStoreTransactionOperation(nativeSource, operation) : operation()
@@ -534,14 +583,14 @@ export function createSearchMiddlewareAdapter(
 			});
 			const adapterData = cloneSafeDataObjectWithoutActiveEntityKey(safeData, 'search middleware index data');
 			assertSearchIndexSupported(adapterKind, wrapped.capabilities);
-			await run({ operation: 'index', model: indexModel, args: snapshotMiddlewareArgs([safeId, adapterData]) }, () => wrapped.index(model, safeId, adapterData));
+			await runMutation({ operation: 'index', model: indexModel, args: snapshotMiddlewareArgs([safeId, adapterData]) }, () => wrapped.index(model, safeId, adapterData));
 		}),
 		delete: (model: ResolvedModelMeta, id: EntityId) => track(async () => {
 			model = snapshotSearchAdapterModel(model, 'search middleware model metadata', indexAdapterKind);
 			const safeId = normalizeMiddlewareEntityId(id, 'search middleware delete id');
 			assertSearchIndexSupported(adapterKind, wrapped.capabilities);
 			searchDocumentIdentity(model, safeId, 'search middleware delete id');
-			await run({ operation: 'delete', model, args: snapshotMiddlewareArgs([safeId]) }, () => wrapped.delete(model, safeId));
+			await runMutation({ operation: 'delete', model, args: snapshotMiddlewareArgs([safeId]) }, () => wrapped.delete(model, safeId));
 		})
 	};
 	const readCapabilities = searchCapabilityReader(wrapped);
@@ -774,13 +823,21 @@ function assertStoreCapabilityMethods(
 function normalizeCacheAdapter(adapter: unknown, context: string): CacheAdapter {
 	const kind = normalizeAdapterObject(adapter, context);
 	const record = adapter as CacheAdapter;
-	return {
+	const normalized: CacheAdapter = {
 		kind,
 		getMany: requiredAdapterFunction(record, 'getMany', context),
 		setMany: requiredAdapterFunction(record, 'setMany', context),
 		deleteMany: requiredAdapterFunction(record, 'deleteMany', context),
 		codecKey: optionalAdapterFunction(record, 'codecKey', context, { requireEnumerableOwn: false })
 	};
+	const getManyVersioned = optionalAdapterFunction(record, 'getManyVersioned', context, { requireEnumerableOwn: false });
+	const setManyVersioned = optionalAdapterFunction(record, 'setManyVersioned', context, { requireEnumerableOwn: false });
+	const invalidateMany = optionalAdapterFunction(record, 'invalidateMany', context, { requireEnumerableOwn: false });
+	if (getManyVersioned) normalized.getManyVersioned = getManyVersioned;
+	if (setManyVersioned) normalized.setManyVersioned = setManyVersioned;
+	if (invalidateMany) normalized.invalidateMany = invalidateMany;
+	assertCompleteCacheVersioning(normalized, context);
+	return normalized;
 }
 
 function normalizeSearchAdapter(adapter: unknown, context: string): SearchAdapter {
@@ -1221,25 +1278,7 @@ async function runRequiredStoreWriteMiddleware(
 	leaf: () => Promise<any>,
 	adapterKind: string
 ) {
-	let leafCalls = 0;
-	let successfulLeafWrites = 0;
-	const result = await runMiddlewareLayers(layers, context, async () => {
-		if (leafCalls >= 1) {
-			throw new ActiveTsConfigurationError(
-				`Store middleware adapter "${adapterKind}" ${context.operation} middleware must call next() exactly once for write operations.`
-			);
-		}
-		leafCalls++;
-		const value = await leaf();
-		successfulLeafWrites++;
-		return value;
-	});
-	if (successfulLeafWrites < 1) {
-		throw new ActiveTsConfigurationError(
-			`Store middleware adapter "${adapterKind}" ${context.operation} middleware must call next() for write operations.`
-		);
-	}
-	return result;
+	return runRequiredMutationMiddleware(layers, context, leaf, adapterKind, 'Store', 'write operations', 'store write');
 }
 
 async function runRequiredCacheMutationMiddleware(
@@ -1248,25 +1287,108 @@ async function runRequiredCacheMutationMiddleware(
 	leaf: () => Promise<any>,
 	adapterKind: string
 ) {
+	return runRequiredMutationMiddleware(layers, context, leaf, adapterKind, 'Cache', 'cache mutations', 'cache mutation');
+}
+
+async function runRequiredSearchMutationMiddleware(
+	layers: ReadonlyArray<SearchMiddleware>,
+	context: SearchMiddlewareContext,
+	leaf: () => Promise<any>,
+	adapterKind: string
+) {
+	return runRequiredMutationMiddleware(layers, context, leaf, adapterKind, 'Search', 'search mutations', 'search mutation');
+}
+
+async function runRequiredMutationMiddleware<TContext>(
+	layers: ReadonlyArray<(context: TContext, next: () => Promise<any>) => Promise<any>>,
+	context: TContext & { operation: string },
+	leaf: () => Promise<any>,
+	adapterKind: string,
+	adapterLabel: 'Store' | 'Cache' | 'Search',
+	requirement: string,
+	mutationLabel: string
+) {
 	let leafCalls = 0;
-	let successfulLeafMutations = 0;
-	const result = await runMiddlewareLayers(layers, context, async () => {
-		if (leafCalls >= 1) {
-			throw new ActiveTsConfigurationError(
-				`Cache middleware adapter "${adapterKind}" ${context.operation} middleware must call next() exactly once for cache mutations.`
-			);
-		}
-		leafCalls++;
-		const value = await leaf();
-		successfulLeafMutations++;
-		return value;
-	});
-	if (successfulLeafMutations < 1) {
+	let leafPromise: Promise<any> | undefined;
+	let duplicateNextError: ActiveTsConfigurationError | undefined;
+	let lateNextError: ActiveTsConfigurationError | undefined;
+	let acceptingNext = true;
+	let middlewareResult: any;
+	let middlewareError: unknown;
+	let middlewareFailed = false;
+	try {
+		middlewareResult = await runMiddlewareLayers(layers, context, () => {
+			if (!acceptingNext) {
+				lateNextError ??= new ActiveTsConfigurationError(
+					`${adapterLabel} middleware adapter "${adapterKind}" ${context.operation} middleware cannot call next() after it settles.`
+				);
+				const rejected = Promise.reject(lateNextError);
+				void rejected.catch(() => undefined);
+				return rejected;
+			}
+			leafCalls++;
+			if (leafCalls > 1) {
+				duplicateNextError ??= new ActiveTsConfigurationError(
+					`${adapterLabel} middleware adapter "${adapterKind}" ${context.operation} middleware must call next() exactly once for ${requirement}.`
+				);
+				throw duplicateNextError;
+			}
+			try {
+				leafPromise = Promise.resolve(leaf());
+			} catch (error) {
+				leafPromise = Promise.reject(error);
+			}
+			void leafPromise.catch(() => undefined);
+			return leafPromise;
+		});
+	} catch (error) {
+		middlewareFailed = true;
+		middlewareError = error;
+	} finally {
+		acceptingNext = false;
+	}
+	if (leafCalls < 1) {
+		if (middlewareFailed) throw middlewareError;
 		throw new ActiveTsConfigurationError(
-			`Cache middleware adapter "${adapterKind}" ${context.operation} middleware must call next() for cache mutations.`
+			`${adapterLabel} middleware adapter "${adapterKind}" ${context.operation} middleware must call next() for ${requirement}.`
 		);
 	}
-	return result;
+	let leafError: unknown;
+	let leafFailed = false;
+	try {
+		await leafPromise;
+	} catch (error) {
+		leafFailed = true;
+		leafError = error;
+	}
+	if (leafFailed && !middlewareFailed) {
+		throw new ActiveTsConfigurationError(
+			`${adapterLabel} middleware adapter "${adapterKind}" ${context.operation} middleware must call next() for ${requirement}.`
+		);
+	}
+	const errors: unknown[] = [];
+	if (middlewareFailed) errors[errors.length] = middlewareError;
+	if (duplicateNextError !== undefined && duplicateNextError !== middlewareError) {
+		errors[errors.length] = duplicateNextError;
+	}
+	if (
+		lateNextError !== undefined &&
+		lateNextError !== middlewareError &&
+		lateNextError !== duplicateNextError
+	) {
+		errors[errors.length] = lateNextError;
+	}
+	if (leafFailed && leafError !== middlewareError && leafError !== duplicateNextError) {
+		errors[errors.length] = leafError;
+	}
+	if (errors.length > 1) {
+		throw new AggregateError(
+			errors,
+			`${adapterLabel} middleware adapter "${adapterKind}" ${context.operation} middleware and ${mutationLabel} both failed.`
+		);
+	}
+	if (errors.length === 1) throw errors[0];
+	return middlewareResult;
 }
 
 function normalizeCacheMiddlewareKeys(keys: unknown, context: string) {

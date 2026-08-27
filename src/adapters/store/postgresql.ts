@@ -91,8 +91,9 @@ export type PostgresStoreOptions = {
 	connectionString?: string;
 	schema?: string;
 	inTransaction?: boolean;
+	cacheScope?: string;
 };
-const POSTGRES_OPTION_KEYS = ['pool', 'connectionString', 'schema', 'inTransaction'] as const;
+const POSTGRES_OPTION_KEYS = ['pool', 'connectionString', 'schema', 'inTransaction', 'cacheScope'] as const;
 
 const POSTGRES_OPERATORS = capturedSet(['=', '!=', '>', '>=', '<', '<=', 'in', 'between', 'isNull', 'isNotNull', 'startsWith']);
 const POSTGRES_IDENTIFIER_MAX_BYTES = 63;
@@ -1289,6 +1290,7 @@ async function createPostgresStoreAdapterInternal(
 
 	const adapter: StoreAdapter = {
 		kind: 'postgresql',
+		cacheScope: options.cacheScope,
 		capabilities: {
 			or: true,
 			contains: false,
@@ -1671,7 +1673,8 @@ async function createPostgresStoreAdapterInternal(
 					{
 						pool: transactionPool,
 						schema: options.schema,
-						inTransaction: true
+						inTransaction: true,
+						cacheScope: options.cacheScope
 					},
 					transactionNativeQuery,
 					trackTransactionNativeOperation,
@@ -1937,6 +1940,7 @@ function validatePostgresOptions(options: PostgresStoreOptions) {
 	const schema = ownFactoryOptionValue(record, 'schema', 'PostgreSQL adapter option');
 	const inTransaction = ownFactoryOptionValue(record, 'inTransaction', 'PostgreSQL adapter option');
 	const pool = ownFactoryOptionValue(record, 'pool', 'PostgreSQL adapter option');
+	const cacheScope = ownFactoryOptionValue(record, 'cacheScope', 'PostgreSQL adapter option');
 	if (connectionString !== undefined && typeof connectionString !== 'string') {
 		throw new ActiveTsConfigurationError('PostgreSQL adapter connectionString must be a string.');
 	}
@@ -1954,10 +1958,15 @@ function validatePostgresOptions(options: PostgresStoreOptions) {
 	if (inTransaction !== undefined && typeof inTransaction !== 'boolean') {
 		throw new ActiveTsConfigurationError('PostgreSQL adapter inTransaction must be a boolean.');
 	}
+	if (cacheScope !== undefined && (typeof cacheScope !== 'string' || !cacheScope || cacheScope.includes('\0'))) {
+		throw new ActiveTsConfigurationError(
+			'PostgreSQL adapter cacheScope must be a non-empty string without null bytes.'
+		);
+	}
 	if (pool !== undefined) {
 		normalizePostgresPool(pool);
 	}
-	return { connectionString, schema, inTransaction, pool } as PostgresStoreOptions;
+	return { connectionString, schema, inTransaction, pool, cacheScope } as PostgresStoreOptions;
 }
 
 function assertPlainFactoryOptions(options: object, context: string) {

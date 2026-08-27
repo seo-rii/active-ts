@@ -1772,30 +1772,20 @@ test('context snapshots registered adapter methods', async () => {
 		search: { default: search }
 	} as any);
 
-	assert.throws(() => {
-		(store as any).query = async () => ({ list: [{ id: 1, value: 'mutated' }], more: false });
-	}, TypeError);
-	assert.throws(() => {
-		(cache as any).getMany = async () => ['cache-mutated'];
-	}, TypeError);
-	assert.throws(() => {
-		(search as any).search = async () => ({ list: [{ id: 1, value: 'search-mutated' }], more: false });
-	}, TypeError);
-	assert.throws(() => {
-		(store.schema as any).plan = async () => ({
+	(store as any).query = async () => ({ list: [{ id: 1, value: 'mutated' }], more: false });
+	(cache as any).getMany = async () => ['cache-mutated'];
+	(search as any).search = async () => ({ list: [{ id: 1, value: 'search-mutated' }], more: false });
+	(store.schema as any).plan = async () => ({
+		adapter: 'snapshot-store',
+		changes: [{ type: 'create-collection', target: 'mutated' }]
+	});
+	(store as any).schema = {
+		plan: async () => ({
 			adapter: 'snapshot-store',
-			changes: [{ type: 'create-collection', target: 'mutated' }]
-		});
-	}, TypeError);
-	assert.throws(() => {
-		(store as any).schema = {
-			plan: async () => ({
-				adapter: 'snapshot-store',
-				changes: [{ type: 'create-collection', target: 'replaced' }]
-			}),
-			apply: async () => ({ adapter: 'snapshot-store', changes: [] })
-		};
-	}, TypeError);
+			changes: [{ type: 'create-collection', target: 'replaced' }]
+		}),
+		apply: async () => ({ adapter: 'snapshot-store', changes: [] })
+	};
 
 	const Record = PlannerContextConfigRecord.use(context) as unknown as typeof PlannerContextConfigRecord;
 	assert.deepEqual((await Record.query().load()).list.map((item) => item.data.value), ['store-query']);

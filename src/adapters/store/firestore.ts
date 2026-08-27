@@ -77,13 +77,14 @@ export type FirestoreStoreOptions = {
 	firestoreOptions?: Record<string, any>;
 	aggregateField?: any;
 	allowAggregateScanFallback?: boolean;
+	cacheScope?: string;
 };
 export type FirestoreTransactionNativeOptions = {
 	readOnly?: boolean;
 	readTime?: unknown;
 	maxAttempts?: number;
 };
-const FIRESTORE_OPTION_KEYS = ['client', 'firestoreOptions', 'aggregateField', 'allowAggregateScanFallback'] as const;
+const FIRESTORE_OPTION_KEYS = ['client', 'firestoreOptions', 'aggregateField', 'allowAggregateScanFallback', 'cacheScope'] as const;
 const FIRESTORE_TRANSACTION_NATIVE_OPTION_KEYS = ['readOnly', 'readTime', 'maxAttempts'] as const;
 type FirestoreTransactionMutation =
 	| { operation: 'create' | 'update'; data: Record<string, unknown> }
@@ -287,6 +288,7 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 
 	const adapter: StoreAdapter = {
 		kind: 'firestore',
+		cacheScope: options.cacheScope,
 		capabilities: {
 			or: false,
 			contains: false,
@@ -782,6 +784,7 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 				};
 				const tx: StoreAdapter = {
 					kind: 'firestore',
+					cacheScope: options.cacheScope,
 					capabilities: { ...adapter.capabilities, transaction: false, aggregate: false, native: false },
 					get: async (model, id, options) => {
 						model = snapshotAdapterModel(model, 'Firestore transaction model metadata');
@@ -928,6 +931,7 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 							};
 							return {
 								kind: tx.kind,
+								cacheScope: tx.cacheScope,
 								capabilities: { ...tx.capabilities, transaction: false, native: false },
 								get: (model, id, options) => tx.get(model, id, options),
 								getMany: (model, ids, options) => tx.getMany(model, ids, options),
@@ -1131,6 +1135,7 @@ function validateFirestoreOptions(options: FirestoreStoreOptions) {
 	const client = ownFactoryOptionValue(record, 'client', 'Firestore adapter option');
 	const aggregateField = ownFactoryOptionValue(record, 'aggregateField', 'Firestore adapter option');
 	const allowAggregateScanFallback = ownFactoryOptionValue(record, 'allowAggregateScanFallback', 'Firestore adapter option');
+	const cacheScope = ownFactoryOptionValue(record, 'cacheScope', 'Firestore adapter option');
 	const safeFirestoreOptions =
 		firestoreOptions === undefined
 			? undefined
@@ -1144,11 +1149,17 @@ function validateFirestoreOptions(options: FirestoreStoreOptions) {
 	if (allowAggregateScanFallback !== undefined && typeof allowAggregateScanFallback !== 'boolean') {
 		throw new ActiveTsConfigurationError('Firestore adapter allowAggregateScanFallback must be a boolean.');
 	}
+	if (cacheScope !== undefined && (typeof cacheScope !== 'string' || !cacheScope || cacheScope.includes('\0'))) {
+		throw new ActiveTsConfigurationError(
+			'Firestore adapter cacheScope must be a non-empty string without null bytes.'
+		);
+	}
 	return {
 		firestoreOptions: safeFirestoreOptions,
 		client,
 		aggregateField,
-		allowAggregateScanFallback
+		allowAggregateScanFallback,
+		cacheScope
 	} as FirestoreStoreOptions;
 }
 

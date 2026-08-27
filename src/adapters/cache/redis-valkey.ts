@@ -1,7 +1,12 @@
+import { randomBytes } from 'node:crypto';
 import { optionalImport } from '../../core/optional-import.js';
 import { assertCacheableValue, assertSafeCacheKey, assertSafeTtl, defineDataProperty } from '../../core/safe-keys.js';
 import { ActiveTsValidationError } from '../../core/errors.js';
 import type { CacheAdapter, CacheCodec, CacheWriteOptions } from '../../core/types.js';
+import {
+	normalizeCacheVersion,
+	normalizeCacheVersionedEntries
+} from '../../core/cache-versioning.js';
 import { snapshotArrayInput } from '../../core/array-input.js';
 import { SET_ADD, SET_HAS, WEAKSET_ADD, WEAKSET_DELETE, WEAKSET_HAS } from '../../core/collection-intrinsics.js';
 import { JSON_PARSE, JSON_STRINGIFY } from '../../core/json-intrinsics.js';
@@ -14,6 +19,75 @@ export type RedisValkeyOptions = {
 };
 const REDIS_VALKEY_OPTION_KEYS = ['client', 'url', 'prefix', 'codec'] as const;
 const CACHE_WRITE_OPTION_KEYS = ['ttl'] as const;
+// Missing-value revisions are fences, not durable data. CAS always rejects a missing
+// revision, so expiry can only cause a safe retry with a newly generated token.
+const VERSION_TOMBSTONE_TTL_SECONDS = 24 * 60 * 60;
+const VERSIONED_GET_SCRIPT = `
+local value = redis.call('GET', KEYS[1])
+local version = redis.call('GET', KEYS[2])
+if not version then
+  version = ARGV[1]
+  if value then
+    local valueTtl = redis.call('PTTL', KEYS[1])
+    if valueTtl >= 0 then
+      redis.call('SET', KEYS[2], version, 'PX', valueTtl)
+    else
+      redis.call('SET', KEYS[2], version)
+    end
+  else
+    redis.call('SET', KEYS[2], version, 'EX', ARGV[2])
+  end
+elseif value then
+  local valueTtl = redis.call('PTTL', KEYS[1])
+  if valueTtl >= 0 then
+    redis.call('PEXPIRE', KEYS[2], valueTtl)
+  else
+    redis.call('PERSIST', KEYS[2])
+  end
+elseif redis.call('TTL', KEYS[2]) < 0 then
+  redis.call('EXPIRE', KEYS[2], ARGV[2])
+end
+return { value, version }
+`;
+const VERSIONED_SET_SCRIPT = `
+local version = redis.call('GET', KEYS[2])
+if not version then
+  local replacement = ARGV[4]
+  if replacement == ARGV[1] then replacement = replacement .. ':rotated' end
+  redis.call('SET', KEYS[2], replacement, 'EX', ARGV[5])
+  return 0
+end
+if version ~= ARGV[1] then return 0 end
+if ARGV[3] == '' then
+  redis.call('SET', KEYS[1], ARGV[2])
+  redis.call('SET', KEYS[2], version)
+else
+  redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+  redis.call('SET', KEYS[2], version, 'EX', ARGV[3])
+end
+return 1
+`;
+const UNCONDITIONAL_SET_SCRIPT = `
+local token = ARGV[3]
+local version = redis.call('GET', KEYS[2])
+if version and token == version then token = token .. ':rotated' end
+if ARGV[2] == '' then
+  redis.call('SET', KEYS[1], ARGV[1])
+  redis.call('SET', KEYS[2], token)
+else
+  redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+  redis.call('SET', KEYS[2], token, 'EX', ARGV[2])
+end
+return 1
+`;
+const INVALIDATE_SCRIPT = `
+local token = ARGV[1]
+local version = redis.call('GET', KEYS[2])
+if version and token == version then token = token .. ':rotated' end
+redis.call('DEL', KEYS[1])
+redis.call('SET', KEYS[2], token, 'EX', ARGV[2])
+return 1
+`;
 
 const pack = (value: any) => {
 	const serialized = JSON_STRINGIFY(snapshotRedisValkeyJson(value));
@@ -40,6 +114,7 @@ export async function createRedisValkeyCacheAdapter(options: RedisValkeyOptions 
 	const codec = options.codec;
 	const prefix = normalizePrefix(options.prefix);
 	const key = (raw: string) => redisValkeyPhysicalKey(prefix, assertSafeCacheKey(raw, 'redis-valkey cache key'));
+	const versionKey = (raw: string) => redisValkeyVersionKey(key(raw));
 	const encode = async (entryKey: string, value: any) => {
 		const physicalKey = key(entryKey);
 		if (!codec) return pack(value);
@@ -64,8 +139,24 @@ export async function createRedisValkeyCacheAdapter(options: RedisValkeyOptions 
 		assertCacheableValue(decoded);
 		return structuredClone(decoded);
 	};
+	const invalidateVersionedKeys = async (keys: string[]) => {
+		const tasks: Array<Promise<void>> = [];
+		for (let index = 0; index < keys.length; index++) {
+			const entryKey = keys[index];
+			tasks[index] = (async () => {
+				const reply = await client.eval!(INVALIDATE_SCRIPT, {
+					keys: [key(entryKey), versionKey(entryKey)],
+					arguments: [createRedisVersionToken(), String(VERSION_TOMBSTONE_TTL_SECONDS)]
+				});
+				if (reply !== 1) {
+					throw new ActiveTsValidationError('redis-valkey cache invalidation result must be 1.');
+				}
+			})();
+		}
+		await Promise.all(tasks);
+	};
 
-	return {
+	const adapter: CacheAdapter = {
 		kind: 'redis-valkey',
 		codecKey: key,
 		async getMany(keys) {
@@ -90,6 +181,31 @@ export async function createRedisValkeyCacheAdapter(options: RedisValkeyOptions 
 				assertCacheableValue(value);
 			}
 			const ttl = assertSafeTtl(writeOptions.ttl, 'redis-valkey cache ttl');
+			if (client.eval) {
+				const encoded: Array<string | Buffer> = [];
+				for (let index = 0; index < entries.length; index++) {
+					encoded[index] = await encode(entries[index][0], entries[index][1]);
+				}
+				const tasks: Array<Promise<void>> = [];
+				for (let index = 0; index < entries.length; index++) {
+					const entryKey = entries[index][0];
+					tasks[index] = (async () => {
+						const reply = await client.eval!(UNCONDITIONAL_SET_SCRIPT, {
+							keys: [key(entryKey), versionKey(entryKey)],
+							arguments: [
+								encoded[index],
+								ttl === undefined ? '' : String(Math.ceil(ttl)),
+								createRedisVersionToken()
+							]
+						});
+						if (reply !== 1) {
+							throw new ActiveTsValidationError('redis-valkey cache set result must be 1.');
+						}
+					})();
+				}
+				await Promise.all(tasks);
+				return;
+			}
 			if (ttl !== undefined) {
 				const multi = normalizeRedisValkeyMulti(client.multi());
 				for (const [entryKey, value] of entries)
@@ -104,6 +220,10 @@ export async function createRedisValkeyCacheAdapter(options: RedisValkeyOptions 
 		},
 		async deleteMany(keys) {
 			keys = normalizeCacheKeys(keys, 'redis-valkey cache keys');
+			if (client.eval) {
+				await invalidateVersionedKeys(keys);
+				return;
+			}
 			if (keys.length) {
 				const physicalKeys: string[] = [];
 				for (let index = 0; index < keys.length; index++) {
@@ -113,6 +233,75 @@ export async function createRedisValkeyCacheAdapter(options: RedisValkeyOptions 
 			}
 		}
 	};
+	if (client.eval) {
+		adapter.getManyVersioned = async (keys) => {
+			keys = normalizeCacheKeys(keys, 'redis-valkey versioned cache keys');
+			const tasks: Array<Promise<{ value: any | undefined; version: string }>> = [];
+			for (let index = 0; index < keys.length; index++) {
+				const entryKey = keys[index];
+				tasks[index] = (async () => {
+					const reply = assertRedisVersionedGetResult(await client.eval!(VERSIONED_GET_SCRIPT, {
+						keys: [key(entryKey), versionKey(entryKey)],
+						arguments: [createRedisVersionToken(), String(VERSION_TOMBSTONE_TTL_SECONDS)]
+					}));
+					return {
+						value: await decode(entryKey, reply[0]),
+						version: normalizeRedisVersion(reply[1], 'redis-valkey versioned cache revision')
+					};
+				})();
+			}
+			return await Promise.all(tasks);
+		};
+		adapter.setManyVersioned = async (entries, writeOptions = {}) => {
+			entries = normalizeCacheVersionedEntries(entries, 'redis-valkey versioned cache entries');
+			writeOptions = normalizeCacheWriteOptions(writeOptions, 'redis-valkey versioned cache write options');
+			const ttl = assertSafeTtl(writeOptions.ttl, 'redis-valkey versioned cache ttl');
+			const tasks: Array<Promise<boolean>> = [];
+			for (let index = 0; index < entries.length; index++) {
+				const [entryKey, value, expectedVersion] = entries[index];
+				tasks[index] = (async () => {
+					const reply = await client.eval!(VERSIONED_SET_SCRIPT, {
+						keys: [key(entryKey), versionKey(entryKey)],
+						arguments: [
+							expectedVersion,
+							await encode(entryKey, value),
+							ttl === undefined ? '' : String(Math.ceil(ttl)),
+							createRedisVersionToken(),
+							String(VERSION_TOMBSTONE_TTL_SECONDS)
+						]
+					});
+					if (reply === 0 || reply === 1) return reply === 1;
+					throw new ActiveTsValidationError('redis-valkey versioned cache set result must be 0 or 1.');
+				})();
+			}
+			return await Promise.all(tasks);
+		};
+		adapter.invalidateMany = async (keys) => {
+			keys = normalizeCacheKeys(keys, 'redis-valkey invalidation keys');
+			await invalidateVersionedKeys(keys);
+		};
+	}
+	return adapter;
+}
+
+function assertRedisVersionedGetResult(value: unknown): [string | Buffer | null, string | Buffer] {
+	if (!Array.isArray(value) || value.length !== 2) {
+		throw new ActiveTsValidationError('redis-valkey versioned cache get result must contain value and revision.');
+	}
+	const result = snapshotArrayInput<unknown>(value, 'redis-valkey versioned cache get result');
+	const stored = result[0];
+	const version = result[1];
+	if (stored !== null && typeof stored !== 'string' && !Buffer.isBuffer(stored)) {
+		throw new ActiveTsValidationError('redis-valkey versioned cache value must be a string, Buffer, or null.');
+	}
+	if (typeof version !== 'string' && !Buffer.isBuffer(version)) {
+		throw new ActiveTsValidationError('redis-valkey versioned cache revision must be a string or Buffer.');
+	}
+	return [stored as string | Buffer | null, version as string | Buffer];
+}
+
+function normalizeRedisVersion(value: string | Buffer, context: string) {
+	return normalizeCacheVersion(Buffer.isBuffer(value) ? value.toString('utf8') : value, context);
 }
 
 function normalizeCacheKeys(keys: unknown, context: string): string[] {
@@ -339,7 +528,8 @@ function normalizeRedisValkeyClient(client: unknown) {
 	const mSet = clientMethod(client, 'mSet', 'redis-valkey cache client.mSet');
 	const multi = clientMethod(client, 'multi', 'redis-valkey cache client.multi');
 	const del = clientMethod(client, 'del', 'redis-valkey cache client.del');
-	return Object.freeze({ mGet, mSet, multi, del });
+	const evalCommand = optionalClientMethod(client, 'eval', 'redis-valkey cache client.eval');
+	return Object.freeze({ mGet, mSet, multi, del, eval: evalCommand });
 }
 
 function normalizeRedisValkeyMulti(multi: unknown) {
@@ -376,6 +566,15 @@ function cloneRedisValkeyEncodedPayload(value: unknown) {
 
 function clientMethod(client: object, method: string, context: string) {
 	const value = clientMember(client, method, context);
+	if (typeof value !== 'function') {
+		throw new ActiveTsValidationError(`${context} must be a function.`);
+	}
+	return value.bind(client);
+}
+
+function optionalClientMethod(client: object, method: string, context: string) {
+	const value = clientMember(client, method, context);
+	if (value === undefined) return undefined;
 	if (typeof value !== 'function') {
 		throw new ActiveTsValidationError(`${context} must be a function.`);
 	}
@@ -425,6 +624,17 @@ function redisValkeyPhysicalKey(prefix: string, key: string) {
 		`active-ts:${redisValkeyKeyPart(prefix)}:${redisValkeyKeyPart(key)}`,
 		'redis-valkey physical cache key'
 	);
+}
+
+function redisValkeyVersionKey(valueKey: string) {
+	return assertSafeCacheKey(
+		`active-ts:version:{${valueKey}}`,
+		'redis-valkey physical cache version key'
+	);
+}
+
+function createRedisVersionToken() {
+	return randomBytes(24).toString('base64url');
 }
 
 function redisValkeyKeyPart(value: string) {

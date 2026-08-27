@@ -32,6 +32,12 @@ import {
 	WEAKMAP_SET
 } from './collection-intrinsics.js';
 import type { CacheAdapter, MaybePromise } from './types.js';
+import {
+	assertCompleteCacheVersioning,
+	cacheSupportsVersioning,
+	normalizeCacheVersionedSetResult,
+	normalizeCacheVersionedValues
+} from './cache-versioning.js';
 
 export type FunctionCacheKeyResolver<TInput> = (input: TInput) => MaybePromise<string>;
 
@@ -46,6 +52,7 @@ export type FunctionCacheOptions<TInput, TValue> = {
 	memory?: false | { ttl?: number; maxEntries?: number };
 	singleFlight?: boolean;
 	staleWhileRevalidate?: number;
+	consistency?: 'local' | 'distributed';
 };
 
 export type FunctionCacheGetOptions = {
@@ -67,6 +74,13 @@ type FunctionCachePersistentHit<TValue> = {
 	stored: TValue;
 	value: TValue;
 };
+type FunctionCachePersistentRead<TValue> = {
+	hit?: FunctionCachePersistentHit<TValue>;
+	version?: string;
+};
+type FunctionCacheWriteIntent =
+	| { mode: 'authoritative' }
+	| { mode: 'backfill'; expectedVersion?: string };
 const FUNCTION_CACHE_OPTION_KEYS = [
 	'prefix',
 	'factory',
@@ -77,7 +91,8 @@ const FUNCTION_CACHE_OPTION_KEYS = [
 	'ttl',
 	'memory',
 	'singleFlight',
-	'staleWhileRevalidate'
+	'staleWhileRevalidate',
+	'consistency'
 ] as const;
 const FUNCTION_CACHE_MEMORY_OPTION_KEYS = ['ttl', 'maxEntries'] as const;
 const FUNCTION_CACHE_GET_OPTION_KEYS = ['refresh'] as const;
@@ -120,7 +135,7 @@ export class ActiveFunctionCache<TInput, TValue> {
 		const epoch = this.invalidationEpoch(key);
 		const bypassCache = this.shouldBypassCacheForTransaction();
 		const flightScope = this.inFlightScope();
-		if (!bypassCache && !getOptions.refresh) {
+		if (!bypassCache && !getOptions.refresh && this.options.consistency !== 'distributed') {
 			const local = this.memoryGet(key, { allowStale: true });
 			if (local.found && !local.stale) {
 				const value = await this.cacheHitValue(key, local.value);
@@ -162,32 +177,38 @@ export class ActiveFunctionCache<TInput, TValue> {
 		expectedEpoch: number,
 		bypassCache: boolean
 	) {
+		let expectedVersion: string | undefined;
 		if (!bypassCache && !getOptions.refresh) {
 			const cached = await this.cacheGet(key);
-			if (cached !== undefined && this.invalidationEpochUnchanged(key, expectedEpoch)) {
+			expectedVersion = cached?.version;
+			if (cached?.hit !== undefined && this.invalidationEpochUnchanged(key, expectedEpoch)) {
 				this.stats.cacheHits++;
-				this.memorySet(key, cached.stored);
-				return cached.value;
+				this.memorySet(key, cached.hit.stored);
+				return cached.hit.value;
 			}
+		} else if (!bypassCache && this.options.consistency === 'distributed') {
+			expectedVersion = await this.cacheVersion(key);
 		}
 		this.stats.misses++;
-		return await this.compute(input, key, this.invalidationEpoch(key));
+		return await this.compute(input, key, this.invalidationEpoch(key), expectedVersion);
 	}
 
 	async peek(input: TInput) {
 		if (this.shouldBypassCacheForTransaction()) return undefined;
 		const key = await this.keyFor(input);
 		const epoch = this.invalidationEpoch(key);
-		const local = this.memoryGet(key);
+		const local = this.options.consistency === 'distributed'
+			? { found: false as const, value: undefined }
+			: this.memoryGet(key);
 		if (local.found) {
 			const value = await this.cacheHitValue(key, local.value);
 			if (value !== undefined && this.invalidationEpochUnchanged(key, epoch)) return value;
 			MAP_DELETE.call(this.memory, key);
 		}
 		const cached = await this.cacheGet(key);
-		if (cached === undefined || !this.invalidationEpochUnchanged(key, epoch)) return undefined;
-		this.memorySet(key, cached.stored);
-		return cached.value;
+		if (cached?.hit === undefined || !this.invalidationEpochUnchanged(key, epoch)) return undefined;
+		this.memorySet(key, cached.hit.stored);
+		return cached.hit.value;
 	}
 
 	async set(input: TInput, value: TValue) {
@@ -201,13 +222,13 @@ export class ActiveFunctionCache<TInput, TValue> {
 			await transactionContext.afterCommitInternal(async () => {
 				const epoch = this.bumpInvalidationEpoch(key);
 				MAP_DELETE.call(this.memory, key);
-				await this.setResolvedKey(key, committedValue, epoch, runtime);
+				await this.setResolvedKey(key, committedValue, epoch, runtime, { mode: 'authoritative' });
 			});
 			return value;
 		}
 		const epoch = this.bumpInvalidationEpoch(key);
 		MAP_DELETE.call(this.memory, key);
-		await this.setResolvedKey(key, value, epoch);
+		await this.setResolvedKey(key, value, epoch, this.currentRuntime(), { mode: 'authoritative' });
 		return value;
 	}
 
@@ -228,6 +249,7 @@ export class ActiveFunctionCache<TInput, TValue> {
 		markPendingInvalidation(key);
 		MAP_DELETE.call(this.memory, key);
 		const { adapter, context } = runtime;
+		this.distributedAdapter(adapter);
 		let deleted = false;
 		try {
 			if (context) {
@@ -237,7 +259,11 @@ export class ActiveFunctionCache<TInput, TValue> {
 					meta: { prefix: this.options.prefix, key }
 				});
 			}
-			if (adapter) await adapter.deleteMany([key]);
+			if (adapter) {
+				const distributed = this.distributedAdapter(adapter);
+				if (distributed) await distributed.invalidateMany([key]);
+				else await adapter.deleteMany([key]);
+			}
 			deleted = true;
 		} catch (error) {
 			if (adapter) markInvalidationFailure(adapter, key);
@@ -279,9 +305,11 @@ export class ActiveFunctionCache<TInput, TValue> {
 		key: string,
 		value: TValue,
 		expectedEpoch?: number,
-		runtime = this.currentRuntime()
+		runtime = this.currentRuntime(),
+		intent: FunctionCacheWriteIntent = { mode: 'authoritative' }
 	) {
 		const { adapter, context, transactionContext } = runtime;
+		this.distributedAdapter(adapter);
 		let cacheValue: TValue;
 		try {
 			assertCacheableValue(value);
@@ -304,14 +332,34 @@ export class ActiveFunctionCache<TInput, TValue> {
 		if (transactionContext?.isInTransaction()) return value;
 		if (adapter) {
 			try {
-				await adapter.setMany([[key, cacheValue]], { ttl: this.options.ttl });
+				const distributed = this.distributedAdapter(adapter);
+				if (distributed) {
+					if (intent.mode === 'authoritative') {
+						await distributed.setMany([[key, cacheValue]], { ttl: this.options.ttl });
+					} else {
+						if (intent.expectedVersion === undefined) return value;
+						const results = normalizeCacheVersionedSetResult(
+							await distributed.setManyVersioned(
+								[[key, cacheValue, intent.expectedVersion]],
+								{ ttl: this.options.ttl }
+							),
+							1,
+							`Function cache adapter "${adapter.kind}" setManyVersioned`
+						);
+						if (!results[0]) return value;
+					}
+				} else {
+					await adapter.setMany([[key, cacheValue]], { ttl: this.options.ttl });
+				}
 			} catch (error) {
 				markInvalidationFailure(adapter, key);
 				throw error;
 			}
 			if (!this.invalidationEpochUnchanged(key, expectedEpoch)) {
 				try {
-					await adapter.deleteMany([key]);
+					const distributed = this.distributedAdapter(adapter);
+					if (distributed) await distributed.invalidateMany([key]);
+					else await adapter.deleteMany([key]);
 				} catch (error) {
 					markInvalidationFailure(adapter, key);
 					throw error;
@@ -320,7 +368,7 @@ export class ActiveFunctionCache<TInput, TValue> {
 			}
 			clearInvalidationFailure(adapter, key);
 		}
-		this.memorySet(key, cacheValue);
+		if (this.options.consistency !== 'distributed') this.memorySet(key, cacheValue);
 		if (context) {
 			try {
 				await context.runHooks('afterCacheSet', {
@@ -349,7 +397,9 @@ export class ActiveFunctionCache<TInput, TValue> {
 		MAP_DELETE.call(this.memory, key);
 		if (!adapter) return;
 		try {
-			await adapter.deleteMany([key]);
+			const distributed = this.distributedAdapter(adapter);
+			if (distributed) await distributed.invalidateMany([key]);
+			else await adapter.deleteMany([key]);
 			clearInvalidationFailure(adapter, key);
 		} catch (error) {
 			markInvalidationFailure(adapter, key);
@@ -357,24 +407,55 @@ export class ActiveFunctionCache<TInput, TValue> {
 		}
 	}
 
-	private async cacheGet(key: string) {
+	private async cacheGet(key: string): Promise<FunctionCachePersistentRead<TValue> | undefined> {
 		const adapter = this.adapter();
+		const distributed = this.distributedAdapter(adapter);
 		if (!adapter) return undefined;
 		if (hasPendingInvalidation(key)) return undefined;
 		if (hasInvalidationFailure(adapter, key)) return undefined;
 		const context = this.hookContext();
 		if (context) await this.beforeCacheGet(context, key);
 		if (hasPendingInvalidation(key)) return undefined;
-		const rawValues = sanitizeFunctionCacheGetMany(await adapter.getMany([key]), adapter.kind);
+		let rawValues: unknown[];
+		let version: string | undefined;
+		if (distributed) {
+			const snapshots = normalizeCacheVersionedValues(
+				await distributed.getManyVersioned([key]),
+				1,
+				`Function cache adapter "${adapter.kind}" getManyVersioned`
+			);
+			rawValues = [snapshots[0].value];
+			version = snapshots[0].version;
+		} else {
+			rawValues = sanitizeFunctionCacheGetMany(await adapter.getMany([key]), adapter.kind);
+		}
 		if (hasPendingInvalidation(key)) return undefined;
 		const rawValue = rawValues[0] as TValue | undefined;
 		const stored = sanitizeFunctionCacheValue(rawValue, `Function cache adapter "${adapter.kind}" getMany result[0]`);
 		const value = context ? await this.afterCacheGet(context, key, cloneFunctionCacheValue(stored)) : stored;
-		if (value === undefined) return undefined;
+		if (value === undefined) return { version };
 		return {
-			stored: stored === undefined ? value : stored,
-			value
-		} as FunctionCachePersistentHit<TValue>;
+			hit: {
+				stored: stored === undefined ? value : stored,
+				value
+			},
+			version
+		};
+	}
+
+	private async cacheVersion(key: string) {
+		const adapter = this.adapter();
+		const distributed = this.distributedAdapter(adapter);
+		if (!adapter) return undefined;
+		if (!distributed) return undefined;
+		if (hasPendingInvalidation(key) || hasInvalidationFailure(adapter, key)) return undefined;
+		const snapshots = normalizeCacheVersionedValues(
+			await distributed.getManyVersioned([key]),
+			1,
+			`Function cache adapter "${adapter.kind}" getManyVersioned`
+		);
+		if (hasPendingInvalidation(key) || hasInvalidationFailure(adapter, key)) return undefined;
+		return snapshots[0].version;
 	}
 
 	private async cacheHitValue(key: string, value: TValue | undefined) {
@@ -403,9 +484,12 @@ export class ActiveFunctionCache<TInput, TValue> {
 		return sanitizeFunctionCacheValue(result, 'afterCacheGet result');
 	}
 
-	private async compute(input: TInput, key: string, expectedEpoch: number) {
+	private async compute(input: TInput, key: string, expectedEpoch: number, expectedVersion?: string) {
 		const value = await this.options.factory(input);
-		await this.setResolvedKey(key, value, expectedEpoch);
+		await this.setResolvedKey(key, value, expectedEpoch, this.currentRuntime(), {
+			mode: 'backfill',
+			expectedVersion
+		});
 		return value;
 	}
 
@@ -461,7 +545,7 @@ export class ActiveFunctionCache<TInput, TValue> {
 	}
 
 	private memorySet(key: string, value: TValue) {
-		if (this.options.memory === false) return;
+		if (this.options.memory === false || this.options.consistency === 'distributed') return;
 		assertCacheableValue(value);
 		const ttl = this.options.memory?.ttl ?? this.options.ttl;
 		const expires = ttl === undefined ? undefined : Date.now() + ttl * 1000;
@@ -505,6 +589,19 @@ export class ActiveFunctionCache<TInput, TValue> {
 		if (cache === false) return undefined;
 		if (cache && typeof cache !== 'string') return cache;
 		return (context ?? this.context()).cache(cache ?? 'default');
+	}
+
+	private distributedAdapter(adapter: CacheAdapter | undefined) {
+		if (this.options.consistency !== 'distributed') return undefined;
+		if (!adapter) {
+			throw new ActiveTsConfigurationError('Distributed function cache consistency requires a cache adapter.');
+		}
+		if (!cacheSupportsVersioning(adapter)) {
+			throw new ActiveTsConfigurationError(
+				`Function cache adapter "${adapter.kind}" does not support versioned reads, conditional writes, and atomic invalidation.`
+			);
+		}
+		return adapter;
 	}
 
 	private hookContext(context?: ActiveContext) {
@@ -602,6 +699,7 @@ function normalizeFunctionCacheOptions(value: unknown): FunctionCacheOptions<unk
 	const cache = ownOptionValue(options, 'cache', 'function cache options');
 	const ttl = ownOptionValue(options, 'ttl', 'function cache options');
 	const staleWhileRevalidate = ownOptionValue(options, 'staleWhileRevalidate', 'function cache options');
+	const consistency = ownOptionValue(options, 'consistency', 'function cache options');
 	if (typeof factory !== 'function') {
 		throw new ActiveTsValidationError('function cache factory must be a function.');
 	}
@@ -641,6 +739,15 @@ function normalizeFunctionCacheOptions(value: unknown): FunctionCacheOptions<unk
 	if (typeof cache === 'string') {
 		assertSafeSchemaIdentifier(cache, 'function cache adapter name');
 	}
+	if (consistency !== undefined && consistency !== 'local' && consistency !== 'distributed') {
+		throw new ActiveTsValidationError('function cache consistency must be "local" or "distributed".');
+	}
+	if (consistency === 'distributed' && memory !== undefined && memory !== false) {
+		throw new ActiveTsValidationError('distributed function caches cannot enable process-local memory entries.');
+	}
+	if (consistency === 'distributed' && staleWhileRevalidate !== undefined) {
+		throw new ActiveTsValidationError('distributed function caches cannot use staleWhileRevalidate.');
+	}
 	const normalizedCache = normalizeFunctionCacheAdapterOption(cache);
 	return {
 		prefix: prefix as string,
@@ -652,7 +759,8 @@ function normalizeFunctionCacheOptions(value: unknown): FunctionCacheOptions<unk
 		ttl: ttl as number | undefined,
 		memory: normalizedMemory,
 		singleFlight: singleFlight as boolean | undefined,
-		staleWhileRevalidate: staleWhileRevalidate as number | undefined
+		staleWhileRevalidate: staleWhileRevalidate as number | undefined,
+		consistency: consistency as 'local' | 'distributed' | undefined
 	};
 }
 
@@ -717,6 +825,9 @@ function normalizeFunctionCacheAdapterOption(cache: unknown) {
 	const getMany = functionCacheAdapterMember(cache, 'getMany');
 	const setMany = functionCacheAdapterMember(cache, 'setMany');
 	const deleteMany = functionCacheAdapterMember(cache, 'deleteMany');
+	const getManyVersioned = functionCacheAdapterMember(cache, 'getManyVersioned');
+	const setManyVersioned = functionCacheAdapterMember(cache, 'setManyVersioned');
+	const invalidateMany = functionCacheAdapterMember(cache, 'invalidateMany');
 	if (
 		typeof kind !== 'string' ||
 		!kind ||
@@ -727,13 +838,24 @@ function normalizeFunctionCacheAdapterOption(cache: unknown) {
 	) {
 		throw new ActiveTsValidationError('function cache adapter object must provide kind, getMany, setMany, and deleteMany.');
 	}
-	const normalized = Object.freeze({
+	const normalized: CacheAdapter = {
 		kind,
 		getMany: getMany.bind(cache),
 		setMany: setMany.bind(cache),
 		deleteMany: deleteMany.bind(cache)
-	});
-	return markCacheAdapterSource(normalized, cache);
+	};
+	if (getManyVersioned !== undefined) normalized.getManyVersioned = bindFunctionCacheAdapterMethod(cache, getManyVersioned, 'getManyVersioned');
+	if (setManyVersioned !== undefined) normalized.setManyVersioned = bindFunctionCacheAdapterMethod(cache, setManyVersioned, 'setManyVersioned');
+	if (invalidateMany !== undefined) normalized.invalidateMany = bindFunctionCacheAdapterMethod(cache, invalidateMany, 'invalidateMany');
+	assertCompleteCacheVersioning(normalized, 'function cache adapter object');
+	return markCacheAdapterSource(Object.freeze(normalized), cache);
+}
+
+function bindFunctionCacheAdapterMethod(adapter: object, value: unknown, property: string) {
+	if (typeof value !== 'function') {
+		throw new ActiveTsValidationError(`function cache adapter object "${property}" must be a function.`);
+	}
+	return value.bind(adapter);
 }
 
 function cacheFailureSource(adapter: CacheAdapter) {

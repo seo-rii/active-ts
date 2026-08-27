@@ -2850,9 +2850,9 @@ test('registered search adapter kind is snapshotted for projection routing', asy
 	});
 	const Record = SearchAffinityRecord.use(context) as unknown as typeof SearchAffinityRecord;
 
-	assert.throws(() => {
-		(adapter as any).kind = 'algolia';
-	}, TypeError);
+	adapter.kind = 'algolia';
+	assert.equal(adapter.kind, 'algolia');
+	assert.equal(context.searchAdapter('memory').kind, 'memory');
 
 	const result = await Record.search('needle').load();
 	assert.deepEqual(seenFields, ['title']);
