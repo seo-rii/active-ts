@@ -12,6 +12,18 @@ export class ActiveTsValidationError extends ActiveTsError {}
 export class ActiveTsNotFoundError extends ActiveTsError {}
 export class ActiveTsConflictError extends ActiveTsError {}
 
+export class ActiveTsUnknownTransactionOutcomeError extends ActiveTsError {
+	readonly outcome = 'unknown' as const;
+
+	constructor(
+		message: string,
+		readonly phase: 'commit' | 'abort',
+		readonly cause: unknown
+	) {
+		super(message);
+	}
+}
+
 export class ActiveTsCommittedWriteError extends ActiveTsError {
 	readonly committed = true;
 

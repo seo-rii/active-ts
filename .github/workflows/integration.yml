@@ -50,15 +50,6 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
-      mongodb:
-        image: mongo:7@sha256:948b635bc126d62274eebb650dd2e2e66c9abc3bb0a336eb2279a5d8489417f5
-        ports:
-          - 27017:27017
-        options: >-
-          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ ping: 1 }).ok'"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
       redis:
         image: redis:7@sha256:33d7c9a245edd95e6703a0addbeaa48fe40c3b3b4783627a72085155462ebfdb
         ports:
@@ -83,7 +74,7 @@ jobs:
           --health-retries 10
     env:
       POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/active_ts
-      MONGODB_URL: mongodb://127.0.0.1:27017
+      MONGODB_URL: mongodb://127.0.0.1:27017/?replicaSet=active-ts-rs
       REDIS_URL: redis://127.0.0.1:6379
       ELASTICSEARCH_URL: http://127.0.0.1:9200
       DATASTORE_EMULATOR_HOST: 127.0.0.1:8081
@@ -100,6 +91,33 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
+      - name: Start MongoDB replica set
+        run: |
+          docker run --detach --rm --name active-ts-mongodb --publish 27017:27017 \
+            mongo:7@sha256:948b635bc126d62274eebb650dd2e2e66c9abc3bb0a336eb2279a5d8489417f5 \
+            --replSet active-ts-rs --bind_ip_all
+          for attempt in $(seq 1 60); do
+            if docker exec active-ts-mongodb mongosh --quiet --eval 'db.adminCommand({ ping: 1 }).ok' | grep -q 1; then
+              break
+            fi
+            if [ "$attempt" -eq 60 ]; then
+              docker logs active-ts-mongodb
+              exit 1
+            fi
+            sleep 1
+          done
+          docker exec active-ts-mongodb mongosh --quiet --eval \
+            'rs.initiate({ _id: "active-ts-rs", members: [{ _id: 0, host: "127.0.0.1:27017" }] })'
+          for attempt in $(seq 1 60); do
+            if docker exec active-ts-mongodb mongosh --quiet --eval 'db.hello().isWritablePrimary' | grep -q true; then
+              break
+            fi
+            if [ "$attempt" -eq 60 ]; then
+              docker logs active-ts-mongodb
+              exit 1
+            fi
+            sleep 1
+          done
       - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
         with:
           version: 505.0.0

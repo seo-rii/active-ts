@@ -264,7 +264,14 @@ if (targets.has('mongodb')) {
 	const dbName = `active_ts_${randomUUID().replace(/-/g, '')}`;
 	try {
 		await client.connect();
-		const adapter = await createMongoStoreAdapter({ client, dbName, allowAggregateScanFallback: true });
+		const cacheScope = `mongodb|db=${dbName}`;
+		const adapter = await createMongoStoreAdapter({
+			client,
+			dbName,
+			cacheScope,
+			allowAggregateScanFallback: true
+		});
+		assert.equal(adapter.cacheScope, cacheScope);
 		await runStoreAdapterContract(adapter, {
 			nativeProbe: async ({ adapter, model }) => {
 				const result = await adapter.query(model, {
@@ -310,6 +317,60 @@ if (targets.has('mongodb')) {
 		} finally {
 			await adapter.delete(meta, 1).catch(() => undefined);
 		}
+
+		const bulkModelName = `integration_mongodb_bulk_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
+		let rejectDeleteHooks = false;
+		class IntegrationMongoBulkRecord extends Model {}
+		defineModel({ name: bulkModelName })
+			.id('id')
+			.validate((input) => input)
+			.index('handle', { name: 'handle_unique', unique: true })
+			.hooks({
+				afterDelete: ({ id }) => {
+					if (rejectDeleteHooks && id === 301) throw new Error('MongoDB deleteMany rollback probe');
+				}
+			})
+			.attach(IntegrationMongoBulkRecord);
+		const bulkContext = createActiveTs({ stores: { default: adapter } });
+		const BulkRecord = IntegrationMongoBulkRecord.use(bulkContext);
+		const bulkMeta = bulkContext.meta(IntegrationMongoBulkRecord);
+		await adapter.schema.apply([bulkMeta], { mode: 'safe' });
+
+		await BulkRecord.create({ id: 102, handle: 'create-blocker' });
+		await assert.rejects(
+			() => BulkRecord.createMany([
+				{ id: 101, handle: 'create-first' },
+				{ id: 102, handle: 'create-conflict' }
+			]),
+			/already exists/
+		);
+		assert.equal(await adapter.get(bulkMeta, 101), null);
+		assert.equal((await adapter.get(bulkMeta, 102)).handle, 'create-blocker');
+
+		await BulkRecord.create({ id: 201, handle: 'upsert-original' });
+		await BulkRecord.create({ id: 202, handle: 'upsert-conflict' });
+		await assert.rejects(
+			() => BulkRecord.upsertMany([
+				{ id: 201, handle: 'upsert-mutated' },
+				{ id: 203, handle: 'upsert-conflict' }
+			]),
+			/already exists/
+		);
+		assert.equal((await adapter.get(bulkMeta, 201)).handle, 'upsert-original');
+		assert.equal(await adapter.get(bulkMeta, 203), null);
+
+		await BulkRecord.create({ id: 301, handle: 'delete-first' });
+		await BulkRecord.create({ id: 302, handle: 'delete-second' });
+		rejectDeleteHooks = true;
+		await assert.rejects(
+			() => BulkRecord.deleteMany([301, 302]),
+			/MongoDB deleteMany rollback probe/
+		);
+		rejectDeleteHooks = false;
+		assert.deepEqual(
+			(await adapter.getMany(bulkMeta, [301, 302])).map((row) => row?.handle),
+			['delete-first', 'delete-second']
+		);
 		ran++;
 		ranTargets.push('mongodb');
 	} finally {

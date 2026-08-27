@@ -1,7 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { MongoError, ReadConcern, ReadPreference, WriteConcern } from 'mongodb';
 import type { ResolvedModelMeta } from '../src/index.js';
-import { ActiveTsConflictError, ActiveTsNotFoundError } from '../src/index.js';
+import {
+	ActiveTsCommittedTransactionError,
+	ActiveTsConflictError,
+	ActiveTsNotFoundError,
+	ActiveTsUnknownTransactionOutcomeError,
+	Model,
+	createActiveTs,
+	defineModel
+} from '../src/index.js';
 import { createMongoStoreAdapter } from '../src/adapters/store/mongodb.js';
 
 type MongoRegressionData = {
@@ -68,6 +77,531 @@ function mongoScalarField(field: string, condition: unknown) {
 		]
 	};
 }
+
+test('MongoDB transactions bind every portable operation to one session and close retained handles', async () => {
+	const calls: Array<{ operation: string; options?: Record<string, unknown> }> = [];
+	const rows = new Map<string, Record<string, unknown>>();
+	const session = {
+		startTransaction: async (options?: Record<string, unknown>) => {
+			calls.push({ operation: 'startTransaction', options });
+		},
+		commitTransaction: async (options?: Record<string, unknown>) => {
+			calls.push({ operation: 'commitTransaction', options });
+		},
+		abortTransaction: async (options?: Record<string, unknown>) => {
+			calls.push({ operation: 'abortTransaction', options });
+		},
+		endSession: async () => {
+			calls.push({ operation: 'endSession' });
+		}
+	};
+	const collection = {
+		findOne: async (filter: { _id: string }, options?: Record<string, unknown>) => {
+			calls.push({ operation: 'findOne', options });
+			return rows.get(filter._id) ?? null;
+		},
+		find: (_filter: unknown, options?: Record<string, unknown>) => {
+			calls.push({ operation: 'find', options });
+			return { toArray: async () => [...rows.values()] };
+		},
+		aggregate: (_pipeline: unknown, options?: Record<string, unknown>) => {
+			calls.push({ operation: 'aggregate', options });
+			return { toArray: async () => [] };
+		},
+		insertOne: async (document: Record<string, unknown>, options?: Record<string, unknown>) => {
+			calls.push({ operation: 'insertOne', options });
+			rows.set(document._id as string, document);
+		},
+		replaceOne: async (filter: { _id: string }, document: Record<string, unknown>, options?: Record<string, unknown>) => {
+			calls.push({ operation: 'replaceOne', options });
+			if (!rows.has(filter._id)) return { matchedCount: 0 };
+			rows.set(filter._id, document);
+			return { matchedCount: 1 };
+		},
+		deleteOne: async (filter: { _id: string }, options?: Record<string, unknown>) => {
+			calls.push({ operation: 'deleteOne', options });
+			return { deletedCount: rows.delete(filter._id) ? 1 : 0 };
+		}
+	};
+	let startSessionOptions: unknown;
+	const adapter = await createMongoStoreAdapter({
+		dbName: 'test',
+		cacheScope: 'mongodb|cluster=integration|db=test',
+		client: {
+			db: () => ({ collection: () => collection }),
+			startSession: (options?: unknown) => {
+				startSessionOptions = options;
+				return session;
+			}
+		}
+	});
+	assert.equal(adapter.cacheScope, 'mongodb|cluster=integration|db=test');
+	let retained: typeof adapter | undefined;
+	const result = await adapter.transaction!(async (tx) => {
+		retained = tx;
+		assert.equal(tx.cacheScope, adapter.cacheScope);
+		assert.equal(tx.capabilities?.transaction, false);
+		assert.equal(tx.capabilities?.native, false);
+		assert.equal(Object.isFrozen(tx.capabilities), true);
+		assert.equal(tx.transaction, undefined);
+		assert.equal(tx.schema, undefined);
+		await tx.create(meta, 1, { id: 1, handle: 'one' });
+		assert.equal((await tx.get(meta, 1))?.handle, 'one');
+		await tx.getMany(meta, [1]);
+		await tx.query(meta, { where: [], or: [], sort: [], include: [] });
+		await tx.aggregate!(meta, { where: [], or: [], aggregates: [{ op: 'count', as: 'count' }] });
+		await tx.update(meta, 1, { id: 1, handle: 'next' });
+		await tx.delete(meta, 1);
+		return 'committed';
+	}, {
+		timeoutMs: 50,
+		native: {
+			readConcern: { level: 'snapshot' },
+			writeConcern: { w: 'majority' },
+			readPreference: 'primary',
+			maxCommitTimeMS: 40
+		}
+	});
+
+	assert.equal(result, 'committed');
+	assert.deepEqual(startSessionOptions, { defaultTimeoutMS: 50 });
+	assert.deepEqual(calls[0], {
+		operation: 'startTransaction',
+		options: {
+			readConcern: { level: 'snapshot' },
+			writeConcern: { w: 'majority' },
+			readPreference: 'primary',
+			maxCommitTimeMS: 40
+		}
+	});
+	for (const call of calls.filter(({ operation }) =>
+		['findOne', 'find', 'aggregate', 'insertOne', 'replaceOne', 'deleteOne'].includes(operation)
+	)) {
+		assert.equal(call.options?.session, session, `${call.operation} must use the transaction session`);
+	}
+	assert.deepEqual(calls.slice(-2), [
+		{ operation: 'commitTransaction', options: { timeoutMS: 50 } },
+		{ operation: 'endSession' }
+	]);
+	await assert.rejects(() => retained!.get(meta, 1), /closed MongoDB store transaction adapter after commit/);
+});
+
+test('MongoDB transactions expose only labeled unknown outcomes and preserve definitive rollback errors', async () => {
+	let commitError: unknown;
+	let abortError: unknown;
+	let endError: unknown;
+	let abortCalls = 0;
+	let endCalls = 0;
+	const session = {
+		startTransaction: async () => undefined,
+		commitTransaction: async () => {
+			if (commitError !== undefined) throw commitError;
+		},
+		abortTransaction: async () => {
+			abortCalls++;
+			if (abortError !== undefined) throw abortError;
+		},
+		endSession: async () => {
+			endCalls++;
+			if (endError !== undefined) throw endError;
+		}
+	};
+	const adapter = await createMongoStoreAdapter({
+		dbName: 'test',
+		client: {
+			db: () => ({ collection: () => ({}) }),
+			startSession: () => session
+		}
+	});
+	const callbackError = new Error('callback failed');
+	await assert.rejects(
+		() => adapter.transaction!(async () => { throw callbackError; }),
+		(error) => error === callbackError
+	);
+	assert.equal(abortCalls, 1);
+	assert.equal(endCalls, 1);
+
+	const plainCommitError = new Error('unlabeled commit failure');
+	commitError = plainCommitError;
+	await assert.rejects(
+		() => adapter.transaction!(async () => 'definitive rollback'),
+		(error) => error === plainCommitError
+	);
+	assert.equal(abortCalls, 1, 'a commit response must not be followed by abort');
+
+	const transientCommitError = new Error('transient transaction failure');
+	Object.defineProperty(transientCommitError, 'errorLabelSet', {
+		value: new Set(['TransientTransactionError']),
+		enumerable: true
+	});
+	commitError = transientCommitError;
+	await assert.rejects(
+		() => adapter.transaction!(async () => 'definitive transient rollback'),
+		(error) =>
+			error instanceof ActiveTsConflictError &&
+			(error as ActiveTsConflictError & { cause?: unknown }).cause === transientCommitError
+	);
+
+	const unknownCommitCause = new Error('commit response lost');
+	Object.defineProperty(unknownCommitCause, 'errorLabels', {
+		value: ['UnknownTransactionCommitResult'],
+		enumerable: true
+	});
+	commitError = unknownCommitCause;
+	await assert.rejects(
+		() => adapter.transaction!(async () => 'unknown'),
+		(error) =>
+			error instanceof ActiveTsUnknownTransactionOutcomeError &&
+			error.outcome === 'unknown' &&
+			error.phase === 'commit' &&
+			error.cause === unknownCommitCause
+	);
+	assert.equal(abortCalls, 1, 'an unknown commit outcome must not issue abort');
+
+	let labelAccessorCalls = 0;
+	let codeAccessorCalls = 0;
+	const accessorCommitError = new Error('hostile commit error');
+	Object.defineProperties(accessorCommitError, {
+		errorLabels: {
+			get() {
+				labelAccessorCalls++;
+				return ['UnknownTransactionCommitResult'];
+			},
+			enumerable: true
+		},
+		code: {
+			get() {
+				codeAccessorCalls++;
+				return 251;
+			},
+			enumerable: true
+		}
+	});
+	commitError = accessorCommitError;
+	await assert.rejects(
+		() => adapter.transaction!(async () => 'accessor rollback'),
+		(error) => error === accessorCommitError
+	);
+	assert.equal(labelAccessorCalls, 0);
+	assert.equal(codeAccessorCalls, 0);
+
+	const dualLabelCommitError = new MongoError('transaction commit response was lost');
+	dualLabelCommitError.addErrorLabel('TransientTransactionError');
+	dualLabelCommitError.addErrorLabel('UnknownTransactionCommitResult');
+	commitError = dualLabelCommitError;
+	await assert.rejects(
+		() => adapter.transaction!(async () => 'possibly committed'),
+		(error) =>
+			error instanceof ActiveTsUnknownTransactionOutcomeError &&
+			error.phase === 'commit' &&
+			error.cause === dualLabelCommitError
+	);
+
+	commitError = undefined;
+	abortError = new Error('abort transport failed');
+	await assert.rejects(
+		() => adapter.transaction!(async () => { throw callbackError; }),
+		(error) => {
+			if (!(error instanceof ActiveTsUnknownTransactionOutcomeError)) return false;
+			assert.equal(error.outcome, 'unknown');
+			assert.equal(error.phase, 'abort');
+			assert.ok(error.cause instanceof AggregateError);
+			assert.deepEqual(error.cause.errors, [callbackError, abortError]);
+			return true;
+		}
+	);
+
+	abortError = undefined;
+	endError = new Error('end session failed');
+	await assert.rejects(
+		() => adapter.transaction!(async () => 'committed-result'),
+		(error) =>
+			error instanceof ActiveTsCommittedTransactionError &&
+			error.committed === true &&
+			error.result === 'committed-result'
+	);
+});
+
+test('MongoDB transactions preserve undefined rejection reasons across every phase', async () => {
+	for (const phase of ['start', 'callback', 'commit'] as const) {
+		const session = {
+			startTransaction: async () => {
+				if (phase === 'start') return Promise.reject(undefined);
+			},
+			commitTransaction: async () => {
+				if (phase === 'commit') return Promise.reject(undefined);
+			},
+			abortTransaction: async () => undefined,
+			endSession: async () => undefined
+		};
+		const adapter = await createMongoStoreAdapter({
+			dbName: 'test',
+			client: {
+				db: () => ({ collection: () => ({}) }),
+				startSession: () => session
+			}
+		});
+		let rejected = false;
+		let rejection: unknown = Symbol('not rejected');
+		try {
+			await adapter.transaction!(async () => {
+				if (phase === 'callback') return Promise.reject(undefined);
+				return 'result';
+			});
+		} catch (error) {
+			rejected = true;
+			rejection = error;
+		}
+		assert.equal(rejected, true, `${phase} must reject`);
+		assert.equal(rejection, undefined, `${phase} must retain the original rejection reason`);
+	}
+});
+
+test('MongoDB transactions snapshot supported driver option instances', async () => {
+	let capturedOptions: unknown;
+	const adapter = await createMongoStoreAdapter({
+		dbName: 'test',
+		client: {
+			db: () => ({ collection: () => ({}) }),
+			startSession: () => ({
+				startTransaction: async (options?: unknown) => {
+					capturedOptions = options;
+				},
+				commitTransaction: async () => undefined,
+				abortTransaction: async () => undefined,
+				endSession: async () => undefined
+			})
+		}
+	});
+
+	await adapter.transaction!(async () => undefined, {
+		native: {
+			readConcern: new ReadConcern('snapshot'),
+			writeConcern: new WriteConcern('majority', 250, true),
+			readPreference: new ReadPreference('secondary', [{ region: 'east' }], {
+				maxStalenessSeconds: 120
+			})
+		}
+	});
+
+	assert.deepEqual(capturedOptions, {
+		readConcern: { level: 'snapshot' },
+		writeConcern: {
+			w: 'majority',
+			wtimeoutMS: 250,
+			wtimeout: 250,
+			journal: true,
+			j: true
+		},
+		readPreference: {
+			mode: 'secondary',
+			tags: [{ region: 'east' }],
+			maxStalenessSeconds: 120
+		}
+	});
+});
+
+test('MongoDB ends a session when session contract normalization fails', async () => {
+	let endCalls = 0;
+	const adapter = await createMongoStoreAdapter({
+		dbName: 'test',
+		client: {
+			db: () => ({ collection: () => ({}) }),
+			startSession: () => ({
+				startTransaction: async () => undefined,
+				commitTransaction: async () => undefined,
+				endSession: async () => {
+					endCalls++;
+				}
+			})
+		}
+	});
+
+	await assert.rejects(
+		() => adapter.transaction!(async () => undefined),
+		/MongoDB session\.abortTransaction must be a function/
+	);
+	assert.equal(endCalls, 1);
+});
+
+test('MongoDB validates explicit physical cache scopes', async () => {
+	const client = { db: () => ({ collection: () => ({}) }) };
+	for (const cacheScope of ['', 'cluster\0database', 123]) {
+		await assert.rejects(
+			() => createMongoStoreAdapter({ dbName: 'test', client, cacheScope } as never),
+			/MongoDB adapter cacheScope must be a non-empty string without null bytes/
+		);
+	}
+
+	const adapter = await createMongoStoreAdapter({
+		dbName: 'test',
+		client,
+		cacheScope: 'mongodb|cluster=primary|db=test'
+	});
+	assert.equal(adapter.cacheScope, 'mongodb|cluster=primary|db=test');
+});
+
+test('MongoDB transactions reject unsupported options and read-only or native writes before dispatch', async () => {
+	let startSessionCalls = 0;
+	let abortCalls = 0;
+	let insertCalls = 0;
+	let nativeCalls = 0;
+	const session = {
+		startTransaction: async () => undefined,
+		commitTransaction: async () => undefined,
+		abortTransaction: async () => {
+			abortCalls++;
+		},
+		endSession: async () => undefined
+	};
+	const adapter = await createMongoStoreAdapter({
+		dbName: 'test',
+		client: {
+			db: () => ({
+				collection: () => ({
+					insertOne: async () => {
+						insertCalls++;
+					}
+				})
+			}),
+			startSession: () => {
+				startSessionCalls++;
+				return session;
+			}
+		}
+	});
+
+	await assert.rejects(
+		() => adapter.transaction!(async () => undefined, { isolation: 'serializable' } as never),
+		/isolation is not supported/
+	);
+	await assert.rejects(
+		() => adapter.transaction!(async () => undefined, { native: { retryWrites: true } } as never),
+		/unknown option "retryWrites"/
+	);
+	assert.equal(startSessionCalls, 0);
+	await assert.rejects(
+		() => adapter.transaction!(async (tx) => tx.create(meta, 1, { id: 1, handle: 'one' }), { readOnly: true }),
+		/read-only MongoDB transaction/
+	);
+	assert.equal(insertCalls, 0);
+	assert.equal(abortCalls, 1);
+	await assert.rejects(
+		() => adapter.transaction!(async (tx) => {
+			try {
+				(tx.capabilities as any).native = true;
+			} catch {
+				// Frozen capabilities reject mutation in strict runtimes.
+			}
+			assert.equal(tx.capabilities?.native, false);
+			return tx.query(meta, {
+				where: [],
+				or: [],
+				sort: [],
+				include: [],
+				native: {
+					payload: async () => {
+						nativeCalls++;
+						return { list: [] };
+					}
+				}
+			});
+		}),
+		/native/
+	);
+	assert.equal(abortCalls, 2);
+	assert.equal(nativeCalls, 0);
+});
+
+test('MongoDB sessions make non-empty model bulk writes atomic', async () => {
+	type BulkData = { id: number; handle: string };
+	class MongoBulkRecord extends Model<BulkData> {}
+	defineModel<BulkData>('mongo_bulk_transaction_record')
+		.id('id')
+		.validate((input) => input as BulkData)
+		.attach(MongoBulkRecord);
+
+	let committedRows = new Map<string, Record<string, unknown>>();
+	const rowsFor = (options?: Record<string, any>) =>
+		(options?.session?.rows as Map<string, Record<string, unknown>> | undefined) ?? committedRows;
+	const collection = {
+		findOne: async (filter: { _id: string }, options?: Record<string, any>) =>
+			rowsFor(options).get(filter._id) ?? null,
+		find: (filter: { _id?: { $in?: string[] } }, options?: Record<string, any>) => ({
+			toArray: async () => {
+				const rows = rowsFor(options);
+				const ids = filter._id?.$in;
+				return ids ? ids.flatMap((id) => rows.has(id) ? [rows.get(id)!] : []) : [...rows.values()];
+			}
+		}),
+		aggregate: () => ({ toArray: async () => [] }),
+		insertOne: async (document: Record<string, unknown>, options?: Record<string, any>) => {
+			const rows = rowsFor(options);
+			const id = document._id as string;
+			if (rows.has(id)) throw Object.assign(new Error('duplicate'), { code: 11000 });
+			rows.set(id, document);
+		},
+		replaceOne: async (filter: { _id: string }, document: Record<string, unknown>, options?: Record<string, any>) => {
+			const rows = rowsFor(options);
+			if (!rows.has(filter._id)) return { matchedCount: 0 };
+			rows.set(filter._id, document);
+			return { matchedCount: 1 };
+		},
+		deleteOne: async (filter: { _id: string }, options?: Record<string, any>) => ({
+			deletedCount: rowsFor(options).delete(filter._id) ? 1 : 0
+		})
+	};
+	const adapter = await createMongoStoreAdapter({
+		dbName: 'test',
+		client: {
+			db: () => ({ collection: () => collection }),
+			startSession: () => {
+				const session: Record<string, any> = {
+					rows: new Map<string, Record<string, unknown>>(),
+					startTransaction: async () => {
+						session.rows = new Map(committedRows);
+					},
+					commitTransaction: async () => {
+						committedRows = new Map(session.rows);
+					},
+					abortTransaction: async () => undefined,
+					endSession: async () => undefined
+				};
+				return session;
+			}
+		}
+	});
+	const context = createActiveTs({ stores: { default: adapter } });
+	const Record = MongoBulkRecord.use(context) as typeof MongoBulkRecord;
+
+	const created = await Record.createMany([
+		{ id: 1, handle: 'one' },
+		{ id: 2, handle: 'two' }
+	]);
+	assert.deepEqual(created.map(({ data }) => data.handle), ['one', 'two']);
+	const upserted = await Record.upsertMany([
+		{ id: 1, handle: 'updated' },
+		{ id: 3, handle: 'three' }
+	]);
+	assert.deepEqual(upserted.map(({ operation }) => operation), ['update', 'create']);
+	await Record.deleteMany([2, 3]);
+	assert.deepEqual(await adapter.getMany(context.meta(Record), [1, 2, 3]), [
+		{ id: 1, handle: 'updated' },
+		null,
+		null
+	]);
+	await assert.rejects(
+		() => Record.transaction(async (tx) => {
+			await Record.createMany([
+				{ id: 4, handle: 'rolled-back-a' },
+				{ id: 5, handle: 'rolled-back-b' }
+			], tx);
+			throw new Error('bulk rollback');
+		}),
+		/bulk rollback/
+	);
+	assert.deepEqual(await adapter.getMany(context.meta(Record), [4, 5]), [null, null]);
+});
 
 test('MongoDB adapter rejects missing own write result counters', async () => {
 	const plainError = new Error('plain insert failure');

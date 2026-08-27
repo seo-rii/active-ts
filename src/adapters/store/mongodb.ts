@@ -1,6 +1,14 @@
 import { optionalImport } from '../../core/optional-import.js';
-import { ActiveTsConfigurationError, ActiveTsConflictError, ActiveTsNotFoundError, ActiveTsValidationError } from '../../core/errors.js';
-import { ownErrorValue } from '../../core/error-classification.js';
+import {
+	ActiveTsCommittedTransactionError,
+	ActiveTsConfigurationError,
+	ActiveTsConflictError,
+	ActiveTsNotFoundError,
+	ActiveTsUnknownTransactionOutcomeError,
+	ActiveTsValidationError,
+	safeErrorMessage
+} from '../../core/errors.js';
+import { markTransactionRollbackSkipped, ownErrorValue } from '../../core/error-classification.js';
 import {
 	assertSafeEntityId,
 	assertSafeEntityIdArray,
@@ -22,7 +30,9 @@ import {
 	normalizeStoreAggregateResult,
 	normalizeStoreQueryResultForModel,
 	normalizeStoreQueryPlan,
+	normalizeStoreTransactionOptions,
 	normalizeStoreWriteOptions,
+	createCloseGuardedStoreAdapter,
 	rejectUnsupportedStoreReadOptions,
 	rejectUnsupportedStoreWriteMetadata,
 	rejectUnsupportedStoreWriteOptions,
@@ -57,17 +67,60 @@ import type {
 	ResolvedModelMeta,
 	SchemaPlan,
 	SortDirection,
-	StoreAdapter
+	StoreAdapter,
+	StoreTransactionOptions
 } from '../../core/types.js';
+import type { TransactionOptions as MongoDriverTransactionOptions } from 'mongodb';
 import escapeStringRegexp from 'escape-string-regexp';
 
 export type MongoStoreOptions = {
 	client?: any;
 	url?: string;
 	dbName: string;
+	cacheScope?: string;
 	allowAggregateScanFallback?: boolean;
 };
-const MONGO_OPTION_KEYS = ['client', 'url', 'dbName', 'allowAggregateScanFallback'] as const;
+const MONGO_OPTION_KEYS = ['client', 'url', 'dbName', 'cacheScope', 'allowAggregateScanFallback'] as const;
+const MONGO_TRANSACTION_NATIVE_OPTION_KEYS = [
+	'readConcern',
+	'writeConcern',
+	'readPreference',
+	'maxCommitTimeMS'
+] as const;
+const MONGO_READ_CONCERN_KEYS = ['level'] as const;
+const MONGO_WRITE_CONCERN_KEYS = ['w', 'journal', 'wtimeoutMS', 'wtimeout', 'j', 'fsync'] as const;
+const MONGO_READ_PREFERENCE_KEYS = ['mode', 'tags', 'hedge', 'maxStalenessSeconds'] as const;
+
+export type MongoTransactionNativeOptions = Pick<
+	MongoDriverTransactionOptions,
+	'readConcern' | 'writeConcern' | 'readPreference' | 'maxCommitTimeMS'
+>;
+
+export type MongoStoreTransactionOptions = Omit<StoreTransactionOptions, 'isolation' | 'native'> & {
+	isolation?: never;
+	native?: MongoTransactionNativeOptions;
+};
+
+export type MongoStoreAdapter = Omit<StoreAdapter, 'transaction'> & {
+	transaction?<T>(
+		fn: (tx: StoreAdapter) => Promise<T>,
+		options?: MongoStoreTransactionOptions
+	): Promise<T>;
+};
+
+type NormalizedMongoClientSession = {
+	raw: object;
+	startTransaction: (options?: MongoTransactionNativeOptions) => unknown;
+	commitTransaction: (options?: { timeoutMS?: number }) => unknown;
+	abortTransaction: (options?: { timeoutMS?: number }) => unknown;
+	endSession: () => unknown;
+};
+
+type MongoTransactionState = {
+	session: NormalizedMongoClientSession;
+	readOnly: boolean;
+	run: <T>(operation: () => Promise<T>) => Promise<T>;
+};
 
 function assertSafeMongoCollectionName(name: string) {
 	name = assertSafeSchemaIdentifier(name, 'MongoDB collection name');
@@ -399,7 +452,7 @@ function assertMongoSortableFieldsDeclared(model: ResolvedModelMeta, plan: Pick<
 	}
 }
 
-export async function createMongoStoreAdapter(options: MongoStoreOptions): Promise<StoreAdapter> {
+export async function createMongoStoreAdapter(options: MongoStoreOptions): Promise<MongoStoreAdapter> {
 	options = validateMongoOptions(options);
 	const mod = options.client ? undefined : await optionalImport('mongodb', 'MongoStoreAdapter');
 	const MongoClient = mod?.MongoClient;
@@ -407,370 +460,559 @@ export async function createMongoStoreAdapter(options: MongoStoreOptions): Promi
 	const allowAggregateScanFallback = options.allowAggregateScanFallback === true;
 	if (!options.client && client.connect) await client.connect();
 	const db = normalizeMongoDb(client.db(options.dbName));
+	const supportsTransaction = client.startSession !== undefined;
 
-	const collection = (model: ResolvedModelMeta) => {
-		assertSafeMongoModel(model);
-		return normalizeMongoCollection(db.collection(assertSafeMongoCollectionName(model.name)), `MongoDB collection "${model.name}"`);
-	};
-	const idFilter = (model: ResolvedModelMeta, id: EntityId) => {
-		assertSafeMongoField(model.idField);
-		assertSafeEntityId(id, `${model.name} store id`);
-		return { _id: entityIdKey(id) };
-	};
-	const documentExists = async (model: ResolvedModelMeta, id: EntityId) => {
-		const coll = collection(model);
-		const row = await mongoMethod(coll, 'findOne', 'MongoDB collection.findOne')(idFilter(model, id));
-		return row !== null && row !== undefined;
-	};
-	const prepareDocumentData = (model: ResolvedModelMeta, id: EntityId, data: any) => {
-		assertSafeMongoField(model.idField);
-		assertSafeEntityId(id, `${model.name} store id`);
-		const clean = clonePortableDataObject(data, `${model.name} stored data`);
-		assertNoMongoStorageKeyField(clean, `${model.name} stored data`);
-		assertNoMongoDataKeys(clean, `${model.name} stored data`);
-		assertStoreDataMatchesId(model, id, clean);
-		return clean;
-	};
-	const documentFor = (model: ResolvedModelMeta, id: EntityId, data: any) => ({
-		...prepareDocumentData(model, id, data),
-		_id: entityIdKey(id)
-	});
-
-	const adapter: StoreAdapter = {
-		kind: 'mongodb',
-		capabilities: {
-			or: true,
-			contains: false,
-			arrayContains: true,
-			textContains: false,
-			jsonContains: false,
-			startsWith: true,
-			cursor: false,
-			offset: true,
-			select: true,
-			nestedFields: true,
-			numericComparisons: true,
-			aggregate: true,
-			transaction: false,
-			transactionConflictDetection: false,
-			savepoint: false,
-			uniqueIndex: true,
-			optimisticLock: true,
-			nullOperators: true,
-			missingFieldNulls: true,
-			native: true
-		},
-		async get(model, id, options) {
-			model = snapshotAdapterModel(model, 'MongoDB model metadata');
-			rejectUnsupportedStoreReadOptions(options, 'MongoDB store read options');
-			assertSafeEntityId(id, `${model.name} store id`);
-			const coll = collection(model);
-			const row = await mongoMethod(coll, 'findOne', 'MongoDB collection.findOne')(idFilter(model, id));
-			if (row === null || row === undefined) return null;
-			return mongoDocumentDataForExpectedId(row, model, id, 'MongoDB document');
-		},
-		async getMany(model, ids, options) {
-			model = snapshotAdapterModel(model, 'MongoDB model metadata');
-			rejectUnsupportedStoreReadOptions(options, 'MongoDB store read options');
-			ids = assertSafeEntityIdArray(ids, 'MongoDB store ids');
+	const createAdapter = (transactionState?: MongoTransactionState): MongoStoreAdapter => {
+		const collection = (model: ResolvedModelMeta) => {
+			assertSafeMongoModel(model);
+			return normalizeMongoCollection(db.collection(assertSafeMongoCollectionName(model.name)), `MongoDB collection "${model.name}"`);
+		};
+		const idFilter = (model: ResolvedModelMeta, id: EntityId) => {
 			assertSafeMongoField(model.idField);
+			assertSafeEntityId(id, `${model.name} store id`);
+			return { _id: entityIdKey(id) };
+		};
+		const documentExists = async (model: ResolvedModelMeta, id: EntityId) => {
 			const coll = collection(model);
-			const cursor = mongoMethod(coll, 'find', 'MongoDB collection.find')(
-				{ _id: { $in: entityIdKeyArray(ids) } }
+			const row = await mongoMethod(coll, 'findOne', 'MongoDB collection.findOne')(
+				idFilter(model, id),
+				mongoSessionOptions(transactionState)
 			);
-			const list = mongoArrayResult(
-				await mongoMethod(normalizeMongoCursor(cursor, 'MongoDB find cursor'), 'toArray', 'MongoDB find cursor.toArray')(),
-				'MongoDB find cursor.toArray'
-			);
-			const requested = new Set<string>();
-			for (const id of ids) SET_ADD.call(requested, entityIdKey(id));
-			const byId = new Map<string, any>();
-			for (const item of list) {
-				const storageKey = mongoRequiredDocumentStorageKey(item, 'MongoDB getMany document');
-				const id = entityIdFromCanonicalKey(storageKey, 'MongoDB getMany document._id');
-				const key = entityIdKey(id);
-				if (!SET_HAS.call(requested, key)) {
-					throw new ActiveTsValidationError('MongoDB getMany document id was not requested.');
-				}
-				if (MAP_HAS.call(byId, key)) {
-					throw new ActiveTsValidationError('MongoDB getMany returned duplicate document ids.');
-				}
-				const clean = mongoDocumentDataFromStorageId(item, model, id, 'MongoDB getMany document');
-				MAP_SET.call(byId, key, clean);
-			}
-			const result: Array<Record<string, unknown> | null> = [];
-			for (let index = 0; index < ids.length; index++) {
-				const row = MAP_GET.call(byId, entityIdKey(ids[index]));
-				result[index] = row === undefined ? null : cloneSafeDataObject(row, 'MongoDB getMany document');
-			}
-			return result;
-		},
-		async query(model, plan, options): Promise<QueryResult> {
-			model = snapshotAdapterModel(model, 'MongoDB model metadata');
-			plan = normalizeStoreQueryPlan(plan, model.idField, 'MongoDB query plan', {
-				limit: 'MongoDB limit',
-				offset: 'MongoDB offset',
-				whereField: 'MongoDB query field',
-				selectField: 'MongoDB select field',
-				sortField: 'MongoDB sort field'
-			});
-			plan = normalizeQueryPlanFieldTypes(model, plan);
-			plan = encodeQueryPlanFieldCodecs(model, plan);
-			assertStorePlanSupported(adapter.kind, adapter.capabilities, plan);
-			validateStoreQueryReadOptions(options, plan, 'MongoDB store read options');
-			const native = assertMongoNativeFunction(plan);
-			if (native) return normalizeStoreQueryResultForModel(
-				model,
-				await native({ db, collection: collection(model), model, plan }),
-				'MongoDB native function query',
-				{ cursor: adapter.capabilities?.cursor, adapterKind: adapter.kind }
-			);
-			assertMongoSortableFieldsDeclared(model, plan);
-			const projection = plan.select ? mongoProjection(uniqueStrings([model.idField, ...plan.select])) : undefined;
-			const coll = collection(model);
-			let cursor = normalizeMongoCursor(
-				mongoMethod(coll, 'find', 'MongoDB collection.find')(
-					mongoFilter(plan),
-					projection === undefined ? undefined : { projection }
-				),
-				'MongoDB find cursor'
-			);
-			if (plan.sort.length)
-				cursor = normalizeMongoCursor(
-					mongoMethod(cursor, 'sort', 'MongoDB find cursor.sort')(
-						mongoSortSpec(plan.sort)
-					),
-					'MongoDB sorted cursor'
-				);
-			if (plan.offset !== undefined)
-				cursor = normalizeMongoCursor(
-					mongoMethod(cursor, 'skip', 'MongoDB find cursor.skip')(plan.offset),
-					'MongoDB skipped cursor'
-				);
-			if (plan.limit !== undefined)
-				cursor = normalizeMongoCursor(
-					mongoMethod(cursor, 'limit', 'MongoDB find cursor.limit')(limitWithLookahead(plan.limit, 'MongoDB limit')),
-					'MongoDB limited cursor'
-				);
-			const list = mongoArrayResult(await mongoMethod(cursor, 'toArray', 'MongoDB find cursor.toArray')(), 'MongoDB find cursor.toArray');
-			const trimmed = trimLookaheadRows(list, plan.limit, 'MongoDB limit');
-			const result: QueryResult = {
-				list: mongoQueryDocumentsData(trimmed.rows, model),
-				count: trimmed.rows.length,
-				more: trimmed.more
-			};
-			return result;
-		},
-		async aggregate(model, plan: AggregatePlan) {
-			model = snapshotAdapterModel(model, 'MongoDB model metadata');
-			plan = normalizeStoreAggregatePlan(plan, 'MongoDB aggregate plan');
-			plan = normalizeAggregatePlanFieldTypes(model, plan);
-			plan = encodeAggregatePlanFieldCodecs(model, plan);
-			assertStorePlanSupported(adapter.kind, adapter.capabilities, plan);
-			const specs = assertAggregateSpecsCompatibleWithModel(model, plan.aggregates, 'MongoDB aggregate');
-			assertNoAggregateFieldCodecSpecs(model, specs, 'MongoDB aggregate');
-			const native = assertMongoNativeFunction(plan);
-			if (native) return normalizeStoreAggregateResult(
-				await native({ db, collection: collection(model), model, plan }),
-				specs,
-				'MongoDB native function aggregate'
-			);
-			const coll = collection(model);
-			if (aggregateNeedsPortableFallback(specs)) {
-				if (!allowAggregateScanFallback) {
-					throw new ActiveTsConfigurationError(
-						'MongoDB aggregate scan fallback requires allowAggregateScanFallback: true.'
+			return row !== null && row !== undefined;
+		};
+		const prepareDocumentData = (model: ResolvedModelMeta, id: EntityId, data: any) => {
+			assertSafeMongoField(model.idField);
+			assertSafeEntityId(id, `${model.name} store id`);
+			const clean = clonePortableDataObject(data, `${model.name} stored data`);
+			assertNoMongoStorageKeyField(clean, `${model.name} stored data`);
+			assertNoMongoDataKeys(clean, `${model.name} stored data`);
+			assertStoreDataMatchesId(model, id, clean);
+			return clean;
+		};
+		const documentFor = (model: ResolvedModelMeta, id: EntityId, data: any) => ({
+			...prepareDocumentData(model, id, data),
+			_id: entityIdKey(id)
+		});
+
+		const adapter: MongoStoreAdapter = {
+			kind: 'mongodb',
+			cacheScope: options.cacheScope,
+			capabilities: Object.freeze({
+				or: true,
+				contains: false,
+				arrayContains: true,
+				textContains: false,
+				jsonContains: false,
+				startsWith: true,
+				cursor: false,
+				offset: true,
+				select: true,
+				nestedFields: true,
+				numericComparisons: true,
+				aggregate: true,
+				transaction: transactionState === undefined && supportsTransaction,
+				transactionConflictDetection: transactionState === undefined && supportsTransaction,
+				savepoint: false,
+				uniqueIndex: true,
+				optimisticLock: true,
+				nullOperators: true,
+				missingFieldNulls: true,
+				native: transactionState === undefined
+			}),
+			async get(model, id, options) {
+				model = snapshotAdapterModel(model, 'MongoDB model metadata');
+				rejectUnsupportedStoreReadOptions(options, 'MongoDB store read options');
+				assertSafeEntityId(id, `${model.name} store id`);
+				return runMongoOperation(transactionState, async () => {
+					const coll = collection(model);
+					const row = await mongoMethod(coll, 'findOne', 'MongoDB collection.findOne')(
+						idFilter(model, id),
+						mongoSessionOptions(transactionState)
 					);
-				}
-				const fields = aggregateFields(specs);
-				const projection = mongoProjection(uniqueStrings([model.idField, ...fields]));
-				const cursor = normalizeMongoCursor(
-					mongoMethod(coll, 'find', 'MongoDB collection.find')(
-						mongoFilter({ where: plan.where, or: plan.or }),
-						{ projection }
-					),
-					'MongoDB aggregate fallback cursor'
-				);
-				const list = mongoArrayResult(
-					await mongoMethod(cursor, 'toArray', 'MongoDB aggregate fallback cursor.toArray')(),
-					'MongoDB aggregate fallback cursor.toArray'
-				);
-				return aggregateRows(mongoQueryDocumentsData(list, model), specs);
-			}
-			const invalidAliases = numericAggregateInvalidAliases(specs);
-			const cursor = normalizeMongoCursor(
-				mongoMethod(coll, 'aggregate', 'MongoDB collection.aggregate')([
-					{ $match: mongoFilter({ where: plan.where, or: plan.or }) },
-					{
-						$group: mongoAggregateGroup(specs, invalidAliases)
-					}
-				]),
-				'MongoDB aggregate cursor'
-			);
-			const [row] = mongoArrayResult(
-				await mongoMethod(cursor, 'toArray', 'MongoDB aggregate cursor.toArray')(),
-				'MongoDB aggregate cursor.toArray'
-			);
-			assertNoInvalidNumericAggregateRows(row, invalidAliases);
-			return normalizeAggregateRow(
-				row === undefined ? defaultAggregateResult(specs) : mongoAggregateResultRow(row, invalidAliases),
-				specs,
-				'MongoDB aggregate'
-			);
-		},
-		async create(model, id, data, options = {}) {
-			model = snapshotAdapterModel(model, 'MongoDB model metadata');
-			rejectUnsupportedStoreWriteOptions(options, 'MongoDB store create options');
-			assertSafeEntityId(id, `${model.name} store id`);
-			try {
-				const coll = collection(model);
-				await mongoMethod(coll, 'insertOne', 'MongoDB collection.insertOne')(documentFor(model, id, data));
-			} catch (error) {
-				if (mongoErrorCode(error) === 11000) {
-					throw new ActiveTsConflictError(`Cannot create ${model.name}:${String(id)} because it already exists.`);
-				}
-				throw error;
-			}
-		},
-		async update(model, id, data, options = {}) {
-			model = snapshotAdapterModel(model, 'MongoDB model metadata');
-			assertSafeEntityId(id, `${model.name} store id`);
-			options = rejectUnsupportedStoreWriteMetadata(
-				normalizeStoreWriteOptions(options, 'MongoDB store write options'),
-				'MongoDB store write options'
-			);
-			const filter =
-				options.expectedVersion === undefined
-					? idFilter(model, id)
-					: mongoAnd(idFilter(model, id), mongoScalarFieldCondition('version', { $eq: options.expectedVersion }));
-			const coll = collection(model);
-			const res = await mongoMethod(coll, 'replaceOne', 'MongoDB collection.replaceOne')(filter, documentFor(model, id, data), {
-				upsert: false
-			});
-			const matchedCount = mongoMatchedCount(res, 'MongoDB replaceOne');
-			if (matchedCount === 0 && options.expectedVersion !== undefined) {
-				if (!await documentExists(model, id)) {
-					throw new ActiveTsNotFoundError(`Cannot update ${model.name}:${String(id)} because it does not exist.`);
-				}
-				throw new ActiveTsConflictError(
-					`Optimistic lock failed for ${model.name}:${String(id)}. Expected version ${options.expectedVersion}.`
-				);
-			}
-			if (matchedCount === 0) {
-				throw new ActiveTsNotFoundError(`Cannot update ${model.name}:${String(id)} because it does not exist.`);
-			}
-		},
-		async delete(model, id, options = {}) {
-			model = snapshotAdapterModel(model, 'MongoDB model metadata');
-			assertSafeEntityId(id, `${model.name} store id`);
-			options = rejectUnsupportedStoreWriteMetadata(
-				normalizeStoreWriteOptions(options, 'MongoDB store delete options'),
-				'MongoDB store delete options'
-			);
-			const coll = collection(model);
-			const filter =
-				options.expectedVersion === undefined
-					? idFilter(model, id)
-					: mongoAnd(idFilter(model, id), mongoScalarFieldCondition('version', { $eq: options.expectedVersion }));
-			const res = await mongoMethod(coll, 'deleteOne', 'MongoDB collection.deleteOne')(filter);
-			const deletedCount = mongoDeletedCount(res, 'MongoDB deleteOne');
-			if (options.expectedVersion !== undefined && deletedCount === 0) {
-				if (!await documentExists(model, id)) {
-					throw new ActiveTsNotFoundError(`Cannot delete ${model.name}:${String(id)} because it does not exist.`);
-				}
-				throw new ActiveTsConflictError(
-					`Optimistic lock failed for ${model.name}:${String(id)}. Expected version ${options.expectedVersion}.`
-				);
-			}
-		},
-		schema: db.listCollections && db.createCollection ? {
-			async plan(models): Promise<SchemaPlan> {
-				models = normalizeSchemaModels(models, 'MongoDB schema models');
-				const existing = new Map<string, MongoCollectionDefinition>();
-				for (const collectionInfo of mongoArrayResult(await mongoMethod(
-						normalizeMongoCursor(
-							mongoMethod(db, 'listCollections', 'MongoDB db.listCollections')(),
-							'MongoDB listCollections cursor'
-						),
-						'toArray',
-						'MongoDB listCollections cursor.toArray'
-					)(), 'MongoDB listCollections cursor.toArray')) {
-					const collection = mongoCollectionDefinition(collectionInfo);
-					MAP_SET.call(existing, collection.name, collection);
-				}
-				const changes: SchemaPlan['changes'] = [];
-				for (const model of models) {
-					const existingCollection = MAP_GET.call(existing, model.name) as MongoCollectionDefinition | undefined;
-					if (existingCollection && !mongoCollectionKindWritable(existingCollection)) {
-						throw new ActiveTsConfigurationError(
-							`MongoDB collection "${model.name}" exists as ${existingCollection.type}; expected collection.`
-						);
-					}
-					const collectionExists = existingCollection !== undefined;
-					if (!collectionExists) changes.push({ type: 'create-collection', target: model.name });
-					const existingIndexes = collectionExists
-						? mongoExistingIndexes(
-							mongoArrayResult(
-								await mongoMethod(collection(model), 'indexes', 'MongoDB collection.indexes')(),
-								'MongoDB collection.indexes'
-							)
-						)
-						: new Map<string, unknown>();
-					for (const index of model.indexes) {
-						const fields = mongoIndexFields(index.fields);
-						const directions = index.directions;
-						const existingIndex = MAP_GET.call(existingIndexes, index.name);
-						if (MAP_HAS.call(existingIndexes, index.name)) {
-							assertMongoIndexDefinitionMatches(
-								model,
-								index.name,
-								fields,
-								directions,
-								Boolean(index.unique),
-								mongoIndexDefinition(existingIndex)
-							);
-							continue;
-						}
-						changes.push({
-							type: 'create-index',
-							target: model.name,
-							name: index.name,
-							fields,
-							...(directions === undefined ? {} : { directions }),
-							unique: index.unique
-						});
-					}
-				}
-				return {
-					adapter: 'mongodb',
-					changes
-				};
+					if (row === null || row === undefined) return null;
+					return mongoDocumentDataForExpectedId(row, model, id, 'MongoDB document');
+				});
 			},
-			async apply(models, applyOptions): Promise<SchemaPlan> {
-				normalizeStoreSchemaApplyOptions(applyOptions, 'MongoDB schema apply options');
-				const safeModels = normalizeSchemaModels(models, 'MongoDB schema models');
-				const plan = await adapter.schema!.plan(safeModels);
-				for (const model of safeModels) {
-					await mongoMethod(db, 'createCollection', 'MongoDB db.createCollection')(
-						assertSafeMongoCollectionName(model.name)
-					).catch((error: unknown) => {
-						if (isMongoNamespaceExistsError(error)) return undefined;
+			async getMany(model, ids, options) {
+				model = snapshotAdapterModel(model, 'MongoDB model metadata');
+				rejectUnsupportedStoreReadOptions(options, 'MongoDB store read options');
+				ids = assertSafeEntityIdArray(ids, 'MongoDB store ids');
+				assertSafeMongoField(model.idField);
+				return runMongoOperation(transactionState, async () => {
+					const coll = collection(model);
+					const cursor = mongoMethod(coll, 'find', 'MongoDB collection.find')(
+						{ _id: { $in: entityIdKeyArray(ids) } },
+						mongoSessionOptions(transactionState)
+					);
+					const list = mongoArrayResult(
+						await mongoMethod(normalizeMongoCursor(cursor, 'MongoDB find cursor'), 'toArray', 'MongoDB find cursor.toArray')(),
+						'MongoDB find cursor.toArray'
+					);
+					const requested = new Set<string>();
+					for (const id of ids) SET_ADD.call(requested, entityIdKey(id));
+					const byId = new Map<string, any>();
+					for (const item of list) {
+						const storageKey = mongoRequiredDocumentStorageKey(item, 'MongoDB getMany document');
+						const id = entityIdFromCanonicalKey(storageKey, 'MongoDB getMany document._id');
+						const key = entityIdKey(id);
+						if (!SET_HAS.call(requested, key)) {
+							throw new ActiveTsValidationError('MongoDB getMany document id was not requested.');
+						}
+						if (MAP_HAS.call(byId, key)) {
+							throw new ActiveTsValidationError('MongoDB getMany returned duplicate document ids.');
+						}
+						const clean = mongoDocumentDataFromStorageId(item, model, id, 'MongoDB getMany document');
+						MAP_SET.call(byId, key, clean);
+					}
+					const result: Array<Record<string, unknown> | null> = [];
+					for (let index = 0; index < ids.length; index++) {
+						const row = MAP_GET.call(byId, entityIdKey(ids[index]));
+						result[index] = row === undefined ? null : cloneSafeDataObject(row, 'MongoDB getMany document');
+					}
+					return result;
+				});
+			},
+			async query(model, plan, options): Promise<QueryResult> {
+				model = snapshotAdapterModel(model, 'MongoDB model metadata');
+				plan = normalizeStoreQueryPlan(plan, model.idField, 'MongoDB query plan', {
+					limit: 'MongoDB limit',
+					offset: 'MongoDB offset',
+					whereField: 'MongoDB query field',
+					selectField: 'MongoDB select field',
+					sortField: 'MongoDB sort field'
+				});
+				plan = normalizeQueryPlanFieldTypes(model, plan);
+				plan = encodeQueryPlanFieldCodecs(model, plan);
+				assertStorePlanSupported(adapter.kind, adapter.capabilities, plan);
+				validateStoreQueryReadOptions(options, plan, 'MongoDB store read options');
+				const native = assertMongoNativeFunction(plan);
+				if (!native) assertMongoSortableFieldsDeclared(model, plan);
+				const projection = plan.select ? mongoProjection(uniqueStrings([model.idField, ...plan.select])) : undefined;
+				return runMongoOperation(transactionState, async () => {
+					if (native) return normalizeStoreQueryResultForModel(
+						model,
+						await native({ db, collection: collection(model), model, plan }),
+						'MongoDB native function query',
+						{ cursor: adapter.capabilities?.cursor, adapterKind: adapter.kind }
+					);
+					const coll = collection(model);
+					let cursor = normalizeMongoCursor(
+						mongoMethod(coll, 'find', 'MongoDB collection.find')(
+							mongoFilter(plan),
+							mongoSessionOptions(
+								transactionState,
+								projection === undefined ? undefined : { projection }
+							)
+						),
+						'MongoDB find cursor'
+					);
+					if (plan.sort.length)
+						cursor = normalizeMongoCursor(
+							mongoMethod(cursor, 'sort', 'MongoDB find cursor.sort')(
+								mongoSortSpec(plan.sort)
+							),
+							'MongoDB sorted cursor'
+						);
+					if (plan.offset !== undefined)
+						cursor = normalizeMongoCursor(
+							mongoMethod(cursor, 'skip', 'MongoDB find cursor.skip')(plan.offset),
+							'MongoDB skipped cursor'
+						);
+					if (plan.limit !== undefined)
+						cursor = normalizeMongoCursor(
+							mongoMethod(cursor, 'limit', 'MongoDB find cursor.limit')(limitWithLookahead(plan.limit, 'MongoDB limit')),
+							'MongoDB limited cursor'
+						);
+					const list = mongoArrayResult(await mongoMethod(cursor, 'toArray', 'MongoDB find cursor.toArray')(), 'MongoDB find cursor.toArray');
+					const trimmed = trimLookaheadRows(list, plan.limit, 'MongoDB limit');
+					const result: QueryResult = {
+						list: mongoQueryDocumentsData(trimmed.rows, model),
+						count: trimmed.rows.length,
+						more: trimmed.more
+					};
+					return result;
+				});
+			},
+			async aggregate(model, plan: AggregatePlan) {
+				model = snapshotAdapterModel(model, 'MongoDB model metadata');
+				plan = normalizeStoreAggregatePlan(plan, 'MongoDB aggregate plan');
+				plan = normalizeAggregatePlanFieldTypes(model, plan);
+				plan = encodeAggregatePlanFieldCodecs(model, plan);
+				assertStorePlanSupported(adapter.kind, adapter.capabilities, plan);
+				const specs = assertAggregateSpecsCompatibleWithModel(model, plan.aggregates, 'MongoDB aggregate');
+				assertNoAggregateFieldCodecSpecs(model, specs, 'MongoDB aggregate');
+				const native = assertMongoNativeFunction(plan);
+				return runMongoOperation(transactionState, async () => {
+					if (native) return normalizeStoreAggregateResult(
+						await native({ db, collection: collection(model), model, plan }),
+						specs,
+						'MongoDB native function aggregate'
+					);
+					const coll = collection(model);
+					if (aggregateNeedsPortableFallback(specs)) {
+						if (!allowAggregateScanFallback) {
+							throw new ActiveTsConfigurationError(
+								'MongoDB aggregate scan fallback requires allowAggregateScanFallback: true.'
+							);
+						}
+						const fields = aggregateFields(specs);
+						const projection = mongoProjection(uniqueStrings([model.idField, ...fields]));
+						const cursor = normalizeMongoCursor(
+							mongoMethod(coll, 'find', 'MongoDB collection.find')(
+								mongoFilter({ where: plan.where, or: plan.or }),
+								mongoSessionOptions(transactionState, { projection })
+							),
+							'MongoDB aggregate fallback cursor'
+						);
+						const list = mongoArrayResult(
+							await mongoMethod(cursor, 'toArray', 'MongoDB aggregate fallback cursor.toArray')(),
+							'MongoDB aggregate fallback cursor.toArray'
+						);
+						return aggregateRows(mongoQueryDocumentsData(list, model), specs);
+					}
+					const invalidAliases = numericAggregateInvalidAliases(specs);
+					const cursor = normalizeMongoCursor(
+						mongoMethod(coll, 'aggregate', 'MongoDB collection.aggregate')(
+							[
+								{ $match: mongoFilter({ where: plan.where, or: plan.or }) },
+								{
+									$group: mongoAggregateGroup(specs, invalidAliases)
+								}
+							],
+							mongoSessionOptions(transactionState)
+						),
+						'MongoDB aggregate cursor'
+					);
+					const [row] = mongoArrayResult(
+						await mongoMethod(cursor, 'toArray', 'MongoDB aggregate cursor.toArray')(),
+						'MongoDB aggregate cursor.toArray'
+					);
+					assertNoInvalidNumericAggregateRows(row, invalidAliases);
+					return normalizeAggregateRow(
+						row === undefined ? defaultAggregateResult(specs) : mongoAggregateResultRow(row, invalidAliases),
+						specs,
+						'MongoDB aggregate'
+					);
+				});
+			},
+			async create(model, id, data, options = {}) {
+				model = snapshotAdapterModel(model, 'MongoDB model metadata');
+				rejectUnsupportedStoreWriteOptions(options, 'MongoDB store create options');
+				assertSafeEntityId(id, `${model.name} store id`);
+				assertSafeMongoModel(model);
+				assertMongoTransactionWritable(transactionState, 'create');
+				const document = documentFor(model, id, data);
+				return runMongoOperation(transactionState, async () => {
+					try {
+						const coll = collection(model);
+						await mongoMethod(coll, 'insertOne', 'MongoDB collection.insertOne')(
+							document,
+							mongoSessionOptions(transactionState)
+						);
+					} catch (error) {
+						if (mongoErrorCode(error) === 11000) {
+							throw new ActiveTsConflictError(`Cannot create ${model.name}:${String(id)} because it already exists.`);
+						}
 						throw error;
-					});
-					for (const index of model.indexes) {
-						const options: { name: string; unique?: true } = { name: assertSafeMongoIndexName(index.name) };
-						if (index.unique === true) options.unique = true;
-						await mongoMethod(collection(model), 'createIndex', 'MongoDB collection.createIndex')(
-							mongoIndexKeySpec(index.fields, index.directions),
-							options
+					}
+				});
+			},
+			async update(model, id, data, options = {}) {
+				model = snapshotAdapterModel(model, 'MongoDB model metadata');
+				assertSafeEntityId(id, `${model.name} store id`);
+				assertMongoTransactionWritable(transactionState, 'update');
+				options = rejectUnsupportedStoreWriteMetadata(
+					normalizeStoreWriteOptions(options, 'MongoDB store write options'),
+					'MongoDB store write options'
+				);
+				const filter =
+					options.expectedVersion === undefined
+						? idFilter(model, id)
+						: mongoAnd(idFilter(model, id), mongoScalarFieldCondition('version', { $eq: options.expectedVersion }));
+				const document = documentFor(model, id, data);
+				return runMongoOperation(transactionState, async () => {
+					const coll = collection(model);
+					const res = await mongoMethod(coll, 'replaceOne', 'MongoDB collection.replaceOne')(
+						filter,
+						document,
+						mongoSessionOptions(transactionState, { upsert: false })
+					);
+					const matchedCount = mongoMatchedCount(res, 'MongoDB replaceOne');
+					if (matchedCount === 0 && options.expectedVersion !== undefined) {
+						if (!await documentExists(model, id)) {
+							throw new ActiveTsNotFoundError(`Cannot update ${model.name}:${String(id)} because it does not exist.`);
+						}
+						throw new ActiveTsConflictError(
+							`Optimistic lock failed for ${model.name}:${String(id)}. Expected version ${options.expectedVersion}.`
 						);
 					}
+					if (matchedCount === 0) {
+						throw new ActiveTsNotFoundError(`Cannot update ${model.name}:${String(id)} because it does not exist.`);
+					}
+				});
+			},
+			async delete(model, id, options = {}) {
+				model = snapshotAdapterModel(model, 'MongoDB model metadata');
+				assertSafeEntityId(id, `${model.name} store id`);
+				assertMongoTransactionWritable(transactionState, 'delete');
+				options = rejectUnsupportedStoreWriteMetadata(
+					normalizeStoreWriteOptions(options, 'MongoDB store delete options'),
+					'MongoDB store delete options'
+				);
+				const coll = collection(model);
+				const filter =
+					options.expectedVersion === undefined
+						? idFilter(model, id)
+						: mongoAnd(idFilter(model, id), mongoScalarFieldCondition('version', { $eq: options.expectedVersion }));
+				return runMongoOperation(transactionState, async () => {
+					const res = await mongoMethod(coll, 'deleteOne', 'MongoDB collection.deleteOne')(
+						filter,
+						mongoSessionOptions(transactionState)
+					);
+					const deletedCount = mongoDeletedCount(res, 'MongoDB deleteOne');
+					if (options.expectedVersion !== undefined && deletedCount === 0) {
+						if (!await documentExists(model, id)) {
+							throw new ActiveTsNotFoundError(`Cannot delete ${model.name}:${String(id)} because it does not exist.`);
+						}
+						throw new ActiveTsConflictError(
+							`Optimistic lock failed for ${model.name}:${String(id)}. Expected version ${options.expectedVersion}.`
+						);
+					}
+				});
+			},
+			transaction: transactionState === undefined && client.startSession ? async (fn, transactionOptions) => {
+				if (typeof fn !== 'function') {
+					throw new ActiveTsConfigurationError('MongoDB transaction callback must be a function.');
 				}
-				return plan;
-			}
-		} : undefined
+				const txOptions = normalizeMongoTransactionOptions(transactionOptions);
+				const rawSession = await client.startSession(
+					txOptions.timeoutMs === undefined ? undefined : { defaultTimeoutMS: txOptions.timeoutMs }
+				);
+				let session: NormalizedMongoClientSession;
+				try {
+					session = normalizeMongoClientSession(rawSession);
+				} catch (error) {
+					try {
+						if (rawSession && typeof rawSession === 'object' && !Array.isArray(rawSession)) {
+							const endSession = optionalMongoMethod(
+								rawSession,
+								'endSession',
+								'MongoDB session.endSession'
+							);
+							if (endSession) await endSession();
+						}
+					} catch (endError) {
+						if (error && (typeof error === 'object' || typeof error === 'function')) {
+							try {
+								defineDataProperty(error, 'sessionEndError', endError, {
+									enumerable: false,
+									configurable: true
+								});
+							} catch {
+								// Preserve the session contract error when it cannot be extended.
+							}
+						}
+					}
+					throw error;
+				}
+				const finalizationOptions = txOptions.timeoutMs === undefined
+					? undefined
+					: { timeoutMS: txOptions.timeoutMs };
+				let result!: Awaited<ReturnType<typeof fn>>;
+				let primaryFailure: { error: unknown } | undefined;
+				let transactionStarted = false;
+				let commitDispatched = false;
+				let committed = false;
+				let closed: string | undefined;
+				try {
+					await session.startTransaction(txOptions.native);
+					transactionStarted = true;
+					let operationTail = Promise.resolve();
+					const state: MongoTransactionState = {
+						session,
+						readOnly: txOptions.readOnly === true,
+						run: <T>(operation: () => Promise<T>) => {
+							const queued = operationTail.then(operation, operation);
+							operationTail = queued.then(() => undefined, () => undefined);
+							return queued;
+						}
+					};
+					const guarded = createCloseGuardedStoreAdapter(
+						createAdapter(state),
+						() => closed,
+						'MongoDB store'
+					);
+					try {
+						result = await fn(guarded.adapter);
+						closed = 'callback finished';
+						await guarded.waitForPendingOperations();
+					} catch (error) {
+						closed = 'rollback';
+						try {
+							await guarded.waitForPendingOperations();
+						} catch {
+							// Preserve the callback or tracked operation error that triggered rollback.
+						}
+						throw error;
+					}
+					commitDispatched = true;
+					await session.commitTransaction(finalizationOptions);
+					committed = true;
+					closed = 'commit';
+				} catch (error) {
+					if (commitDispatched) {
+						if (isMongoUnknownTransactionCommitResult(error)) {
+							primaryFailure = {
+								error: markTransactionRollbackSkipped(
+									new ActiveTsUnknownTransactionOutcomeError(
+										`MongoDB transaction commit outcome is unknown: ${safeErrorMessage(error)}`,
+										'commit',
+										error
+									)
+								)
+							};
+							closed = 'failed';
+						} else {
+							primaryFailure = { error: normalizeMongoTransactionConflict(error) };
+							closed = 'rollback';
+						}
+					} else if (transactionStarted) {
+						try {
+							await session.abortTransaction(finalizationOptions);
+							closed = 'rollback';
+						} catch (abortError) {
+							primaryFailure = {
+								error: markTransactionRollbackSkipped(
+									new ActiveTsUnknownTransactionOutcomeError(
+										`MongoDB transaction failed and abort outcome is unknown: ${safeErrorMessage(error)}`,
+										'abort',
+										new AggregateError([error, abortError], 'MongoDB transaction callback and abort both failed.')
+									)
+								)
+							};
+							closed = 'failed';
+						}
+					}
+					primaryFailure ??= { error };
+				}
+				try {
+					await session.endSession();
+				} catch (endError) {
+					if (primaryFailure !== undefined) {
+						const primaryError = primaryFailure.error;
+						if (primaryError && (typeof primaryError === 'object' || typeof primaryError === 'function')) {
+							try {
+								defineDataProperty(primaryError, 'sessionEndError', endError, {
+									enumerable: false,
+									configurable: true
+								});
+							} catch {
+								// Preserve the transaction outcome when the primary error is not extensible.
+							}
+						}
+					} else if (committed) {
+						throw new ActiveTsCommittedTransactionError(
+							`MongoDB transaction committed but ending its session failed: ${safeErrorMessage(endError)}`,
+							endError,
+							result
+						);
+					} else {
+						primaryFailure = { error: endError };
+					}
+				}
+				if (primaryFailure !== undefined) throw primaryFailure.error;
+				return result;
+			} : undefined,
+			schema: transactionState === undefined && db.listCollections && db.createCollection ? {
+				async plan(models): Promise<SchemaPlan> {
+					models = normalizeSchemaModels(models, 'MongoDB schema models');
+					const existing = new Map<string, MongoCollectionDefinition>();
+					for (const collectionInfo of mongoArrayResult(await mongoMethod(
+							normalizeMongoCursor(
+								mongoMethod(db, 'listCollections', 'MongoDB db.listCollections')(),
+								'MongoDB listCollections cursor'
+							),
+							'toArray',
+							'MongoDB listCollections cursor.toArray'
+						)(), 'MongoDB listCollections cursor.toArray')) {
+						const collection = mongoCollectionDefinition(collectionInfo);
+						MAP_SET.call(existing, collection.name, collection);
+					}
+					const changes: SchemaPlan['changes'] = [];
+					for (const model of models) {
+						const existingCollection = MAP_GET.call(existing, model.name) as MongoCollectionDefinition | undefined;
+						if (existingCollection && !mongoCollectionKindWritable(existingCollection)) {
+							throw new ActiveTsConfigurationError(
+								`MongoDB collection "${model.name}" exists as ${existingCollection.type}; expected collection.`
+							);
+						}
+						const collectionExists = existingCollection !== undefined;
+						if (!collectionExists) changes.push({ type: 'create-collection', target: model.name });
+						const existingIndexes = collectionExists
+							? mongoExistingIndexes(
+								mongoArrayResult(
+									await mongoMethod(collection(model), 'indexes', 'MongoDB collection.indexes')(),
+									'MongoDB collection.indexes'
+								)
+							)
+							: new Map<string, unknown>();
+						for (const index of model.indexes) {
+							const fields = mongoIndexFields(index.fields);
+							const directions = index.directions;
+							const existingIndex = MAP_GET.call(existingIndexes, index.name);
+							if (MAP_HAS.call(existingIndexes, index.name)) {
+								assertMongoIndexDefinitionMatches(
+									model,
+									index.name,
+									fields,
+									directions,
+									Boolean(index.unique),
+									mongoIndexDefinition(existingIndex)
+								);
+								continue;
+							}
+							changes.push({
+								type: 'create-index',
+								target: model.name,
+								name: index.name,
+								fields,
+								...(directions === undefined ? {} : { directions }),
+								unique: index.unique
+							});
+						}
+					}
+					return {
+						adapter: 'mongodb',
+						changes
+					};
+				},
+				async apply(models, applyOptions): Promise<SchemaPlan> {
+					normalizeStoreSchemaApplyOptions(applyOptions, 'MongoDB schema apply options');
+					const safeModels = normalizeSchemaModels(models, 'MongoDB schema models');
+					const plan = await adapter.schema!.plan(safeModels);
+					for (const model of safeModels) {
+						await mongoMethod(db, 'createCollection', 'MongoDB db.createCollection')(
+							assertSafeMongoCollectionName(model.name)
+						).catch((error: unknown) => {
+							if (isMongoNamespaceExistsError(error)) return undefined;
+							throw error;
+						});
+						for (const index of model.indexes) {
+							const options: { name: string; unique?: true } = { name: assertSafeMongoIndexName(index.name) };
+							if (index.unique === true) options.unique = true;
+							await mongoMethod(collection(model), 'createIndex', 'MongoDB collection.createIndex')(
+								mongoIndexKeySpec(index.fields, index.directions),
+								options
+							);
+						}
+					}
+					return plan;
+				}
+			} : undefined
+		};
+		return adapter;
 	};
-	return adapter;
+	return createAdapter();
 }
 
 type MongoIndexDefinition = {
@@ -1063,12 +1305,211 @@ function mongoErrorCode(error: unknown) {
 	return typeof code === 'number' ? code : undefined;
 }
 
+function mongoErrorHasLabel(error: unknown, label: string) {
+	if (!error || typeof error !== 'object' || Array.isArray(error)) return false;
+	let prototype: object | null = error;
+	try {
+		for (let depth = 0; prototype !== null && depth < 16; depth++) {
+			const descriptor = Object.getOwnPropertyDescriptor(prototype, 'hasErrorLabel');
+			if (descriptor !== undefined) {
+				if ('value' in descriptor && typeof descriptor.value === 'function') {
+					try {
+						if (descriptor.value.call(error, label) === true) return true;
+					} catch {
+						// Fall back to inert label data when a malformed method throws.
+					}
+				}
+				break;
+			}
+			prototype = Object.getPrototypeOf(prototype);
+		}
+	} catch {
+		// Error classification must not propagate hostile prototype traps.
+	}
+	const labelSet = ownErrorValue(error, 'errorLabelSet');
+	try {
+		if (SET_HAS.call(labelSet as Set<unknown>, label)) return true;
+	} catch {
+		// Non-Set values, including proxies, are not trusted as driver label sets.
+	}
+	const labels = ownErrorValue(error, 'errorLabels');
+	if (!Array.isArray(labels)) return false;
+	try {
+		for (const property of Object.getOwnPropertyNames(labels)) {
+			if (property === 'length') continue;
+			const descriptor = Object.getOwnPropertyDescriptor(labels, property);
+			if (descriptor && 'value' in descriptor && descriptor.value === label) return true;
+		}
+	} catch {
+		// Error classification must not execute or propagate hostile collection traps.
+	}
+	return false;
+}
+
+function isMongoUnknownTransactionCommitResult(error: unknown) {
+	return mongoErrorHasLabel(error, 'UnknownTransactionCommitResult');
+}
+
+function isMongoTransactionConflict(error: unknown) {
+	if (mongoErrorHasLabel(error, 'TransientTransactionError')) return true;
+	const code = mongoErrorCode(error);
+	return code === 112 || code === 251;
+}
+
+function normalizeMongoTransactionConflict(error: unknown) {
+	if (!isMongoTransactionConflict(error)) return error;
+	const conflict = new ActiveTsConflictError(`MongoDB transaction conflicted: ${safeErrorMessage(error)}`);
+	defineDataProperty(conflict, 'cause', error, {
+		enumerable: false,
+		configurable: true
+	});
+	return conflict;
+}
+
 function isMongoNamespaceExistsError(error: unknown) {
 	const code = mongoErrorCode(error);
 	if (code === 48) return true;
 	if (!error || typeof error !== 'object' || Array.isArray(error)) return false;
 	const codeName = ownErrorValue(error, 'codeName');
 	return codeName === 'NamespaceExists';
+}
+
+function normalizeMongoTransactionOptions(options: unknown) {
+	const normalized = normalizeStoreTransactionOptions(
+		snapshotMongoTransactionNativeInstances(options),
+		'MongoDB transaction options'
+	);
+	if (normalized.isolation !== undefined) {
+		throw new ActiveTsConfigurationError('MongoDB transaction options.isolation is not supported.');
+	}
+	let native: MongoTransactionNativeOptions | undefined;
+	if (normalized.native !== undefined) {
+		if (!normalized.native || typeof normalized.native !== 'object' || Array.isArray(normalized.native)) {
+			throw new ActiveTsConfigurationError('MongoDB transaction options.native must be a plain object.');
+		}
+		assertPlainFactoryOptions(normalized.native, 'MongoDB transaction options.native');
+		native = normalized.native as MongoTransactionNativeOptions;
+		assertNoSymbolOptions(native as Record<string, unknown>, 'MongoDB transaction options.native');
+		assertKnownOptions(
+			native as Record<string, unknown>,
+			MONGO_TRANSACTION_NATIVE_OPTION_KEYS,
+			'MongoDB transaction options.native'
+		);
+		const maxCommitTimeMS = ownFactoryOptionValue(
+			native as Record<string, unknown>,
+			'maxCommitTimeMS',
+			'MongoDB transaction native option'
+		);
+		if (maxCommitTimeMS !== undefined) {
+			assertSafeLimit(maxCommitTimeMS as number, 'MongoDB transaction options.native.maxCommitTimeMS');
+		}
+	}
+	return {
+		readOnly: normalized.readOnly,
+		timeoutMs: normalized.timeoutMs,
+		native
+	};
+}
+
+function snapshotMongoTransactionNativeInstances(options: unknown): unknown {
+	if (!options || typeof options !== 'object' || Array.isArray(options)) return options;
+	const optionsPrototype = Object.getPrototypeOf(options);
+	if (optionsPrototype !== Object.prototype && optionsPrototype !== null) return options;
+	const nativeDescriptor = Object.getOwnPropertyDescriptor(options, 'native');
+	if (!nativeDescriptor || !('value' in nativeDescriptor) || nativeDescriptor.value === undefined) return options;
+	const native = nativeDescriptor.value;
+	if (!native || typeof native !== 'object' || Array.isArray(native)) return options;
+	const nativePrototype = Object.getPrototypeOf(native);
+	if (nativePrototype !== Object.prototype && nativePrototype !== null) return options;
+
+	const descriptors = Object.getOwnPropertyDescriptors(native);
+	let changed = false;
+	for (const key of ['readConcern', 'writeConcern', 'readPreference'] as const) {
+		const descriptor = descriptors[key];
+		if (!descriptor || !('value' in descriptor) || descriptor.value === undefined) continue;
+		const value = descriptor.value;
+		if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+		const prototype = Object.getPrototypeOf(value);
+		if (prototype === Object.prototype || prototype === null) continue;
+		const allowedKeys = key === 'readConcern'
+			? MONGO_READ_CONCERN_KEYS
+			: key === 'writeConcern'
+				? MONGO_WRITE_CONCERN_KEYS
+				: MONGO_READ_PREFERENCE_KEYS;
+		descriptors[key] = {
+			...descriptor,
+			value: snapshotMongoDriverOption(value, allowedKeys, `MongoDB transaction options.native.${key}`)
+		};
+		changed = true;
+	}
+	if (!changed) return options;
+
+	const nativeSnapshot = Object.create(nativePrototype);
+	Object.defineProperties(nativeSnapshot, descriptors);
+	const optionDescriptors = Object.getOwnPropertyDescriptors(options);
+	optionDescriptors.native = { ...nativeDescriptor, value: nativeSnapshot };
+	const optionsSnapshot = Object.create(optionsPrototype);
+	Object.defineProperties(optionsSnapshot, optionDescriptors);
+	return optionsSnapshot;
+}
+
+function snapshotMongoDriverOption(
+	value: object,
+	allowedKeys: readonly string[],
+	context: string
+): Record<string, unknown> {
+	if (Object.getOwnPropertySymbols(value).length) {
+		throw new ActiveTsConfigurationError(`${context} cannot contain symbol fields.`);
+	}
+	const allowed = new Set<string>(allowedKeys);
+	const snapshot: Record<string, unknown> = {};
+	for (const key of Object.getOwnPropertyNames(value)) {
+		if (!allowed.has(key)) {
+			throw new ActiveTsConfigurationError(`${context} contains unknown option "${key}".`);
+		}
+		const descriptor = Object.getOwnPropertyDescriptor(value, key);
+		if (!descriptor || !('value' in descriptor)) {
+			throw new ActiveTsConfigurationError(`${context}.${key} must be a data property.`);
+		}
+		if (!descriptor.enumerable) {
+			throw new ActiveTsConfigurationError(`${context}.${key} must be enumerable.`);
+		}
+		if (descriptor.value !== undefined) snapshot[key] = descriptor.value;
+	}
+	return snapshot;
+}
+
+function runMongoOperation<T>(
+	transactionState: MongoTransactionState | undefined,
+	operation: () => Promise<T>
+): Promise<T> {
+	if (!transactionState) return operation();
+	return (async () => {
+		try {
+			return await transactionState.run(operation);
+		} catch (error) {
+			throw normalizeMongoTransactionConflict(error);
+		}
+	})();
+}
+
+function mongoSessionOptions(
+	transactionState: MongoTransactionState | undefined,
+	options?: Record<string, unknown>
+) {
+	if (!transactionState) return options;
+	return {
+		...(options ?? {}),
+		session: transactionState.session.raw
+	};
+}
+
+function assertMongoTransactionWritable(
+	transactionState: MongoTransactionState | undefined,
+	operation: string
+) {
+	if (transactionState?.readOnly !== true) return;
+	throw new ActiveTsConfigurationError(`Cannot ${operation} in a read-only MongoDB transaction.`);
 }
 
 function validateMongoOptions(options: MongoStoreOptions) {
@@ -1082,6 +1523,7 @@ function validateMongoOptions(options: MongoStoreOptions) {
 	const dbName = ownFactoryOptionValue(record, 'dbName', 'MongoDB adapter option');
 	const url = ownFactoryOptionValue(record, 'url', 'MongoDB adapter option');
 	const client = ownFactoryOptionValue(record, 'client', 'MongoDB adapter option');
+	const cacheScope = ownFactoryOptionValue(record, 'cacheScope', 'MongoDB adapter option');
 	const allowAggregateScanFallback = ownFactoryOptionValue(record, 'allowAggregateScanFallback', 'MongoDB adapter option');
 	if (typeof dbName !== 'string' || !dbName || dbName.includes('\0')) {
 		throw new ActiveTsConfigurationError('MongoDB adapter dbName must be a non-empty string without null bytes.');
@@ -1092,13 +1534,18 @@ function validateMongoOptions(options: MongoStoreOptions) {
 	if (client !== undefined && url !== undefined) {
 		throw new ActiveTsConfigurationError('MongoDB adapter options cannot combine client and url.');
 	}
+	if (cacheScope !== undefined && (typeof cacheScope !== 'string' || !cacheScope || cacheScope.includes('\0'))) {
+		throw new ActiveTsConfigurationError(
+			'MongoDB adapter cacheScope must be a non-empty string without null bytes.'
+		);
+	}
 	if (client !== undefined) {
 		normalizeMongoClient(client);
 	}
 	if (allowAggregateScanFallback !== undefined && typeof allowAggregateScanFallback !== 'boolean') {
 		throw new ActiveTsConfigurationError('MongoDB adapter allowAggregateScanFallback must be a boolean.');
 	}
-	return { dbName, url, client, allowAggregateScanFallback } as MongoStoreOptions;
+	return { dbName, url, client, cacheScope, allowAggregateScanFallback } as MongoStoreOptions;
 }
 
 function assertPlainFactoryOptions(options: object, context: string) {
@@ -1145,8 +1592,26 @@ function normalizeMongoClient(client: unknown) {
 	if (connectValue !== undefined && typeof connectValue !== 'function') {
 		throw new ActiveTsConfigurationError('MongoDB adapter client.connect must be a function.');
 	}
+	const startSessionValue = mongoMember(client, 'startSession', 'MongoDB adapter client.startSession', { requireEnumerableOwn: true });
+	if (startSessionValue !== undefined && typeof startSessionValue !== 'function') {
+		throw new ActiveTsConfigurationError('MongoDB adapter client.startSession must be a function.');
+	}
 	const connect = typeof connectValue === 'function' ? connectValue.bind(client) : undefined;
-	return Object.freeze(connect === undefined ? { db } : { db, connect });
+	const startSession = typeof startSessionValue === 'function' ? startSessionValue.bind(client) : undefined;
+	return Object.freeze({ db, connect, startSession });
+}
+
+function normalizeMongoClientSession(session: unknown): NormalizedMongoClientSession {
+	if (!session || typeof session !== 'object' || Array.isArray(session)) {
+		throw new ActiveTsConfigurationError('MongoDB client.startSession result must be an object.');
+	}
+	return Object.freeze({
+		raw: session,
+		startTransaction: mongoMethod(session, 'startTransaction', 'MongoDB session.startTransaction'),
+		commitTransaction: mongoMethod(session, 'commitTransaction', 'MongoDB session.commitTransaction'),
+		abortTransaction: mongoMethod(session, 'abortTransaction', 'MongoDB session.abortTransaction'),
+		endSession: mongoMethod(session, 'endSession', 'MongoDB session.endSession')
+	});
 }
 
 function normalizeMongoDb(db: unknown) {
