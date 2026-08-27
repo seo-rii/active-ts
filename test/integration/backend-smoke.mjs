@@ -645,7 +645,7 @@ if (targets.has('datastore')) {
 	try {
 		await assert.rejects(
 			() => nativeKeyAdapter.create(nativeKeyMeta, 0, { id: 0, handle: 'incomplete' }),
-			/must be a positive integer for native Datastore key encoding/
+			/cannot be zero for native Datastore key encoding/
 		);
 		await nativeKeyAdapter.create(nativeKeyMeta, 17, { id: 17, handle: 'numeric' });
 		await nativeKeyAdapter.create(nativeKeyMeta, '17', { id: '17', handle: 'string' });
