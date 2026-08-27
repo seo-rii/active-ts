@@ -176,6 +176,40 @@ the supplied context before resolving routes or mutating an index. Legacy or
 manually produced events without the field remain accepted; producers that know
 their project should always include it.
 
+Search delivery allows five attempts by default. `retryDelayMs` defaults to `0`
+for immediate retries and accepts either a fixed millisecond delay or an async
+`(attempt) => milliseconds` backoff function; `maxAttempts` sets the terminal
+attempt. Failed events carry `deliveryAttempts`, `availableAt`, and
+`lastDeliveryError`. A lease adapter selected by the worker must implement
+`retry(failures)` and durably persist the attempt, retry time, and released lease
+before resolving. The worker validates this capability before calling `lease()`;
+`release()` is not a retry persistence fallback. `retry` remains optional on the
+base `OutboxAdapter` type so existing drain adapters and capability-erased plugin
+references remain source-compatible. At the terminal attempt the worker calls
+its `deadLetter` option, or the adapter's `deadLetter(failures)` method. The
+built-in memory and store adapters implement retry, dead-letter storage, and
+`listDeadLetters()`. An option-level dead-letter callback must commit its sink
+before resolving; the lease worker then acknowledges the source. An adapter-level
+`deadLetter()` owns the durable source-to-DLQ transition itself.
+For malformed events, a failure can omit `event` and expose only the safely
+snapshotted `identity`; custom handlers must support that form.
+
+For lease-based search delivery, the worker durably appends a same-entity
+`reconcileFromStore` repair event before each external index or delete attempt.
+The repair remains if the remote call rejects after a possible write, the lease
+is lost, or acknowledgement is uncertain. If renewal occurs before a failed
+mutation settles, `retry()` receives the latest renewed source snapshot. On
+confirmed success, the worker passes the source event and repair snapshot to one
+`ack()` call. Custom durable `append()` implementations should return the
+persisted event snapshot when they change its version or ordering fields.
+`ack()` may return `false` to report that the batch was not acknowledged; legacy
+`undefined` results remain successful. Lease delivery requires `context` so the
+repair can reconcile from the authoritative store. Concrete lease adapter option
+types enforce that requirement; broad `OutboxAdapter` references are validated
+at runtime for compatibility. Adapters must keep same-entity ordering and make
+`retry()`, `deadLetter()`, and lease release durable so poison events cannot
+indefinitely block unrelated entities.
+
 ## Function Cache
 
 `createFunctionCache()` provides the `Cache<TInput, TValue>` style abstraction:

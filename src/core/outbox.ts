@@ -79,24 +79,52 @@ export type OutboxEvent = {
 	operation: OutboxOperation;
 	data?: any;
 	dataEncoding?: 'public' | 'stored';
+	reconcileFromStore?: boolean;
 	createdAt: string;
 	sequence?: string;
 	version?: number;
 	leaseToken?: string;
 	leaseExpiresAt?: string;
+	deliveryAttempts?: number;
+	availableAt?: string;
+	deadLetteredAt?: string;
+	lastDeliveryError?: string;
+};
+
+export type OutboxEventIdentity = {
+	id?: string;
+	model?: string;
+	modelId?: EntityId;
+	modelIdentity?: string;
+	leaseToken?: string;
+	leaseExpiresAt?: string;
+};
+
+export type OutboxDeliveryFailure = {
+	identity: OutboxEventIdentity;
+	event?: OutboxEvent;
+	attempt: number;
+	maxAttempts: number;
+	failedAt: string;
+	retryAt?: string;
+	error: string;
 };
 
 export type OutboxAdapter = {
 	readonly transactionStore?: string;
 	setup?: (context: ActiveContext) => Promise<void> | void;
-	append: (event: OutboxEvent) => Promise<void>;
-	appendTransactional?: (context: ActiveContext, event: OutboxEvent) => Promise<void>;
+	append: (event: OutboxEvent) => Promise<void | OutboxEvent>;
+	appendTransactional?: (context: ActiveContext, event: OutboxEvent) => Promise<void | OutboxEvent>;
 	list?: () => Promise<OutboxEvent[]>;
+	listDeadLetters?: () => Promise<OutboxEvent[]>;
 	lease?: (options?: OutboxBatchOptions) => Promise<OutboxEvent[]>;
 	supportsExclusiveLease?: () => Promise<boolean> | boolean;
 	isLeaseCurrent?: (event: OutboxEvent) => Promise<boolean>;
+	renewLease?: (event: OutboxEvent) => Promise<OutboxEvent | undefined>;
 	release?: (events: OutboxEvent[]) => Promise<void>;
-	ack?: (events: OutboxEvent[]) => Promise<void>;
+	ack?: (events: OutboxEvent[]) => Promise<void | boolean>;
+	retry?: (failures: OutboxDeliveryFailure[]) => Promise<void>;
+	deadLetter?: (failures: OutboxDeliveryFailure[]) => Promise<void>;
 	drain?: (options?: OutboxBatchOptions) => Promise<OutboxEvent[]>;
 	requeue?: (events: OutboxEvent[]) => Promise<void>;
 };
@@ -111,6 +139,9 @@ const SEARCH_SYNC_WORKER_OPTION_KEYS = [
 	'context',
 	'adapter',
 	'batchSize',
+	'maxAttempts',
+	'retryDelayMs',
+	'deadLetter',
 	'allowUnsafeDrainFallback',
 	'allowUnsafeIdentityOnlyDatastoreDelete'
 ] as const;
@@ -152,14 +183,22 @@ const OUTBOX_EVENT_KEYS = [
 	'operation',
 	'data',
 	'dataEncoding',
+	'reconcileFromStore',
 	'createdAt',
 	'sequence',
 	'version',
 	'leaseToken',
-	'leaseExpiresAt'
+	'leaseExpiresAt',
+	'deliveryAttempts',
+	'availableAt',
+	'deadLetteredAt',
+	'lastDeliveryError'
 ] as const;
 const DEFAULT_STORE_OUTBOX_MODEL_NAME = 'active_ts_outbox_event';
 const STORE_OUTBOX_LEASE_TTL_MS = 5 * 60 * 1000;
+const DEFAULT_SEARCH_SYNC_MAX_ATTEMPTS = 5;
+const DEFAULT_SEARCH_SYNC_RETRY_DELAY_MS = 0;
+const MAX_SEARCH_SYNC_RETRY_DELAY_MS = 60_000;
 const STALE_SEARCH_SYNC_LEASE_RELEASE_ERROR = Symbol('active-ts.outbox.stale-search-sync-lease-release-error');
 let storeOutboxSequence = 0;
 
@@ -167,11 +206,13 @@ class StoreOutboxEventModel {}
 
 export class MemoryOutboxAdapter implements OutboxAdapter {
 	private readonly events: OutboxEvent[] = [];
+	private readonly deadLetters: OutboxEvent[] = [];
 
-	async append(event: OutboxEvent) {
+	async append(event: OutboxEvent): Promise<void | OutboxEvent> {
 		const normalized = sanitizeOutboxEvent(event, { requireModelId: false });
 		this.assertAvailableIds([normalized], 'memory outbox append event');
 		this.events[this.events.length] = normalized;
+		return sanitizeOutboxEvent(normalized, { requireModelId: false });
 	}
 
 	async list() {
@@ -182,14 +223,39 @@ export class MemoryOutboxAdapter implements OutboxAdapter {
 		return list;
 	}
 
+	async listDeadLetters() {
+		const list: OutboxEvent[] = [];
+		for (let index = 0; index < this.deadLetters.length; index++) {
+			list[index] = sanitizeOutboxEvent(this.deadLetters[index], { requireModelId: false });
+		}
+		return list;
+	}
+
 	async drain(options?: OutboxBatchOptions) {
 		const limit = normalizeOutboxBatchLimit(options, 'memory outbox drain options');
-		const count = limit ?? this.events.length;
 		const drained: OutboxEvent[] = [];
-		for (let index = 0; index < count && index < this.events.length; index++) {
-			drained[index] = sanitizeOutboxEvent(this.events[index], { requireModelId: false });
+		const retained: OutboxEvent[] = [];
+		const blockedEntityKeys = new Set<string>();
+		const now = new Date();
+		for (let index = 0; index < this.events.length; index++) {
+			const event = sanitizeOutboxEvent(this.events[index], { requireModelId: false });
+			const checkOrderKeys = outboxEntityOrderCheckKeys(event);
+			const blockOrderKeys = outboxEntityOrderBlockKeys(event);
+			if (
+				(limit !== undefined && drained.length >= limit) ||
+				outboxEntityOrderKeysBlocked(blockedEntityKeys, checkOrderKeys)
+			) {
+				retained[retained.length] = event;
+				continue;
+			}
+			if (!isOutboxDeliveryAvailable(event, now)) {
+				blockOutboxEntityOrderKeys(blockedEntityKeys, blockOrderKeys);
+				retained[retained.length] = event;
+				continue;
+			}
+			drained[drained.length] = event;
 		}
-		removeMemoryOutboxHead(this.events, drained.length);
+		replaceMemoryOutboxEvents(this.events, retained);
 		return drained;
 	}
 
@@ -201,6 +267,30 @@ export class MemoryOutboxAdapter implements OutboxAdapter {
 		}
 		this.assertAvailableIds(normalized, 'memory outbox requeue events');
 		prependMemoryOutboxEvents(this.events, normalized);
+	}
+
+	async retry(failures: OutboxDeliveryFailure[]) {
+		const normalized = sanitizeOutboxDeliveryFailureBatch(failures, 'memory outbox retry failures', true);
+		const events: OutboxEvent[] = [];
+		for (let index = 0; index < normalized.length; index++) {
+			events[index] = outboxRetryEvent(normalized[index]);
+		}
+		this.assertAvailableIds(events, 'memory outbox retry failures');
+		prependMemoryOutboxEvents(this.events, events);
+	}
+
+	async deadLetter(failures: OutboxDeliveryFailure[]) {
+		const normalized = sanitizeOutboxDeliveryFailureBatch(failures, 'memory outbox dead-letter failures', true);
+		const existing = new Set<string>();
+		for (const event of this.deadLetters) SET_ADD.call(existing, event.id);
+		for (let index = 0; index < normalized.length; index++) {
+			const event = outboxDeadLetterEvent(normalized[index]);
+			if (SET_HAS.call(existing, event.id)) {
+				throw new ActiveTsConflictError(`Memory outbox dead-letter event id "${event.id}" already exists.`);
+			}
+			SET_ADD.call(existing, event.id);
+			this.deadLetters[this.deadLetters.length] = event;
+		}
 	}
 
 	private assertAvailableIds(events: readonly OutboxEvent[], context: string) {
@@ -219,14 +309,9 @@ export class MemoryOutboxAdapter implements OutboxAdapter {
 	}
 }
 
-function removeMemoryOutboxHead(events: OutboxEvent[], count: number) {
-	if (count <= 0) return;
-	let write = 0;
-	for (let read = count; read < events.length; read++) {
-		events[write] = events[read];
-		write++;
-	}
-	events.length = write;
+function replaceMemoryOutboxEvents(events: OutboxEvent[], next: readonly OutboxEvent[]) {
+	events.length = 0;
+	for (let index = 0; index < next.length; index++) events[index] = next[index];
 }
 
 function prependMemoryOutboxEvents(events: OutboxEvent[], prefix: readonly OutboxEvent[]) {
@@ -280,11 +365,11 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 		this.context = context;
 	}
 
-	async append(event: OutboxEvent) {
-		await this.appendWithContext(this.activeContext(), event);
+	async append(event: OutboxEvent): Promise<void | OutboxEvent> {
+		return await this.appendWithContext(this.activeContext(), event);
 	}
 
-	async appendTransactional(context: ActiveContext, event: OutboxEvent) {
+	async appendTransactional(context: ActiveContext, event: OutboxEvent): Promise<void | OutboxEvent> {
 		if (!(context instanceof ActiveContext)) {
 			throw new ActiveTsConfigurationError('Store outbox transactional context must be an ActiveContext.');
 		}
@@ -296,11 +381,25 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 			throw new ActiveTsConfigurationError('Store outbox appendTransactional requires an active transaction context.');
 		}
 		this.context ??= root;
-		await this.appendWithContext(context, event);
+		return await this.appendWithContext(context, event);
 	}
 
 	async list() {
-		return await this.listWithContext(this.activeContext());
+		const events = await this.listWithContext(this.activeContext());
+		const pending: OutboxEvent[] = [];
+		for (const event of events) {
+			if (event.deadLetteredAt === undefined) pending[pending.length] = event;
+		}
+		return pending;
+	}
+
+	async listDeadLetters() {
+		const events = await this.listWithContext(this.activeContext());
+		const deadLetters: OutboxEvent[] = [];
+		for (const event of events) {
+			if (event.deadLetteredAt !== undefined) deadLetters[deadLetters.length] = event;
+		}
+		return deadLetters;
 	}
 
 	async lease(options?: OutboxBatchOptions) {
@@ -326,7 +425,12 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 			for (const event of page.events) {
 				const checkOrderKeys = outboxEntityOrderCheckKeys(event);
 				const blockOrderKeys = outboxEntityOrderBlockKeys(event);
+				if (event.deadLetteredAt !== undefined) continue;
 				if (outboxEntityOrderKeysBlocked(blockedEntityKeys, checkOrderKeys)) {
+					blockOutboxEntityOrderKeys(blockedEntityKeys, blockOrderKeys);
+					continue;
+				}
+				if (!isOutboxDeliveryAvailable(event, now)) {
 					blockOutboxEntityOrderKeys(blockedEntityKeys, blockOrderKeys);
 					continue;
 				}
@@ -380,6 +484,48 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 			isOutboxSnapshotCurrent(current, normalized);
 	}
 
+	async renewLease(event: OutboxEvent) {
+		const normalized = sanitizeOutboxEvent(event, { requireModelId: false });
+		if (normalized.leaseToken === undefined) {
+			throw new ActiveTsConfigurationError('Store outbox renewLease requires a leased event.');
+		}
+		const context = this.activeContext();
+		const now = new Date();
+		const expiresAt = dateIsoString(new Date(dateTime(now) + STORE_OUTBOX_LEASE_TTL_MS));
+		const run = async (activeContext: ActiveContext) => {
+			const current = await this.currentOutboxEvent(activeContext, normalized.id);
+			if (
+				!current ||
+				!isOutboxSnapshotCurrent(current, normalized) ||
+				!isOutboxLeaseCurrent(current, normalized.leaseToken!, now)
+			) {
+				return undefined;
+			}
+			const renewed = withOutboxLease(current, normalized.leaseToken!, expiresAt);
+			const store = contextInternalStore(activeContext, this.meta.store);
+			await store.update(
+				this.meta,
+				current.id,
+				renewed,
+				store.capabilities?.optimisticLock === true ? outboxExpectedVersionOption(current) : undefined
+			);
+			return renewed;
+		};
+		const store = contextInternalStore(context, this.meta.store);
+		try {
+			if (store.capabilities?.optimisticLock === true) return await run(context);
+			if (storeSupportsOutboxLeaseTransactions(store)) {
+				return await context.transaction((tx) => run(tx), { store: this.meta.store });
+			}
+			throw new ActiveTsConfigurationError(
+				`Store outbox adapter requires store "${store.kind}" to support optimistic locking or conflict-detecting transactions for lease renewal.`
+			);
+		} catch (error) {
+			if (isStoreOutboxLeaseClaimConflict(store, error)) return undefined;
+			throw error;
+		}
+	}
+
 	async release(events: OutboxEvent[]) {
 		const normalized = sanitizeOutboxEventBatch(events, 'store outbox release events');
 		const context = this.activeContext();
@@ -420,6 +566,74 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 		await run(context, normalized);
 	}
 
+	async retry(failures: OutboxDeliveryFailure[]) {
+		await this.settleDeliveryFailures(failures, 'retry');
+	}
+
+	async deadLetter(failures: OutboxDeliveryFailure[]) {
+		await this.settleDeliveryFailures(failures, 'dead-letter');
+	}
+
+	private async settleDeliveryFailures(
+		failures: OutboxDeliveryFailure[],
+		disposition: 'retry' | 'dead-letter'
+	) {
+		const normalized = sanitizeOutboxDeliveryFailureBatch(
+			failures,
+			`store outbox ${disposition} failures`,
+			true
+		);
+		const run = async (activeContext: ActiveContext, batch: readonly OutboxDeliveryFailure[]) => {
+			const store = contextInternalStore(activeContext, this.meta.store);
+			for (const failure of batch) {
+				const source = failure.event!;
+				const current = await this.currentOutboxEvent(activeContext, source.id);
+				if (!current) {
+					if (source.leaseToken !== undefined) continue;
+					const next = disposition === 'retry'
+						? outboxRetryEvent(failure)
+						: outboxDeadLetterEvent(failure);
+					await store.create(this.meta, next.id, next);
+					continue;
+				}
+				if (!isOutboxSnapshotCurrent(current, source)) continue;
+				if (source.leaseToken !== undefined && current.leaseToken !== source.leaseToken) continue;
+				const currentFailure = { ...failure, event: current };
+				const next = disposition === 'retry'
+					? outboxRetryEvent(currentFailure)
+					: outboxDeadLetterEvent(currentFailure);
+				await store.update(
+					this.meta,
+					current.id,
+					next,
+					store.capabilities?.optimisticLock === true ? outboxExpectedVersionOption(current) : undefined
+				);
+			}
+		};
+		const context = this.activeContext();
+		const store = contextInternalStore(context, this.meta.store);
+		if (store.capabilities?.optimisticLock !== true && storeSupportsOutboxLeaseTransactions(store)) {
+			const errors: unknown[] = [];
+			for (const failure of normalized) {
+				try {
+					await context.transaction((tx) => run(tx, [failure]), { store: this.meta.store });
+				} catch (error) {
+					errors[errors.length] = error;
+				}
+			}
+			if (errors.length === 1) throw errors[0];
+			if (errors.length > 1) {
+				throw new AggregateError(errors, `Store outbox ${disposition} failed.`);
+			}
+			return;
+		}
+		if (storeSupportsOutboxManagementTransactions(store)) {
+			await context.transaction((tx) => run(tx, normalized), { store: this.meta.store });
+			return;
+		}
+		await run(context, normalized);
+	}
+
 	private async claimOutboxLease(
 		context: ActiveContext,
 		event: OutboxEvent,
@@ -429,7 +643,13 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 	) {
 		const run = async (activeContext: ActiveContext) => {
 			const current = await this.currentOutboxEvent(activeContext, event.id);
-			if (!current || !isOutboxSnapshotCurrent(current, event) || isOutboxLeaseActive(current, now)) {
+			if (
+				!current ||
+				current.deadLetteredAt !== undefined ||
+				!isOutboxDeliveryAvailable(current, now) ||
+				!isOutboxSnapshotCurrent(current, event) ||
+				isOutboxLeaseActive(current, now)
+			) {
 				return { current, claimed: undefined };
 			}
 			const claimed = withOutboxLease(current, token, expiresAt);
@@ -462,21 +682,28 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 	async ack(events: OutboxEvent[]) {
 		const normalized = sanitizeOutboxEventBatch(events, 'store outbox ack events');
 		const run = async (context: ActiveContext, recoverDeletes: boolean, batch: readonly OutboxEvent[]) => {
-			const deleted: OutboxEvent[] = [];
+			const currentEvents: OutboxEvent[] = [];
+			const now = new Date();
 			for (const event of batch) {
 				const current = await this.currentOutboxEvent(context, event.id);
-				if (!current) continue;
+				if (!current) return false;
 				if (
 					event.leaseToken !== undefined &&
 					(
-						!isOutboxLeaseCurrent(current, event.leaseToken, new Date()) ||
+						!isOutboxLeaseCurrent(current, event.leaseToken, now) ||
 						!isOutboxSnapshotCurrent(current, event)
 					)
 				) {
-					continue;
+					return false;
 				}
-				if (event.leaseToken === undefined && current.leaseToken !== undefined) continue;
-				if (event.leaseToken === undefined && !isOutboxSnapshotCurrent(current, event)) continue;
+				if (event.leaseToken === undefined && current.leaseToken !== undefined) return false;
+				if (event.leaseToken === undefined && !isOutboxSnapshotCurrent(current, event)) return false;
+				currentEvents[currentEvents.length] = current;
+			}
+			const deleted: OutboxEvent[] = [];
+			for (let index = 0; index < batch.length; index++) {
+				const event = batch[index];
+				const current = currentEvents[index];
 				const currentStore = contextInternalStore(context, this.meta.store);
 				const deleteOptions = currentStore.capabilities?.optimisticLock === true
 					? outboxExpectedVersionOption(current)
@@ -486,7 +713,17 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 					if (recoverDeletes) deleted.push(current);
 				} catch (error) {
 					if (current && (error instanceof ActiveTsConflictError || error instanceof ActiveTsNotFoundError)) {
-						continue;
+						if (recoverDeletes) {
+							const errors = await this.reinsertDeletedEvents(context, deleted);
+							if (errors.length) {
+								throw new AggregateError(
+									[error, ...errors],
+									`Store outbox ack lost ownership and rollback failed: ${safeErrorMessage(error)}`
+								);
+							}
+							return false;
+						}
+						throw error;
 					}
 					if (recoverDeletes) {
 						const errors = await this.reinsertDeletedEvents(context, current ? [...deleted, current] : deleted);
@@ -500,26 +737,38 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 					throw error;
 				}
 			}
+			return true;
 		};
 		const context = this.activeContext();
 		const store = contextInternalStore(context, this.meta.store);
 		if (store.capabilities?.optimisticLock !== true && storeSupportsOutboxLeaseTransactions(store)) {
 			const errors: unknown[] = [];
+			let acknowledged = true;
 			for (const event of normalized) {
 				try {
-					await context.transaction((tx) => run(tx, false, [event]), { store: this.meta.store });
+					if (!(await context.transaction((tx) => run(tx, false, [event]), { store: this.meta.store }))) {
+						acknowledged = false;
+						break;
+					}
 				} catch (error) {
-					errors[errors.length] = error;
+					if (isStoreOutboxLeaseClaimConflict(store, error)) acknowledged = false;
+					else errors[errors.length] = error;
+					break;
 				}
 			}
 			if (errors.length === 1) throw errors[0];
 			if (errors.length > 1) throw new AggregateError(errors, 'Store outbox ack failed.');
-			return;
+			return acknowledged;
 		}
 		if (storeSupportsOutboxManagementTransactions(store)) {
-			return await context.transaction((tx) => run(tx, false, normalized), { store: this.meta.store });
+			try {
+				return await context.transaction((tx) => run(tx, false, normalized), { store: this.meta.store });
+			} catch (error) {
+				if (isStoreOutboxLeaseClaimConflict(store, error)) return false;
+				throw error;
+			}
 		}
-		await run(context, true, normalized);
+		return await run(context, true, normalized);
 	}
 
 	async drain(options?: OutboxBatchOptions) {
@@ -539,7 +788,12 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 				for (const event of page.events) {
 					const checkOrderKeys = outboxEntityOrderCheckKeys(event);
 					const blockOrderKeys = outboxEntityOrderBlockKeys(event);
+					if (event.deadLetteredAt !== undefined) continue;
 					if (outboxEntityOrderKeysBlocked(blockedEntityKeys, checkOrderKeys)) {
+						blockOutboxEntityOrderKeys(blockedEntityKeys, blockOrderKeys);
+						continue;
+					}
+					if (!isOutboxDeliveryAvailable(event, now)) {
 						blockOutboxEntityOrderKeys(blockedEntityKeys, blockOrderKeys);
 						continue;
 					}
@@ -548,7 +802,13 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 						continue;
 					}
 					const current = await this.currentOutboxEvent(context, event.id);
-					if (!current || !isOutboxSnapshotCurrent(current, event) || isOutboxLeaseActive(current, now)) {
+					if (
+						!current ||
+						current.deadLetteredAt !== undefined ||
+						!isOutboxDeliveryAvailable(current, now) ||
+						!isOutboxSnapshotCurrent(current, event) ||
+						isOutboxLeaseActive(current, now)
+					) {
 						blockOutboxEntityOrderKeys(blockedEntityKeys, blockOrderKeys);
 						if (current) blockOutboxEntityOrderKeys(blockedEntityKeys, outboxEntityOrderBlockKeys(current));
 						continue;
@@ -746,7 +1006,12 @@ function createStoreOutboxMeta(store: string, modelName: string): ResolvedModelM
 		fieldCodecs: new Map(),
 		fieldTypes: new Map([
 			['createdAt', 'string'],
-			['sequence', 'string']
+			['sequence', 'string'],
+			['reconcileFromStore', 'boolean'],
+			['deliveryAttempts', 'number'],
+			['availableAt', 'string'],
+			['deadLetteredAt', 'string'],
+			['lastDeliveryError', 'string']
 		])
 	};
 }
@@ -848,6 +1113,10 @@ function isOutboxLeaseCurrent(event: OutboxEvent, leaseToken: string, now: Date)
 	return event.leaseToken === leaseToken && isOutboxLeaseActive(event, now);
 }
 
+function isOutboxDeliveryAvailable(event: OutboxEvent, now: Date) {
+	return event.availableAt === undefined || dateParse(event.availableAt) <= dateTime(now);
+}
+
 function isOutboxSnapshotCurrent(current: OutboxEvent, snapshot: OutboxEvent) {
 	return current.id === snapshot.id &&
 		current.model === snapshot.model &&
@@ -857,9 +1126,14 @@ function isOutboxSnapshotCurrent(current: OutboxEvent, snapshot: OutboxEvent) {
 		current.version === snapshot.version &&
 		current.leaseToken === snapshot.leaseToken &&
 		current.leaseExpiresAt === snapshot.leaseExpiresAt &&
+		current.deliveryAttempts === snapshot.deliveryAttempts &&
+		current.availableAt === snapshot.availableAt &&
+		current.deadLetteredAt === snapshot.deadLetteredAt &&
+		current.lastDeliveryError === snapshot.lastDeliveryError &&
 		current.modelIdentity === snapshot.modelIdentity &&
 		current.modelDatastoreProjectId === snapshot.modelDatastoreProjectId &&
 		current.dataEncoding === snapshot.dataEncoding &&
+		current.reconcileFromStore === snapshot.reconcileFromStore &&
 		outboxDatastoreAncestorMatches(current.modelDatastoreAncestor, snapshot.modelDatastoreAncestor) &&
 		outboxEntityIdMatches(current.modelId, snapshot.modelId) &&
 		isDeepStrictEqual(current.data, snapshot.data);
@@ -874,9 +1148,14 @@ function isOutboxRequeueInsertCurrent(current: OutboxEvent, inserted: OutboxEven
 		current.version === inserted.version &&
 		current.leaseToken === inserted.leaseToken &&
 		current.leaseExpiresAt === inserted.leaseExpiresAt &&
+		current.deliveryAttempts === inserted.deliveryAttempts &&
+		current.availableAt === inserted.availableAt &&
+		current.deadLetteredAt === inserted.deadLetteredAt &&
+		current.lastDeliveryError === inserted.lastDeliveryError &&
 		current.modelIdentity === inserted.modelIdentity &&
 		current.modelDatastoreProjectId === inserted.modelDatastoreProjectId &&
 		current.dataEncoding === inserted.dataEncoding &&
+		current.reconcileFromStore === inserted.reconcileFromStore &&
 		outboxDatastoreAncestorMatches(current.modelDatastoreAncestor, inserted.modelDatastoreAncestor) &&
 		outboxEntityIdMatches(current.modelId, inserted.modelId) &&
 		isDeepStrictEqual(current.data, inserted.data);
@@ -906,6 +1185,119 @@ function outboxEntityOrderKeys(event: OutboxEvent) {
 	if (keys.length) return keys;
 	if (event.modelId === undefined) return [`event:${event.id}`];
 	return [`${event.model}:${entityIdKey(event.modelId)}`];
+}
+
+type OutboxDeliveryIdentitySnapshot = {
+	identity: OutboxEventIdentity;
+	releaseSnapshot?: OutboxEvent;
+	orderCheckKeys: string[];
+	orderBlockKeys: string[];
+	deliveryAttempts: number;
+};
+
+function snapshotOutboxDeliveryIdentity(value: unknown, index: number): OutboxDeliveryIdentitySnapshot {
+	const identity: OutboxEventIdentity = {};
+	const releaseSnapshot = Object.create(null) as Record<string, unknown>;
+	let hasReleaseId = false;
+	let deliveryAttempts = 0;
+	if (value && typeof value === 'object' && !Array.isArray(value)) {
+		const id = outboxOwnDataValue(value, 'id');
+		if (typeof id === 'string' && isSafeOutboxCacheKey(id)) {
+			identity.id = id;
+			releaseSnapshot.id = id;
+			hasReleaseId = true;
+		}
+		const model = outboxOwnDataValue(value, 'model');
+		if (typeof model === 'string' && isSafeOutboxSchemaIdentifier(model)) {
+			identity.model = model;
+			releaseSnapshot.model = model;
+		}
+		const modelId = outboxOwnDataValue(value, 'modelId');
+		if ((typeof modelId === 'string' || typeof modelId === 'number') && isSafeOutboxEntityId(modelId)) {
+			identity.modelId = modelId;
+			releaseSnapshot.modelId = modelId;
+		}
+		const modelIdentity = outboxOwnDataValue(value, 'modelIdentity');
+		if (typeof modelIdentity === 'string' && isSafeOutboxCacheKey(modelIdentity)) {
+			identity.modelIdentity = modelIdentity;
+			releaseSnapshot.modelIdentity = modelIdentity;
+		}
+		const leaseToken = outboxOwnDataValue(value, 'leaseToken');
+		if (typeof leaseToken === 'string' && isSafeOutboxCacheKey(leaseToken)) {
+			identity.leaseToken = leaseToken;
+			releaseSnapshot.leaseToken = leaseToken;
+		}
+		const leaseExpiresAt = outboxOwnDataValue(value, 'leaseExpiresAt');
+		if (typeof leaseExpiresAt === 'string' && isCanonicalOutboxTimestamp(leaseExpiresAt)) {
+			identity.leaseExpiresAt = leaseExpiresAt;
+			releaseSnapshot.leaseExpiresAt = leaseExpiresAt;
+		}
+		const version = outboxOwnDataValue(value, 'version');
+		if (typeof version === 'number' && Number.isSafeInteger(version) && version >= 0) {
+			releaseSnapshot.version = version;
+		}
+		const attempts = outboxOwnDataValue(value, 'deliveryAttempts');
+		if (typeof attempts === 'number' && Number.isSafeInteger(attempts) && attempts >= 0) {
+			deliveryAttempts = attempts;
+			releaseSnapshot.deliveryAttempts = attempts;
+		}
+	}
+	const orderKeys = outboxIdentityOrderKeys(identity, index);
+	return {
+		identity,
+		releaseSnapshot: hasReleaseId ? releaseSnapshot as OutboxEvent : undefined,
+		orderCheckKeys: orderKeys,
+		orderBlockKeys: copyEvents(orderKeys),
+		deliveryAttempts
+	};
+}
+
+function outboxOwnDataValue(value: object, property: string) {
+	const descriptor = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(value, property);
+	return descriptor && 'value' in descriptor && descriptor.enumerable ? descriptor.value : undefined;
+}
+
+function isSafeOutboxCacheKey(value: string) {
+	try {
+		assertSafeCacheKey(value, 'outbox delivery identity');
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function isSafeOutboxSchemaIdentifier(value: string) {
+	try {
+		assertSafeSchemaIdentifier(value, 'outbox delivery identity');
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function isSafeOutboxEntityId(value: string | number): value is EntityId {
+	try {
+		assertSafeEntityId(value, 'outbox delivery identity');
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function isCanonicalOutboxTimestamp(value: string) {
+	const timestamp = dateParse(value);
+	return Number.isFinite(timestamp) && dateIsoString(new Date(timestamp)) === value;
+}
+
+function outboxIdentityOrderKeys(identity: OutboxEventIdentity, index: number) {
+	if (identity.model !== undefined && identity.modelIdentity !== undefined) {
+		return [`${identity.model}:${identity.modelIdentity}`];
+	}
+	if (identity.model !== undefined && identity.modelId !== undefined) {
+		return [`${identity.model}:${entityIdKey(identity.modelId)}`];
+	}
+	if (identity.id !== undefined) return [`event:${identity.id}`];
+	return [`malformed:${index}`];
 }
 
 function outboxEntityOrderCheckKeys(event: OutboxEvent) {
@@ -1034,6 +1426,7 @@ export function createOutboxPlugin(options: OutboxPluginOptions): ActiveTsPlugin
 			operation,
 			data: eventPayload.data,
 			dataEncoding: eventPayload.dataEncoding,
+			reconcileFromStore: true,
 			createdAt: dateIsoString(new Date())
 		}, { requireModelId: false });
 		const activeContext = context as ActiveContext;
@@ -1050,7 +1443,9 @@ export function createOutboxPlugin(options: OutboxPluginOptions): ActiveTsPlugin
 					`Outbox plugin cannot safely defer appends until after a ${unsafeDeferredStore} transaction commit because commit failures can leave the transaction outcome unknown. Use an outbox adapter with appendTransactional(), such as StoreOutboxAdapter, or pass allowUnsafeTransactionDeferredAppend: true to acknowledge missing-event risk.`
 				);
 			}
-			await activeContext.afterCommitInternal(() => options.outbox.append(event));
+				await activeContext.afterCommitInternal(async () => {
+					await options.outbox.append(event);
+				});
 			return;
 		}
 		await options.outbox.append(event);
@@ -1237,18 +1632,33 @@ function validateOutboxPluginOptions(options: OutboxPluginOptions) {
 	};
 }
 
-export type SearchSyncWorkerOptions = {
-	outbox: OutboxAdapter;
+type SearchSyncWorkerSharedOptions = {
 	search: SearchAdapter;
 	models: ModelConstructor[];
-	context?: ActiveContext;
 	adapter?: string;
 	batchSize?: number;
+	maxAttempts?: number;
+	retryDelayMs?: number | ((attempt: number) => number | Promise<number>);
+	deadLetter?: (failures: OutboxDeliveryFailure[]) => Promise<void>;
 	allowUnsafeDrainFallback?: boolean;
 	allowUnsafeIdentityOnlyDatastoreDelete?: boolean;
 };
 
-export async function runSearchSyncWorker(options: SearchSyncWorkerOptions) {
+type SearchSyncWorkerContextOption<TOutbox extends OutboxAdapter> =
+	TOutbox extends { lease: NonNullable<OutboxAdapter['lease']> }
+		? TOutbox extends { supportsExclusiveLease: () => false | Promise<false> }
+			? { context?: ActiveContext }
+			: { context: ActiveContext }
+		: { context?: ActiveContext };
+
+export type SearchSyncWorkerOptions<TOutbox extends OutboxAdapter = OutboxAdapter> =
+	SearchSyncWorkerSharedOptions &
+	{ outbox: TOutbox } &
+	SearchSyncWorkerContextOption<NoInfer<TOutbox>>;
+
+export async function runSearchSyncWorker<TOutbox extends OutboxAdapter = OutboxAdapter>(
+	options: SearchSyncWorkerOptions<TOutbox>
+) {
 	const activeOptions = validateSearchSyncWorkerOptions(options);
 	assertOutsideActiveTransaction('run search sync workers');
 	activeOptions.context?.assertOutsideTransaction('run search sync workers');
@@ -1278,6 +1688,11 @@ export async function runSearchSyncWorker(options: SearchSyncWorkerOptions) {
 			throw new ActiveTsConfigurationError('Outbox adapter does not support lease().');
 		}
 		assertSearchSyncLeaseContract(activeOptions.outbox, 'Outbox search sync outbox');
+		if (!activeOptions.context) {
+			throw new ActiveTsConfigurationError(
+				'Outbox search sync requires a context when using leases so stale external search mutations can be reconciled from the authoritative store.'
+			);
+		}
 		drained = await leaseOutboxEvents(batchOptions);
 	} else {
 		if (leaseFallbackRequiresUnsafeOptIn && activeOptions.allowUnsafeDrainFallback !== true) {
@@ -1348,20 +1763,40 @@ export async function runSearchSyncWorker(options: SearchSyncWorkerOptions) {
 		}
 		events = copyEvents(events, 0, activeOptions.batchSize);
 	}
-	let index = 0;
 	let processed = 0;
-	try {
-		eventLoop: for (; index < events.length; index++) {
-			const event = sanitizeOutboxEvent(events[index], { requireModelId: true });
-			if (!(await ensureSearchSyncLeaseCurrent(activeOptions.outbox, event, usesLease))) continue eventLoop;
+	const failures: unknown[] = [];
+	const deliveryFailures: PendingSearchSyncFailure[] = [];
+	const deferredEvents: PendingSearchSyncDeferredEvent[] = [];
+	const repairCleanupErrors: unknown[] = [];
+	const blockedEntityKeys = new Set<string>();
+	eventLoop: for (let index = 0; index < events.length; index++) {
+		const rawEvent: unknown = events[index];
+		let event: OutboxEvent | undefined;
+		let identitySnapshot = snapshotOutboxDeliveryIdentity(rawEvent, index);
+		let repair: Awaited<ReturnType<typeof enqueueSearchSyncRepair>> | undefined;
+		let preserveRepair = false;
+		if (outboxEntityOrderKeysBlocked(blockedEntityKeys, identitySnapshot.orderCheckKeys)) {
+			deferredEvents[deferredEvents.length] = { index, value: rawEvent, identity: identitySnapshot };
+			continue;
+		}
+		try {
+			event = sanitizeOutboxEvent(rawEvent, { requireModelId: true });
+			events[index] = event;
+			identitySnapshot = snapshotOutboxDeliveryIdentity(event, index);
+			const orderKeys = outboxEntityOrderCheckKeys(event);
+			if (outboxEntityOrderKeysBlocked(blockedEntityKeys, orderKeys)) {
+				deferredEvents[deferredEvents.length] = { index, value: event, identity: identitySnapshot };
+				continue;
+			}
+			if (!(await ensureSearchSyncLeaseCurrent(activeOptions.outbox, event, usesLease))) {
+				blockOutboxEntityOrderKeys(blockedEntityKeys, outboxEntityOrderBlockKeys(event));
+				continue;
+			}
 			const model = MAP_GET.call(modelByName, event.model) as ModelConstructor | undefined;
 			if (!model) {
 				throw new ActiveTsConfigurationError(
 					`Outbox event "${event.id}" references unregistered model "${event.model}".`
 				);
-			}
-			if (event.modelId === undefined) {
-				throw new ActiveTsConfigurationError(`Outbox event "${event.id}" is missing modelId.`);
 			}
 			const meta = activeOptions.context ? activeOptions.context.meta(model) : legacyOutboxMeta(model, event.model);
 			assertOutboxDatastoreProjectId(activeOptions.context, meta, event);
@@ -1372,139 +1807,576 @@ export async function runSearchSyncWorker(options: SearchSyncWorkerOptions) {
 				activeOptions.search,
 				activeOptions.searchSource
 			);
+			const mutation = await resolveSearchSyncMutation(
+				activeOptions.context,
+				model,
+				meta,
+				event,
+				activeOptions.searchSource,
+				activeOptions.allowUnsafeIdentityOnlyDatastoreDelete,
+				event.reconcileFromStore === true
+			);
+			repair = usesLease && searchRoutes.length
+				? await enqueueSearchSyncRepair(activeOptions.outbox, event)
+				: undefined;
 			for (let routeIndex = 0; routeIndex < searchRoutes.length; routeIndex++) {
 				const searchRoute = searchRoutes[routeIndex];
-				const search = searchRoute.adapter;
-				const searchMeta = withDatastoreSearchNamespace(
-					withSearchIndexesForAdapter(
-						meta,
-						searchRoute.name,
-						searchRoute.indexKind
-					),
-					datastoreNamespaceForContext(activeOptions.context, meta)
+				const searchEventMeta = searchSyncEventMeta(activeOptions.context, meta, searchRoute, mutation.identity);
+				const hookOperation = mutation.operation === 'index' ? 'index' : 'index-delete';
+				const hookData = mutation.operation === 'index' ? mutation.data : undefined;
+				if (!(await ensureSearchSyncLeaseCurrent(activeOptions.outbox, event, usesLease))) {
+					blockOutboxEntityOrderKeys(blockedEntityKeys, outboxEntityOrderBlockKeys(event));
+					continue eventLoop;
+				}
+				await runSearchIndexHook(activeOptions.context, 'beforeIndex', searchEventMeta, event.modelId!, hookData, hookOperation);
+				if (!(await ensureSearchSyncLeaseCurrent(activeOptions.outbox, event, usesLease))) {
+					blockOutboxEntityOrderKeys(blockedEntityKeys, outboxEntityOrderBlockKeys(event));
+					continue eventLoop;
+				}
+				// Once a remote mutation starts, a rejection cannot prove that it had no side effect.
+				preserveRepair = true;
+				const mutationResult = await runSearchSyncMutationWithLease(
+					activeOptions.outbox,
+					event,
+					usesLease,
+					() => executeSearchSyncMutation(searchRoute.adapter, searchEventMeta, event!, mutation)
 				);
-				if (event.operation === 'delete') {
-					let data = event.data;
-					if (data !== undefined) {
-						if (event.dataEncoding === 'stored') {
-							if (!activeOptions.context) {
-								throw new ActiveTsConfigurationError(
-									`Outbox event "${event.id}" stores encoded data and requires a context for search indexing.`
-								);
-							}
-							data = activeOptions.context.validateRead(meta, data);
-						} else if (activeOptions.context) {
-							data = activeOptions.context.validateDecodedRead(meta, data);
-						}
-						data = normalizeSearchIndexEventData(event, meta, data);
-					}
-					const searchEventMeta = withSearchDocumentIdentity(
-						searchMeta,
-						outboxEventSearchDocumentIdentity(
-							event,
-							meta,
-							data,
-							datastoreNamespaceForContext(activeOptions.context, meta),
-							{
-								allowUnsafeIdentityOnlyDatastoreDelete: activeOptions.allowUnsafeIdentityOnlyDatastoreDelete
-							}
-						)
+				event = mutationResult.event;
+				events[index] = event;
+				if (mutationResult.mutationFailed) throw mutationResult.mutationError;
+				if (!mutationResult.current) {
+					preserveRepair = true;
+					await reconcileStaleSearchSyncMutation(
+						activeOptions.context!,
+						model,
+						meta,
+						repair!.event,
+						searchRoute,
+						activeOptions.searchSource,
+						activeOptions.allowUnsafeIdentityOnlyDatastoreDelete
 					);
-					if (!(await ensureSearchSyncLeaseCurrent(activeOptions.outbox, event, usesLease))) continue eventLoop;
-					await runSearchIndexHook(activeOptions.context, 'beforeIndex', searchEventMeta, event.modelId, undefined, 'index-delete');
-					if (!(await ensureSearchSyncLeaseCurrent(activeOptions.outbox, event, usesLease))) continue eventLoop;
-					await search.delete(searchEventMeta, event.modelId);
-					if (!(await ensureSearchSyncLeaseCurrent(activeOptions.outbox, event, usesLease))) continue eventLoop;
-					await runSearchIndexHook(activeOptions.context, 'afterIndex', searchEventMeta, event.modelId, undefined, 'index-delete');
-					if (!(await ensureSearchSyncLeaseCurrent(activeOptions.outbox, event, usesLease))) continue eventLoop;
-				} else {
-					let data = event.data;
-					let searchEventMeta = searchMeta;
-					if (data === undefined && activeOptions.context) {
-						const raw = await loadSearchSyncEventData(activeOptions.context, meta, event);
-						const loaded = activeOptions.context.instantiate(model, raw);
-						data = (loaded as any)?.data;
-						if (data === undefined) {
-							searchEventMeta = withSearchDocumentIdentity(
-								searchMeta,
-								outboxEventSearchDocumentIdentity(
-									event,
-									meta,
-									undefined,
-									datastoreNamespaceForContext(activeOptions.context, meta),
-									{
-										allowUnsafeIdentityOnlyDatastoreDelete: activeOptions.allowUnsafeIdentityOnlyDatastoreDelete
-									}
-								)
-							);
-							if (!(await ensureSearchSyncLeaseCurrent(activeOptions.outbox, event, usesLease))) continue eventLoop;
-							await runSearchIndexHook(activeOptions.context, 'beforeIndex', searchEventMeta, event.modelId, undefined, 'index-delete');
-							if (!(await ensureSearchSyncLeaseCurrent(activeOptions.outbox, event, usesLease))) continue eventLoop;
-							await search.delete(searchEventMeta, event.modelId);
-							if (!(await ensureSearchSyncLeaseCurrent(activeOptions.outbox, event, usesLease))) continue eventLoop;
-							await runSearchIndexHook(activeOptions.context, 'afterIndex', searchEventMeta, event.modelId, undefined, 'index-delete');
-							if (!(await ensureSearchSyncLeaseCurrent(activeOptions.outbox, event, usesLease))) continue eventLoop;
-							continue;
-						}
-					}
-					if (data === undefined) {
-						throw new ActiveTsConfigurationError(`Outbox event "${event.id}" is missing data for search indexing.`);
-					}
-					if (!activeOptions.context && searchAdapterUsesProjection(activeOptions.searchSource)) {
-						throw new ActiveTsConfigurationError(
-							`Outbox event "${event.id}" requires a context for search indexing with a projecting search adapter.`
-						);
-					}
-					if (event.dataEncoding === 'stored') {
-						if (!activeOptions.context) {
-							throw new ActiveTsConfigurationError(
-								`Outbox event "${event.id}" stores encoded data and requires a context for search indexing.`
-							);
-						}
-						data = activeOptions.context.validateRead(meta, data);
-					} else if (activeOptions.context) {
-						data = activeOptions.context.validateDecodedRead(meta, data);
-					}
-					data = normalizeSearchIndexEventData(event, meta, data, { requireDatastoreAncestorFields: true });
-					searchEventMeta = withSearchDocumentIdentity(
-						searchMeta,
-						outboxEventSearchDocumentIdentity(
-							event,
-							meta,
-							data,
-							datastoreNamespaceForContext(activeOptions.context, meta),
-							{
-								allowUnsafeIdentityOnlyDatastoreDelete: activeOptions.allowUnsafeIdentityOnlyDatastoreDelete
-							}
-						)
-					);
-					const adapterData = cloneSafeDataObjectWithoutActiveEntityKey(data, `Outbox event "${event.id}" search index data`);
-					if (!(await ensureSearchSyncLeaseCurrent(activeOptions.outbox, event, usesLease))) continue eventLoop;
-					await runSearchIndexHook(activeOptions.context, 'beforeIndex', searchEventMeta, event.modelId, adapterData, 'index');
-					if (!(await ensureSearchSyncLeaseCurrent(activeOptions.outbox, event, usesLease))) continue eventLoop;
-					await search.index(searchEventMeta, event.modelId, adapterData);
-					if (!(await ensureSearchSyncLeaseCurrent(activeOptions.outbox, event, usesLease))) continue eventLoop;
-					await runSearchIndexHook(activeOptions.context, 'afterIndex', searchEventMeta, event.modelId, adapterData, 'index');
-					if (!(await ensureSearchSyncLeaseCurrent(activeOptions.outbox, event, usesLease))) continue eventLoop;
+					blockOutboxEntityOrderKeys(blockedEntityKeys, outboxEntityOrderBlockKeys(event));
+					if (mutationResult.renewalError !== undefined) throw mutationResult.renewalError;
+					continue eventLoop;
+				}
+				await runSearchIndexHook(activeOptions.context, 'afterIndex', searchEventMeta, event.modelId!, hookData, hookOperation);
+				if (!(await ensureSearchSyncLeaseCurrent(activeOptions.outbox, event, usesLease))) {
+					blockOutboxEntityOrderKeys(blockedEntityKeys, outboxEntityOrderBlockKeys(event));
+					continue eventLoop;
 				}
 			}
-			if (usesLease) await ackOutboxEvents(activeOptions.outbox, [event]);
+			if (usesLease) {
+				const ackEvents = repair?.ackSnapshot ? [event, repair.ackSnapshot] : [event];
+				let acknowledged: boolean;
+				try {
+					acknowledged = await ackOutboxEvents(activeOptions.outbox, ackEvents);
+				} catch (error) {
+					preserveRepair = true;
+					throw error;
+				}
+				if (!acknowledged) {
+					preserveRepair = true;
+					blockOutboxEntityOrderKeys(blockedEntityKeys, outboxEntityOrderBlockKeys(event));
+					continue;
+				}
+			}
 			processed++;
-		}
-	} catch (error) {
-		const remaining = copyEvents(events, isStaleSearchSyncLeaseReleaseError(error) ? index + 1 : index);
-		const retryErrors = usesLease
-			? await releaseOutboxEvents(activeOptions.outbox, remaining)
-			: await requeueOutboxEvents(activeOptions.outbox, remaining);
-		if (retryErrors.length) {
-			throw new AggregateError(
-				[error, ...retryErrors],
-				`Outbox search sync failed and ${usesLease ? 'release' : 'requeue'} failed: ${safeErrorMessage(error)}`
+		} catch (error) {
+			if (repair?.ackSnapshot && !preserveRepair) {
+				try {
+					if (!(await ackOutboxEvents(activeOptions.outbox, [repair.ackSnapshot]))) {
+						repairCleanupErrors[repairCleanupErrors.length] = new ActiveTsConflictError(
+							`Outbox event "${event?.id ?? identitySnapshot.identity.id ?? '<unknown>'}" repair guard was no longer current.`
+						);
+					}
+				} catch (cleanupError) {
+					repairCleanupErrors[repairCleanupErrors.length] = cleanupError;
+				}
+			}
+			failures.push(error);
+			blockOutboxEntityOrderKeys(
+				blockedEntityKeys,
+				event ? outboxEntityOrderBlockKeys(event) : identitySnapshot.orderBlockKeys
 			);
+			if (!isStaleSearchSyncLeaseReleaseError(error)) {
+				deliveryFailures[deliveryFailures.length] = {
+					index,
+					value: rawEvent,
+					event,
+					identity: identitySnapshot,
+					error
+				};
+			}
 		}
-		throw error;
+	}
+	const retryErrors = await settleSearchSyncFailures(
+		activeOptions,
+		deliveryFailures,
+		deferredEvents,
+		usesLease
+	);
+	retryErrors.push(...repairCleanupErrors);
+	if (retryErrors.length) {
+		const primary = failures[0] ?? retryErrors[0];
+		throw new AggregateError(
+			[...failures, ...retryErrors],
+			`Outbox search sync failed and ${usesLease ? 'release' : 'requeue'} failed: ${safeErrorMessage(primary)}`
+		);
+	}
+	if (failures.length === 1) throw failures[0];
+	if (failures.length > 1) {
+		throw new AggregateError(
+			failures,
+			`Outbox search sync failed for ${failures.length} isolated events: ${safeErrorMessage(failures[0])}`
+		);
 	}
 	return processed;
+}
+
+type PendingSearchSyncDeferredEvent = {
+	index: number;
+	value: unknown;
+	identity: OutboxDeliveryIdentitySnapshot;
+};
+
+type PendingSearchSyncFailure = PendingSearchSyncDeferredEvent & {
+	event?: OutboxEvent;
+	error: unknown;
+};
+
+async function settleSearchSyncFailures(
+	options: ReturnType<typeof validateSearchSyncWorkerOptions>,
+	pendingFailures: PendingSearchSyncFailure[],
+	deferredEvents: PendingSearchSyncDeferredEvent[],
+	usesLease: boolean
+) {
+	const recoveryErrors: unknown[] = [];
+	const retryFailures: Array<{ pending: PendingSearchSyncFailure; failure: OutboxDeliveryFailure }> = [];
+	const deadLetterFailures: Array<{ pending: PendingSearchSyncFailure; failure: OutboxDeliveryFailure }> = [];
+	const recoverSources: PendingSearchSyncDeferredEvent[] = [];
+	for (const pending of pendingFailures) {
+		try {
+			const failure = await createSearchSyncDeliveryFailure(options, pending);
+			if (failure.attempt >= failure.maxAttempts) {
+				deadLetterFailures[deadLetterFailures.length] = { pending, failure };
+			} else {
+				retryFailures[retryFailures.length] = { pending, failure };
+			}
+		} catch (error) {
+			recoveryErrors[recoveryErrors.length] = error;
+			recoverSources[recoverSources.length] = pending;
+		}
+	}
+
+	if (deadLetterFailures.length) {
+		const failures: OutboxDeliveryFailure[] = [];
+		for (const entry of deadLetterFailures) failures[failures.length] = entry.failure;
+		const handler = options.deadLetter ?? options.outbox.deadLetter;
+		if (!handler) {
+			recoveryErrors[recoveryErrors.length] = new ActiveTsConfigurationError(
+				'Outbox search sync reached maxAttempts but no deadLetter handler is configured.'
+			);
+			for (const entry of deadLetterFailures) recoverSources[recoverSources.length] = entry.pending;
+		} else {
+			try {
+				await handler(failures);
+				if (options.deadLetter && usesLease) {
+					const sourceEvents: unknown[] = [];
+					for (const entry of deadLetterFailures) {
+						sourceEvents[sourceEvents.length] = entry.pending.event ?? entry.pending.value;
+					}
+					const acknowledged = await ackOutboxSnapshots(
+						options.outbox,
+						sourceEvents
+					);
+					if (!acknowledged) {
+						recoveryErrors[recoveryErrors.length] = new ActiveTsConflictError(
+							'Outbox search sync dead-letter sink completed, but the source lease was no longer current.'
+						);
+					}
+				}
+			} catch (error) {
+				recoveryErrors[recoveryErrors.length] = error;
+				for (const entry of deadLetterFailures) recoverSources[recoverSources.length] = entry.pending;
+			}
+		}
+	}
+
+	if (retryFailures.length) {
+		if (usesLease) {
+			try {
+				const failures: OutboxDeliveryFailure[] = [];
+				for (const entry of retryFailures) failures[failures.length] = entry.failure;
+				await options.outbox.retry!(failures);
+			} catch (error) {
+				recoveryErrors[recoveryErrors.length] = error;
+				for (const entry of retryFailures) recoverSources[recoverSources.length] = entry.pending;
+			}
+		} else {
+			for (const entry of retryFailures) {
+				if (entry.failure.event) {
+					recoverSources[recoverSources.length] = {
+						...entry.pending,
+						value: outboxRetryEvent(entry.failure)
+					};
+				} else if (options.outbox.retry) {
+					try {
+						await options.outbox.retry([entry.failure]);
+					} catch (error) {
+						recoveryErrors[recoveryErrors.length] = error;
+						recoverSources[recoverSources.length] = entry.pending;
+					}
+				} else {
+					recoverSources[recoverSources.length] = entry.pending;
+				}
+			}
+		}
+	}
+
+	for (const event of deferredEvents) recoverSources[recoverSources.length] = event;
+	const orderedRecoveries = orderPendingOutboxRecoveries(recoverSources);
+	if (orderedRecoveries.length) {
+		const values: unknown[] = [];
+		for (const entry of orderedRecoveries) values[values.length] = entry.value;
+		recoveryErrors.push(...(usesLease
+			? await releaseOutboxEvents(options.outbox, values)
+			: await requeueOutboxEvents(options.outbox, values)));
+	}
+	return recoveryErrors;
+}
+
+async function createSearchSyncDeliveryFailure(
+	options: ReturnType<typeof validateSearchSyncWorkerOptions>,
+	pending: PendingSearchSyncFailure
+) {
+	const previousAttempts = pending.event?.deliveryAttempts ?? pending.identity.deliveryAttempts;
+	const attempt = Math.min(options.maxAttempts, previousAttempts + 1);
+	const failedAt = dateIsoString(new Date());
+	let retryAt: string | undefined;
+	if (attempt < options.maxAttempts) {
+		const delay = await searchSyncRetryDelay(options.retryDelayMs, attempt);
+		retryAt = dateIsoString(new Date(Date.now() + delay));
+	}
+	return sanitizeOutboxDeliveryFailure(
+		{
+			identity: pending.identity.identity,
+			event: pending.event,
+			attempt,
+			maxAttempts: options.maxAttempts,
+			failedAt,
+			retryAt,
+			error: outboxDeliveryErrorMessage(pending.error)
+		},
+		'Outbox search sync delivery failure',
+		false
+	);
+}
+
+async function searchSyncRetryDelay(
+	configured: SearchSyncWorkerOptions['retryDelayMs'],
+	attempt: number
+) {
+	let delay: unknown;
+	if (typeof configured === 'function') delay = await configured(attempt);
+	else if (configured !== undefined) delay = configured;
+	else {
+		const exponent = Math.min(attempt - 1, 16);
+		delay = Math.min(MAX_SEARCH_SYNC_RETRY_DELAY_MS, DEFAULT_SEARCH_SYNC_RETRY_DELAY_MS * (2 ** exponent));
+	}
+	return assertNonNegativeSafeInteger(delay, 'Outbox search sync retry delay');
+}
+
+function outboxDeliveryErrorMessage(error: unknown) {
+	let message = safeErrorMessage(error).replaceAll('\0', '\\0');
+	if (!message) message = '<empty error message>';
+	while (Buffer.byteLength(message, 'utf8') > 4_096) {
+		message = message.slice(0, Math.max(1, Math.floor(message.length * 0.75)));
+	}
+	return message;
+}
+
+function orderPendingOutboxRecoveries(events: PendingSearchSyncDeferredEvent[]) {
+	const ordered: PendingSearchSyncDeferredEvent[] = [];
+	for (const event of events) {
+		let insertAt = ordered.length;
+		while (insertAt > 0 && ordered[insertAt - 1].index > event.index) insertAt--;
+		for (let index = ordered.length; index > insertAt; index--) ordered[index] = ordered[index - 1];
+		ordered[insertAt] = event;
+	}
+	return ordered;
+}
+
+type SearchSyncAdapterRoute = {
+	name: string;
+	indexKind: string;
+	adapter: SearchAdapter;
+};
+
+type SearchSyncMutation =
+	| { operation: 'index'; identity: string | undefined; data: Record<string, any> }
+	| { operation: 'delete'; identity: string | undefined };
+
+async function resolveSearchSyncMutation(
+	context: ActiveContext | undefined,
+	model: ModelConstructor,
+	meta: ResolvedModelMeta,
+	event: OutboxEvent,
+	searchSource: SearchAdapter,
+	allowUnsafeIdentityOnlyDatastoreDelete: boolean | undefined,
+	reconcileFromStore: boolean
+): Promise<SearchSyncMutation> {
+	let data = event.data;
+	let loadedFromStore = false;
+	if (context && (reconcileFromStore || (event.operation !== 'delete' && data === undefined))) {
+		const raw = await loadSearchSyncEventData(context, meta, event);
+		const loaded = context.instantiate(model, raw);
+		data = (loaded as any)?.data;
+		loadedFromStore = true;
+	}
+	if (data === undefined) {
+		if (!context && event.operation !== 'delete') {
+			throw new ActiveTsConfigurationError(`Outbox event "${event.id}" is missing data for search indexing.`);
+		}
+		return {
+			operation: 'delete',
+			identity: outboxEventSearchDocumentIdentity(
+				event,
+				meta,
+				undefined,
+				datastoreNamespaceForContext(context, meta),
+				{ allowUnsafeIdentityOnlyDatastoreDelete }
+			)
+		};
+	}
+	if (!loadedFromStore && event.operation === 'delete') {
+		if (event.dataEncoding === 'stored') {
+			if (!context) {
+				throw new ActiveTsConfigurationError(
+					`Outbox event "${event.id}" stores encoded data and requires a context for search indexing.`
+				);
+			}
+			data = context.validateRead(meta, data);
+		} else if (context) {
+			data = context.validateDecodedRead(meta, data);
+		}
+		data = normalizeSearchIndexEventData(event, meta, data);
+		return {
+			operation: 'delete',
+			identity: outboxEventSearchDocumentIdentity(
+				event,
+				meta,
+				data,
+				datastoreNamespaceForContext(context, meta),
+				{ allowUnsafeIdentityOnlyDatastoreDelete }
+			)
+		};
+	}
+	if (!context && searchAdapterUsesProjection(searchSource)) {
+		throw new ActiveTsConfigurationError(
+			`Outbox event "${event.id}" requires a context for search indexing with a projecting search adapter.`
+		);
+	}
+	if (context && (loadedFromStore || event.dataEncoding !== 'stored')) {
+		data = context.validateDecodedRead(meta, data);
+	} else if (context) {
+		data = context.validateRead(meta, data);
+	} else if (event.dataEncoding === 'stored') {
+		throw new ActiveTsConfigurationError(
+			`Outbox event "${event.id}" stores encoded data and requires a context for search indexing.`
+		);
+	}
+	data = normalizeSearchIndexEventData(event, meta, data, { requireDatastoreAncestorFields: true });
+	return {
+		operation: 'index',
+		identity: outboxEventSearchDocumentIdentity(
+			event,
+			meta,
+			data,
+			datastoreNamespaceForContext(context, meta),
+			{ allowUnsafeIdentityOnlyDatastoreDelete }
+		),
+		data: cloneSafeDataObjectWithoutActiveEntityKey(data, `Outbox event "${event.id}" search index data`)
+	};
+}
+
+function searchSyncEventMeta(
+	context: ActiveContext | undefined,
+	meta: ResolvedModelMeta,
+	route: SearchSyncAdapterRoute,
+	identity: string | undefined
+) {
+	return withSearchDocumentIdentity(
+		withDatastoreSearchNamespace(
+			withSearchIndexesForAdapter(meta, route.name, route.indexKind),
+			datastoreNamespaceForContext(context, meta)
+		),
+		identity
+	);
+}
+
+async function executeSearchSyncMutation(
+	search: SearchAdapter,
+	meta: ResolvedModelMeta,
+	event: OutboxEvent,
+	mutation: SearchSyncMutation
+) {
+	if (mutation.operation === 'delete') {
+		await search.delete(meta, event.modelId!);
+		return;
+	}
+	await search.index(meta, event.modelId!, mutation.data);
+}
+
+async function enqueueSearchSyncRepair(outbox: OutboxAdapter, event: OutboxEvent) {
+	const repairEvent = sanitizeOutboxEvent({
+		id: randomUUID(),
+		model: event.model,
+		modelId: event.modelId,
+		modelIdentity: event.modelIdentity,
+		modelDatastoreAncestor: event.modelDatastoreAncestor,
+		modelDatastoreProjectId: event.modelDatastoreProjectId,
+		operation: 'update',
+		reconcileFromStore: true,
+		createdAt: event.createdAt,
+		sequence: nextStoreOutboxSequence(),
+		version: 0
+	}, { requireModelId: true });
+	const appended = await outbox.append(repairEvent);
+	const ackSnapshot = appended === undefined
+		? repairEvent
+		: sanitizeOutboxEvent(appended, { requireModelId: true });
+	if (
+		ackSnapshot.id !== repairEvent.id ||
+		ackSnapshot.model !== repairEvent.model ||
+		!outboxEntityIdMatches(ackSnapshot.modelId, repairEvent.modelId) ||
+		ackSnapshot.reconcileFromStore !== true ||
+		ackSnapshot.deadLetteredAt !== undefined ||
+		ackSnapshot.leaseToken !== undefined
+	) {
+		throw new ActiveTsConfigurationError(
+			`Outbox adapter append returned an invalid search repair snapshot for event "${event.id}".`
+		);
+	}
+	return { event: repairEvent, ackSnapshot };
+}
+
+async function reconcileStaleSearchSyncMutation(
+	context: ActiveContext,
+	model: ModelConstructor,
+	meta: ResolvedModelMeta,
+	event: OutboxEvent,
+	route: SearchSyncAdapterRoute,
+	searchSource: SearchAdapter,
+	allowUnsafeIdentityOnlyDatastoreDelete: boolean | undefined
+) {
+	const mutation = await resolveSearchSyncMutation(
+		context,
+		model,
+		meta,
+		event,
+		searchSource,
+		allowUnsafeIdentityOnlyDatastoreDelete,
+		true
+	);
+	const repairMeta = searchSyncEventMeta(context, meta, route, mutation.identity);
+	await executeSearchSyncMutation(route.adapter, repairMeta, event, mutation);
+}
+
+async function runSearchSyncMutationWithLease(
+	outbox: OutboxAdapter,
+	event: OutboxEvent,
+	usesLease: boolean,
+	mutation: () => Promise<void>
+) {
+	if (!usesLease) {
+		await mutation();
+		return { event, current: true, renewalError: undefined as unknown, mutationFailed: false as const };
+	}
+	let activeEvent = event;
+	let renewalError: unknown;
+	let renewalLost = false;
+	let mutationError: unknown;
+	let mutationFailed = false;
+	let renewalChain = Promise.resolve();
+	let timer: NodeJS.Timeout | undefined;
+	if (outbox.renewLease) {
+		const interval = searchSyncLeaseRenewalInterval(event);
+		timer = setInterval(() => {
+			renewalChain = renewalChain.then(async () => {
+				if (renewalError !== undefined || renewalLost) return;
+				try {
+					const renewed = await outbox.renewLease!(activeEvent);
+					if (renewed === undefined) {
+						renewalLost = true;
+						return;
+					}
+					const normalized = sanitizeOutboxEvent(renewed, { requireModelId: true });
+					assertOutboxLeaseRenewal(activeEvent, normalized);
+					activeEvent = normalized;
+				} catch (error) {
+					renewalError = error;
+				}
+			});
+		}, interval);
+		timer.unref();
+	}
+	try {
+		await mutation();
+	} catch (error) {
+		mutationFailed = true;
+		mutationError = error;
+	} finally {
+		if (timer !== undefined) clearInterval(timer);
+		await renewalChain;
+	}
+	if (mutationFailed) {
+		return {
+			event: activeEvent,
+			current: false,
+			renewalError,
+			mutationFailed: true as const,
+			mutationError
+		};
+	}
+	if (renewalError !== undefined || renewalLost) {
+		return {
+			event: activeEvent,
+			current: false,
+			renewalError: renewalError ?? new ActiveTsConflictError(
+				`Outbox event "${event.id}" lost its lease during search mutation renewal.`
+			),
+			mutationFailed: false as const
+		};
+	}
+	return {
+		event: activeEvent,
+		current: await ensureSearchSyncLeaseCurrent(outbox, activeEvent, true),
+		renewalError: undefined as unknown,
+		mutationFailed: false as const
+	};
+}
+
+function searchSyncLeaseRenewalInterval(event: OutboxEvent) {
+	if (event.leaseExpiresAt === undefined) return 30_000;
+	const remaining = dateParse(event.leaseExpiresAt) - Date.now();
+	return Math.max(1, Math.min(30_000, Math.floor(remaining / 3)));
+}
+
+function assertOutboxLeaseRenewal(previous: OutboxEvent, renewed: OutboxEvent) {
+	const comparable = {
+		...renewed,
+		version: previous.version,
+		leaseExpiresAt: previous.leaseExpiresAt
+	};
+	if (
+		!isOutboxSnapshotCurrent(comparable, previous) ||
+		outboxEventVersion(renewed) <= outboxEventVersion(previous) ||
+		dateParse(renewed.leaseExpiresAt!) <= dateParse(previous.leaseExpiresAt!)
+	) {
+		throw new ActiveTsConfigurationError(
+			`Outbox adapter renewLease returned an invalid renewal for event "${previous.id}".`
+		);
+	}
 }
 
 function copyEvents<T>(events: readonly T[], start = 0, end = events.length) {
@@ -2115,6 +2987,7 @@ function assertProvidedSearchAdapterMatchesRoute(route: string, search: SearchAd
 function validateSearchSyncWorkerOptions(options: SearchSyncWorkerOptions): SearchSyncWorkerOptions & {
 	outbox: OutboxAdapter;
 	searchSource: SearchAdapter;
+	maxAttempts: number;
 } {
 	if (!options || typeof options !== 'object' || Array.isArray(options)) {
 		throw new ActiveTsConfigurationError('Outbox search sync options must be an object.');
@@ -2129,6 +3002,9 @@ function validateSearchSyncWorkerOptions(options: SearchSyncWorkerOptions): Sear
 	const context = ownOptionValue(record, 'context', 'Outbox search sync options') as ActiveContext | undefined;
 	const adapter = ownOptionValue(record, 'adapter', 'Outbox search sync options');
 	const batchSize = ownOptionValue(record, 'batchSize', 'Outbox search sync options');
+	const maxAttempts = ownOptionValue(record, 'maxAttempts', 'Outbox search sync options');
+	const retryDelayMs = ownOptionValue(record, 'retryDelayMs', 'Outbox search sync options');
+	const deadLetter = ownOptionValue(record, 'deadLetter', 'Outbox search sync options');
 	const allowUnsafeDrainFallback = ownOptionValue(
 		record,
 		'allowUnsafeDrainFallback',
@@ -2160,6 +3036,15 @@ function validateSearchSyncWorkerOptions(options: SearchSyncWorkerOptions): Sear
 	const safeBatchSize = batchSize === undefined
 		? undefined
 		: assertPositiveSafeInteger(batchSize, 'Outbox search sync batchSize');
+	const safeMaxAttempts = maxAttempts === undefined
+		? DEFAULT_SEARCH_SYNC_MAX_ATTEMPTS
+		: assertPositiveSafeInteger(maxAttempts, 'Outbox search sync maxAttempts');
+	if (typeof retryDelayMs !== 'function' && retryDelayMs !== undefined) {
+		assertNonNegativeSafeInteger(retryDelayMs, 'Outbox search sync retryDelayMs');
+	}
+	if (deadLetter !== undefined && typeof deadLetter !== 'function') {
+		throw new ActiveTsConfigurationError('Outbox search sync deadLetter must be a function.');
+	}
 	if (allowUnsafeDrainFallback !== undefined && typeof allowUnsafeDrainFallback !== 'boolean') {
 		throw new ActiveTsConfigurationError('Outbox search sync allowUnsafeDrainFallback must be a boolean.');
 	}
@@ -2179,11 +3064,15 @@ function validateSearchSyncWorkerOptions(options: SearchSyncWorkerOptions): Sear
 		context,
 		adapter: safeAdapter,
 		batchSize: safeBatchSize,
+		maxAttempts: safeMaxAttempts,
+		retryDelayMs: retryDelayMs as SearchSyncWorkerOptions['retryDelayMs'],
+		deadLetter: deadLetter as SearchSyncWorkerOptions['deadLetter'],
 		allowUnsafeDrainFallback: allowUnsafeDrainFallback as boolean | undefined,
 		allowUnsafeIdentityOnlyDatastoreDelete: allowUnsafeIdentityOnlyDatastoreDelete as boolean | undefined
 	} as SearchSyncWorkerOptions & {
 		outbox: OutboxAdapter;
 		searchSource: SearchAdapter;
+		maxAttempts: number;
 	};
 }
 
@@ -2256,10 +3145,15 @@ function sanitizeOutboxEvent(event: unknown, options: { requireModelId: boolean 
 	const modelDatastoreProjectId = ownOptionValue(record, 'modelDatastoreProjectId', 'Outbox event');
 	const data = ownOptionValue(record, 'data', 'Outbox event');
 	const dataEncoding = ownOptionValue(record, 'dataEncoding', 'Outbox event');
+	const reconcileFromStore = ownOptionValue(record, 'reconcileFromStore', 'Outbox event');
 	const sequence = ownOptionValue(record, 'sequence', 'Outbox event');
 	const version = ownOptionValue(record, 'version', 'Outbox event');
 	const leaseToken = ownOptionValue(record, 'leaseToken', 'Outbox event');
 	const leaseExpiresAt = ownOptionValue(record, 'leaseExpiresAt', 'Outbox event');
+	const deliveryAttempts = ownOptionValue(record, 'deliveryAttempts', 'Outbox event');
+	const availableAt = ownOptionValue(record, 'availableAt', 'Outbox event');
+	const deadLetteredAt = ownOptionValue(record, 'deadLetteredAt', 'Outbox event');
+	const lastDeliveryError = ownOptionValue(record, 'lastDeliveryError', 'Outbox event');
 	if (operation !== 'create' && operation !== 'update' && operation !== 'delete') {
 		throw new ActiveTsConfigurationError(
 			typeof operation === 'string'
@@ -2290,11 +3184,22 @@ function sanitizeOutboxEvent(event: unknown, options: { requireModelId: boolean 
 	if (data === undefined && dataEncoding !== undefined) {
 		throw new ActiveTsConfigurationError(`Outbox event "${id}" cannot declare dataEncoding without data.`);
 	}
+	if (reconcileFromStore !== undefined && typeof reconcileFromStore !== 'boolean') {
+		throw new ActiveTsConfigurationError(`Outbox event "${id}" reconcileFromStore must be a boolean.`);
+	}
 	if (version !== undefined && (!Number.isSafeInteger(version) || version < 0)) {
 		throw new ActiveTsConfigurationError(`Outbox event "${id}" version must be a non-negative safe integer.`);
 	}
+	if (deliveryAttempts !== undefined && (!Number.isSafeInteger(deliveryAttempts) || deliveryAttempts < 0)) {
+		throw new ActiveTsConfigurationError(
+			`Outbox event "${id}" deliveryAttempts must be a non-negative safe integer.`
+		);
+	}
 	if ((leaseToken === undefined) !== (leaseExpiresAt === undefined)) {
 		throw new ActiveTsConfigurationError(`Outbox event "${id}" leaseToken and leaseExpiresAt must be configured together.`);
+	}
+	if (deadLetteredAt !== undefined && leaseToken !== undefined) {
+		throw new ActiveTsConfigurationError(`Outbox event "${id}" cannot be dead-lettered while leased.`);
 	}
 	const createdAt = assertCanonicalIsoTimestamp(ownOptionValue(record, 'createdAt', 'Outbox event'), `Outbox event "${id}" createdAt`);
 	const normalized: OutboxEvent = {
@@ -2311,11 +3216,28 @@ function sanitizeOutboxEvent(event: unknown, options: { requireModelId: boolean 
 		normalized.modelDatastoreProjectId = modelDatastoreProjectId as string;
 	}
 	if (dataEncoding !== undefined) normalized.dataEncoding = dataEncoding as OutboxEvent['dataEncoding'];
+	if (reconcileFromStore !== undefined) normalized.reconcileFromStore = reconcileFromStore as boolean;
 	if (sequence !== undefined) normalized.sequence = assertSafeCacheKey(sequence, `Outbox event "${id}" sequence`);
 	if (version !== undefined) normalized.version = version as number;
 	if (leaseToken !== undefined) normalized.leaseToken = assertSafeCacheKey(leaseToken, `Outbox event "${id}" leaseToken`);
 	if (leaseExpiresAt !== undefined) {
 		normalized.leaseExpiresAt = assertCanonicalIsoTimestamp(leaseExpiresAt, `Outbox event "${id}" leaseExpiresAt`);
+	}
+	if (deliveryAttempts !== undefined) normalized.deliveryAttempts = deliveryAttempts as number;
+	if (availableAt !== undefined) {
+		normalized.availableAt = assertCanonicalIsoTimestamp(availableAt, `Outbox event "${id}" availableAt`);
+	}
+	if (deadLetteredAt !== undefined) {
+		normalized.deadLetteredAt = assertCanonicalIsoTimestamp(
+			deadLetteredAt,
+			`Outbox event "${id}" deadLetteredAt`
+		);
+	}
+	if (lastDeliveryError !== undefined) {
+		normalized.lastDeliveryError = assertSafeCacheKey(
+			lastDeliveryError,
+			`Outbox event "${id}" lastDeliveryError`
+		);
 	}
 	return normalized;
 }
@@ -2381,18 +3303,26 @@ function normalizeOutboxAdapter(value: unknown, context: string, requireDrain: b
 		throw new ActiveTsConfigurationError(`${context} must be an adapter object.`);
 	}
 	const setup = adapterMember(value, 'setup');
+	const transactionStore = adapterMember(value, 'transactionStore');
 	const append = adapterMember(value, 'append');
 	const appendTransactional = adapterMember(value, 'appendTransactional');
 	const list = adapterMember(value, 'list');
+	const listDeadLetters = adapterMember(value, 'listDeadLetters');
 	const lease = adapterMember(value, 'lease');
 	const supportsExclusiveLease = adapterMember(value, 'supportsExclusiveLease');
 	const isLeaseCurrent = adapterMember(value, 'isLeaseCurrent');
+	const renewLease = adapterMember(value, 'renewLease');
 	const release = adapterMember(value, 'release');
 	const ack = adapterMember(value, 'ack');
+	const retry = adapterMember(value, 'retry');
+	const deadLetter = adapterMember(value, 'deadLetter');
 	const drain = adapterMember(value, 'drain');
 	const requeue = adapterMember(value, 'requeue');
 	if (setup !== undefined && typeof setup !== 'function') {
 		throw new ActiveTsConfigurationError(`${context}.setup must be a function.`);
+	}
+	if (transactionStore !== undefined) {
+		assertSafeSchemaIdentifier(transactionStore, `${context}.transactionStore`);
 	}
 	if (typeof append !== 'function') {
 		throw new ActiveTsConfigurationError(`${context}.append must be a function.`);
@@ -2403,6 +3333,9 @@ function normalizeOutboxAdapter(value: unknown, context: string, requireDrain: b
 	if (list !== undefined && typeof list !== 'function') {
 		throw new ActiveTsConfigurationError(`${context}.list must be a function.`);
 	}
+	if (listDeadLetters !== undefined && typeof listDeadLetters !== 'function') {
+		throw new ActiveTsConfigurationError(`${context}.listDeadLetters must be a function.`);
+	}
 	if (lease !== undefined && typeof lease !== 'function') {
 		throw new ActiveTsConfigurationError(`${context}.lease must be a function.`);
 	}
@@ -2412,23 +3345,35 @@ function normalizeOutboxAdapter(value: unknown, context: string, requireDrain: b
 	if (isLeaseCurrent !== undefined && typeof isLeaseCurrent !== 'function') {
 		throw new ActiveTsConfigurationError(`${context}.isLeaseCurrent must be a function.`);
 	}
+	if (renewLease !== undefined && typeof renewLease !== 'function') {
+		throw new ActiveTsConfigurationError(`${context}.renewLease must be a function.`);
+	}
 	if (release !== undefined && typeof release !== 'function') {
 		throw new ActiveTsConfigurationError(`${context}.release must be a function.`);
 	}
 	if (ack !== undefined && typeof ack !== 'function') {
 		throw new ActiveTsConfigurationError(`${context}.ack must be a function.`);
 	}
+	if (retry !== undefined && typeof retry !== 'function') {
+		throw new ActiveTsConfigurationError(`${context}.retry must be a function.`);
+	}
+	if (deadLetter !== undefined && typeof deadLetter !== 'function') {
+		throw new ActiveTsConfigurationError(`${context}.deadLetter must be a function.`);
+	}
 	if ((lease === undefined) !== (ack === undefined)) {
 		throw new ActiveTsConfigurationError(`${context}.lease and ${context}.ack must be configured together.`);
+	}
+	if (renewLease !== undefined && lease === undefined) {
+		throw new ActiveTsConfigurationError(`${context}.renewLease requires ${context}.lease.`);
 	}
 	if (
 		requireDrain &&
 		lease !== undefined &&
 		supportsExclusiveLease === undefined &&
-		(isLeaseCurrent === undefined || release === undefined)
+		(isLeaseCurrent === undefined || release === undefined || retry === undefined)
 	) {
 		throw new ActiveTsConfigurationError(
-			`${context}.lease, ${context}.ack, ${context}.isLeaseCurrent, and ${context}.release must be configured together for search sync.`
+			`${context}.lease, ${context}.ack, ${context}.isLeaseCurrent, ${context}.release, and ${context}.retry must be configured together for search sync.`
 		);
 	}
 	if (drain !== undefined && typeof drain !== 'function') {
@@ -2451,24 +3396,29 @@ function normalizeOutboxAdapter(value: unknown, context: string, requireDrain: b
 		throw new ActiveTsConfigurationError('Outbox adapter does not support drain() or lease()/ack().');
 	}
 	return {
+		transactionStore: transactionStore as string | undefined,
 		setup: typeof setup === 'function' ? setup.bind(value) : undefined,
 		append: append.bind(value),
 		appendTransactional: typeof appendTransactional === 'function' ? appendTransactional.bind(value) : undefined,
 		list: typeof list === 'function' ? list.bind(value) : undefined,
+		listDeadLetters: typeof listDeadLetters === 'function' ? listDeadLetters.bind(value) : undefined,
 		lease: typeof lease === 'function' ? lease.bind(value) : undefined,
 		supportsExclusiveLease: typeof supportsExclusiveLease === 'function' ? supportsExclusiveLease.bind(value) : undefined,
 		isLeaseCurrent: typeof isLeaseCurrent === 'function' ? isLeaseCurrent.bind(value) : undefined,
+		renewLease: typeof renewLease === 'function' ? renewLease.bind(value) : undefined,
 		release: typeof release === 'function' ? release.bind(value) : undefined,
 		ack: typeof ack === 'function' ? ack.bind(value) : undefined,
+		retry: typeof retry === 'function' ? retry.bind(value) : undefined,
+		deadLetter: typeof deadLetter === 'function' ? deadLetter.bind(value) : undefined,
 		drain: typeof drain === 'function' ? drain.bind(value) : undefined,
 		requeue: typeof requeue === 'function' ? requeue.bind(value) : undefined
 	};
 }
 
 function assertSearchSyncLeaseContract(outbox: OutboxAdapter, context: string) {
-	if (!outbox.isLeaseCurrent || !outbox.release) {
+	if (!outbox.isLeaseCurrent || !outbox.release || !outbox.retry) {
 		throw new ActiveTsConfigurationError(
-			`${context}.lease, ${context}.ack, ${context}.isLeaseCurrent, and ${context}.release must be configured together for search sync.`
+			`${context}.lease, ${context}.ack, ${context}.isLeaseCurrent, ${context}.release, and ${context}.retry must be configured together for search sync.`
 		);
 	}
 }
@@ -2587,6 +3537,13 @@ function assertPositiveSafeInteger(value: unknown, context: string) {
 	return value;
 }
 
+function assertNonNegativeSafeInteger(value: unknown, context: string) {
+	if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+		throw new ActiveTsConfigurationError(`${context} must be a non-negative safe integer.`);
+	}
+	return value;
+}
+
 function normalizeOutboxBatchLimit(options: OutboxBatchOptions | undefined, context: string) {
 	if (options === undefined) return undefined;
 	if (!options || typeof options !== 'object' || Array.isArray(options)) {
@@ -2670,7 +3627,134 @@ function sanitizeOutboxEventBatch(events: OutboxEvent[], context: string) {
 	return normalized;
 }
 
-async function requeueOutboxEvents(outbox: OutboxAdapter, events: OutboxEvent[]) {
+function sanitizeOutboxDeliveryFailureBatch(
+	failures: OutboxDeliveryFailure[],
+	context: string,
+	requireEvent: boolean
+) {
+	const safeFailures = snapshotArrayInput<OutboxDeliveryFailure>(failures, context);
+	const normalized: OutboxDeliveryFailure[] = [];
+	for (let index = 0; index < safeFailures.length; index++) {
+		normalized[index] = sanitizeOutboxDeliveryFailure(
+			safeFailures[index],
+			`${context}[${index}]`,
+			requireEvent
+		);
+	}
+	return normalized;
+}
+
+function sanitizeOutboxDeliveryFailure(value: unknown, context: string, requireEvent: boolean) {
+	if (!value || typeof value !== 'object' || Array.isArray(value)) {
+		throw new ActiveTsConfigurationError(`${context} must be an object.`);
+	}
+	assertPlainOptions(value, context);
+	const record = value as Record<string, unknown>;
+	assertNoSymbolOptions(record, context);
+	assertKnownOptions(
+		record,
+		['identity', 'event', 'attempt', 'maxAttempts', 'failedAt', 'retryAt', 'error'],
+		context
+	);
+	const eventValue = ownOptionValue(record, 'event', context);
+	if (requireEvent && eventValue === undefined) {
+		throw new ActiveTsConfigurationError(`${context}.event is required.`);
+	}
+	const event = eventValue === undefined
+		? undefined
+		: sanitizeOutboxEvent(eventValue, { requireModelId: false });
+	const identity = sanitizeOutboxEventIdentity(ownOptionValue(record, 'identity', context), `${context}.identity`);
+	const attempt = assertPositiveSafeInteger(ownOptionValue(record, 'attempt', context), `${context}.attempt`);
+	const maxAttempts = assertPositiveSafeInteger(
+		ownOptionValue(record, 'maxAttempts', context),
+		`${context}.maxAttempts`
+	);
+	if (attempt > maxAttempts) {
+		throw new ActiveTsConfigurationError(`${context}.attempt cannot exceed maxAttempts.`);
+	}
+	const failedAt = assertCanonicalIsoTimestamp(ownOptionValue(record, 'failedAt', context), `${context}.failedAt`);
+	const retryAtValue = ownOptionValue(record, 'retryAt', context);
+	const retryAt = retryAtValue === undefined
+		? undefined
+		: assertCanonicalIsoTimestamp(retryAtValue, `${context}.retryAt`);
+	const error = assertSafeCacheKey(ownOptionValue(record, 'error', context), `${context}.error`);
+	return {
+		identity,
+		event,
+		attempt,
+		maxAttempts,
+		failedAt,
+		retryAt,
+		error
+	} satisfies OutboxDeliveryFailure;
+}
+
+function sanitizeOutboxEventIdentity(value: unknown, context: string): OutboxEventIdentity {
+	if (!value || typeof value !== 'object' || Array.isArray(value)) {
+		throw new ActiveTsConfigurationError(`${context} must be an object.`);
+	}
+	assertPlainOptions(value, context);
+	const record = value as Record<string, unknown>;
+	assertNoSymbolOptions(record, context);
+	assertKnownOptions(record, ['id', 'model', 'modelId', 'modelIdentity', 'leaseToken', 'leaseExpiresAt'], context);
+	const identity: OutboxEventIdentity = {};
+	const id = ownOptionValue(record, 'id', context);
+	const model = ownOptionValue(record, 'model', context);
+	const modelId = ownOptionValue(record, 'modelId', context);
+	const modelIdentity = ownOptionValue(record, 'modelIdentity', context);
+	const leaseToken = ownOptionValue(record, 'leaseToken', context);
+	const leaseExpiresAt = ownOptionValue(record, 'leaseExpiresAt', context);
+	if (id !== undefined) identity.id = assertSafeCacheKey(id, `${context}.id`);
+	if (model !== undefined) identity.model = assertSafeSchemaIdentifier(model, `${context}.model`);
+	if (modelId !== undefined) {
+		assertSafeEntityId(modelId, `${context}.modelId`);
+		identity.modelId = modelId;
+	}
+	if (modelIdentity !== undefined) {
+		identity.modelIdentity = assertSafeCacheKey(modelIdentity, `${context}.modelIdentity`);
+	}
+	if (leaseToken !== undefined) identity.leaseToken = assertSafeCacheKey(leaseToken, `${context}.leaseToken`);
+	if (leaseExpiresAt !== undefined) {
+		identity.leaseExpiresAt = assertCanonicalIsoTimestamp(leaseExpiresAt, `${context}.leaseExpiresAt`);
+	}
+	return identity;
+}
+
+function outboxRetryEvent(failure: OutboxDeliveryFailure) {
+	if (!failure.event || failure.retryAt === undefined) {
+		throw new ActiveTsConfigurationError('Outbox retry failure requires an event and retryAt.');
+	}
+	const event: OutboxEvent = {
+		...failure.event,
+		version: outboxEventVersion(failure.event) + 1,
+		deliveryAttempts: failure.attempt,
+		availableAt: failure.retryAt,
+		lastDeliveryError: failure.error
+	};
+	delete event.leaseToken;
+	delete event.leaseExpiresAt;
+	delete event.deadLetteredAt;
+	return sanitizeOutboxEvent(event, { requireModelId: false });
+}
+
+function outboxDeadLetterEvent(failure: OutboxDeliveryFailure) {
+	if (!failure.event) {
+		throw new ActiveTsConfigurationError('Outbox dead-letter failure requires an event.');
+	}
+	const event: OutboxEvent = {
+		...failure.event,
+		version: outboxEventVersion(failure.event) + 1,
+		deliveryAttempts: failure.attempt,
+		deadLetteredAt: failure.failedAt,
+		lastDeliveryError: failure.error
+	};
+	delete event.leaseToken;
+	delete event.leaseExpiresAt;
+	delete event.availableAt;
+	return sanitizeOutboxEvent(event, { requireModelId: false });
+}
+
+async function requeueOutboxEvents(outbox: OutboxAdapter, events: unknown[]) {
 	const errors: unknown[] = [];
 	const snapshots: OutboxEvent[] = [];
 	for (const event of events) {
@@ -2712,22 +3796,38 @@ async function appendOutboxEvents(outbox: OutboxAdapter, events: OutboxEvent[]) 
 }
 
 async function ackOutboxEvents(outbox: OutboxAdapter, events: OutboxEvent[]) {
+	return await ackOutboxSnapshots(outbox, events);
+}
+
+async function ackOutboxSnapshots(outbox: OutboxAdapter, events: unknown[]) {
 	if (!outbox.ack) {
 		throw new ActiveTsConfigurationError('Outbox adapter does not support ack().');
 	}
-	const snapshots = sanitizeOutboxEventBatch(events, 'outbox ack events');
-	await outbox.ack(snapshots);
+	const snapshots: OutboxEvent[] = [];
+	for (let index = 0; index < events.length; index++) {
+		try {
+			snapshots[snapshots.length] = sanitizeOutboxEvent(events[index], { requireModelId: false });
+		} catch (error) {
+			const identity = snapshotOutboxDeliveryIdentity(events[index], index);
+			if (!identity.releaseSnapshot) throw error;
+			snapshots[snapshots.length] = identity.releaseSnapshot;
+		}
+	}
+	return (await outbox.ack(snapshots)) !== false;
 }
 
-async function releaseOutboxEvents(outbox: OutboxAdapter, events: OutboxEvent[]) {
+async function releaseOutboxEvents(outbox: OutboxAdapter, events: unknown[]) {
 	if (!outbox.release) return [];
 	const errors: unknown[] = [];
 	const snapshots: OutboxEvent[] = [];
-	for (const event of events) {
+	for (let index = 0; index < events.length; index++) {
+		const event = events[index];
 		try {
 			snapshots.push(sanitizeOutboxEvent(event, { requireModelId: false }));
 		} catch (error) {
-			errors.push(error);
+			const identity = snapshotOutboxDeliveryIdentity(event, index);
+			if (identity.releaseSnapshot) snapshots.push(identity.releaseSnapshot);
+			else errors.push(error);
 		}
 	}
 	if (!snapshots.length) return errors;
@@ -2739,7 +3839,7 @@ async function releaseOutboxEvents(outbox: OutboxAdapter, events: OutboxEvent[])
 	return errors;
 }
 
-function snapshotOutboxEventForRequeue(event: OutboxEvent): OutboxEvent {
+function snapshotOutboxEventForRequeue(event: unknown): OutboxEvent {
 	try {
 		return sanitizeOutboxEvent(event, { requireModelId: false });
 	} catch {

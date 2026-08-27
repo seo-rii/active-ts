@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
 	ACTIVE_TS_ENTITY_KEY,
+	ActiveTsCommittedTransactionError,
 	Model,
 	MemoryOutboxAdapter,
 	MemorySearchAdapter,
@@ -142,9 +143,11 @@ test('transaction afterCommit failures are surfaced after committed writes', asy
 					return 'ok';
 				}),
 			(error: unknown) => {
-				assert.ok(error instanceof AggregateError);
+				assert.ok(error instanceof ActiveTsCommittedTransactionError);
+				assert.equal(error.result, 'ok');
+				assert.ok(error.cause instanceof AggregateError);
 				assert.match(error.message, /afterCommit task failed/);
-				assert.match((error.errors[0] as Error).message, /dispatch unavailable/);
+				assert.match((error.cause.errors[0] as Error).message, /dispatch unavailable/);
 				return true;
 			}
 		);
@@ -218,10 +221,11 @@ test('transaction deferred task logging failures do not mask original task error
 					});
 				}),
 			(error: unknown) => {
-				assert.ok(error instanceof AggregateError);
+				assert.ok(error instanceof ActiveTsCommittedTransactionError);
+				assert.ok(error.cause instanceof AggregateError);
 				assert.match(error.message, /afterCommit task failed/);
-				assert.match((error.errors[0] as Error).message, /afterCommit original failure/);
-				assert.doesNotMatch((error.errors[0] as Error).message, /warning sink failed/);
+				assert.match((error.cause.errors[0] as Error).message, /afterCommit original failure/);
+				assert.doesNotMatch((error.cause.errors[0] as Error).message, /warning sink failed/);
 				return true;
 			}
 		);
@@ -283,8 +287,9 @@ test('transaction deferred error formatting does not invoke thrown value coercio
 					});
 				}),
 			(error: unknown) => {
-				assert.ok(error instanceof AggregateError);
-				assert.equal(error.errors[0], thrown);
+				assert.ok(error instanceof ActiveTsCommittedTransactionError);
+				assert.ok(error.cause instanceof AggregateError);
+				assert.equal(error.cause.errors[0], thrown);
 				assert.match(error.message, /afterCommit task failed/);
 				return true;
 			}
@@ -661,7 +666,7 @@ test('store outbox search sync uses transaction-backed leases without optimistic
 
 	assert.equal(leaseChecks, 1);
 	assert.equal(leaseCalls, 1);
-	assert.equal(transactionCalls, 2);
+	assert.equal(transactionCalls, 3);
 	assert.deepEqual(await outbox.list(), []);
 	assert.deepEqual(
 		(await search.search(context.meta(OutboxAccount), 'drained', {})).list.map((row) => row.id),
@@ -799,7 +804,7 @@ test('outbox search sync detects projecting search adapters through middleware w
 	);
 });
 
-test('store outbox uses append sequence for same-timestamp search updates', async () => {
+test('store outbox reconciles current state when event creation and commit order differ', async () => {
 	const store = new MemoryStoreAdapter();
 	const outbox = new StoreOutboxAdapter({ store: 'default' });
 	const search = new MemorySearchAdapter();
@@ -809,38 +814,45 @@ test('store outbox uses append sequence for same-timestamp search updates', asyn
 		defaultSearch: 'memory'
 	});
 	outbox.setup!(context);
+	const Account = OutboxAccount.use(context) as unknown as typeof OutboxAccount;
 	const timestamp = '2026-05-13T00:00:00.000Z';
+	await Account.create({ id: 1, handle: 'A-final-store' });
 
 	await outbox.append({
-		id: 'z-old-event',
+		id: 'a-created-first-commits-last',
 		model: 'outbox_transaction_account',
 		modelId: 1,
 		operation: 'update',
-		data: { id: 1, handle: 'old value' },
+		data: { id: 1, handle: 'A-final-store' },
+		reconcileFromStore: true,
 		createdAt: timestamp
 	});
 	await outbox.append({
-		id: 'a-new-event',
+		id: 'b-created-last-commits-first',
 		model: 'outbox_transaction_account',
 		modelId: 1,
 		operation: 'update',
-		data: { id: 1, handle: 'new value' },
+		data: { id: 1, handle: 'B-commits-first' },
+		reconcileFromStore: true,
 		createdAt: timestamp
 	});
 
-	assert.deepEqual((await outbox.list()).map((event) => event.id), ['z-old-event', 'a-new-event']);
+	assert.deepEqual(
+		(await outbox.list()).map((event) => event.id),
+		['a-created-first-commits-last', 'b-created-last-commits-first']
+	);
 	assert.equal(await runSearchSyncWorker({ outbox, search, models: [OutboxAccount], context }), 1);
 	assert.deepEqual(
-		(await search.search(context.meta(OutboxAccount), 'old', {})).list.map((row) => row.id),
+		(await search.search(context.meta(OutboxAccount), 'A-final-store', {})).list.map((row) => row.id),
 		[1]
 	);
 
 	assert.equal(await runSearchSyncWorker({ outbox, search, models: [OutboxAccount], context }), 1);
 	assert.deepEqual(
-		(await search.search(context.meta(OutboxAccount), 'new', {})).list.map((row) => row.id),
+		(await search.search(context.meta(OutboxAccount), 'A-final-store', {})).list.map((row) => row.id),
 		[1]
 	);
-	assert.deepEqual((await search.search(context.meta(OutboxAccount), 'old', {})).list, []);
+	assert.deepEqual((await search.search(context.meta(OutboxAccount), 'B-commits-first', {})).list, []);
 });
 
 test('store outbox schema index matches sequence-based list ordering', async () => {
@@ -1187,6 +1199,35 @@ test('store outbox isolates transaction-backed release and ack operations per ev
 	assert.deepEqual(await outbox.list(), []);
 });
 
+test('store outbox transaction ack preserves later repair after source ownership loss', async () => {
+	const context = createActiveTs({ stores: { default: createDatastoreKindMemoryStore() } });
+	const outbox = new StoreOutboxAdapter({ context });
+	await outbox.append({
+		id: 'lost-source-before-repair-ack',
+		model: 'outbox_transaction_account',
+		modelId: 81,
+		operation: 'update',
+		data: { id: 81, handle: 'possibly applied' },
+		createdAt: '2026-05-13T00:00:00.000Z'
+	});
+	const [leased] = await outbox.lease!({ limit: 1 });
+	const repair = await outbox.append({
+		id: 'repair-after-lost-source',
+		model: 'outbox_transaction_account',
+		modelId: 81,
+		operation: 'update',
+		reconcileFromStore: true,
+		createdAt: '2026-05-13T00:00:00.000Z'
+	});
+	await outbox.release!([leased]);
+
+	assert.equal(await outbox.ack!([leased, repair!]), false);
+	assert.deepEqual(
+		(await outbox.list()).map((event) => event.id),
+		['lost-source-before-repair-ack', 'repair-after-lost-source']
+	);
+});
+
 test('store outbox lease keeps events visible until ack', async () => {
 	const context = createActiveTs({ stores: { default: new MemoryStoreAdapter() } });
 	const outbox = new StoreOutboxAdapter({ context });
@@ -1206,6 +1247,32 @@ test('store outbox lease keeps events visible until ack', async () => {
 
 	await outbox.ack!([leased[0]]);
 
+	assert.deepEqual(await outbox.list(), []);
+});
+
+test('store outbox renews an owned lease without accepting the stale snapshot', async () => {
+	const context = createActiveTs({ stores: { default: new MemoryStoreAdapter() } });
+	const outbox = new StoreOutboxAdapter({ context });
+	await outbox.append({
+		id: 'renewed-lease-event',
+		model: 'outbox_transaction_account',
+		modelId: 1,
+		operation: 'create',
+		data: { id: 1, handle: 'renewed' },
+		createdAt: '2026-05-13T00:00:00.000Z'
+	});
+
+	const [leased] = await outbox.lease!();
+	await new Promise((resolve) => setTimeout(resolve, 2));
+	const renewed = await outbox.renewLease!(leased);
+
+	assert.ok(renewed);
+	assert.equal(renewed.leaseToken, leased.leaseToken);
+	assert.equal(renewed.version, (leased.version ?? 0) + 1);
+	assert.ok(Date.parse(renewed.leaseExpiresAt!) > Date.parse(leased.leaseExpiresAt!));
+	assert.equal(await outbox.isLeaseCurrent!(leased), false);
+	assert.equal(await outbox.isLeaseCurrent!(renewed), true);
+	await outbox.ack!([renewed]);
 	assert.deepEqual(await outbox.list(), []);
 });
 
@@ -2396,17 +2463,23 @@ test('non-transactional store outbox ack restores deleted events on failure', as
 	assert.deepEqual((await outbox.list()).map((event) => event.id), ['ack-first-event', 'ack-second-event']);
 });
 
-test('store outbox search sync acks delivered leased events without dropping failed leases', async () => {
+test('store outbox search sync preserves repair after an index applies then rejects', async () => {
 	const context = createActiveTs({ stores: { default: new MemoryStoreAdapter() } });
 	const outbox = new StoreOutboxAdapter({ context });
 	const indexed: string[] = [];
+	let repairVisibleAfterRemoteWrite = false;
 	const search = {
 		kind: 'memory',
 		capabilities: { index: true },
 		search: async () => ({ list: [], more: false }),
 		index: async (_model: unknown, _id: unknown, data: any) => {
 			indexed.push(data.handle);
-			if (data.handle === 'second') throw new Error('index unavailable');
+			if (data.handle === 'second') {
+				repairVisibleAfterRemoteWrite = (await outbox.list()).some((event) =>
+					event.modelId === 2 && event.reconcileFromStore === true
+				);
+				throw new Error('index unavailable');
+			}
 		},
 		delete: async () => undefined
 	} satisfies SearchAdapter;
@@ -2433,7 +2506,14 @@ test('store outbox search sync acks delivered leased events without dropping fai
 	);
 
 	assert.deepEqual(indexed, ['first', 'second']);
-	assert.deepEqual((await outbox.list()).map((event) => event.id), ['leased-second-event']);
+	assert.equal(repairVisibleAfterRemoteWrite, true);
+	const failedPending = await outbox.list();
+	assert.equal(failedPending.length, 2);
+	assert.equal(failedPending[0].id, 'leased-second-event');
+	assert.equal(failedPending[0].deliveryAttempts, 1);
+	assert.equal(failedPending[1].modelId, 2);
+	assert.equal(failedPending[1].reconcileFromStore, true);
+	assert.equal(failedPending[1].data, undefined);
 
 	const recoveredSearch = {
 		kind: 'memory',
@@ -2447,6 +2527,59 @@ test('store outbox search sync acks delivered leased events without dropping fai
 
 	assert.equal(await runSearchSyncWorker({ outbox, search: recoveredSearch, models: [OutboxAccount], context }), 1);
 	assert.deepEqual(indexed, ['first', 'second', 'second']);
+	const [durableRepair] = await outbox.list();
+	assert.equal(durableRepair.reconcileFromStore, true);
+	assert.equal(durableRepair.modelId, 2);
+	assert.equal(await runSearchSyncWorker({ outbox, search: recoveredSearch, models: [OutboxAccount], context }), 1);
+	assert.deepEqual(await outbox.list(), []);
+});
+
+test('store outbox search sync preserves repair after a delete applies then rejects', async () => {
+	const context = createActiveTs({ stores: { default: new MemoryStoreAdapter() } });
+	const Account = OutboxAccount.use(context) as unknown as typeof OutboxAccount;
+	const outbox = new StoreOutboxAdapter({ context });
+	let indexedHandle: string | undefined = 'stale document';
+	let rejectDelete = true;
+	const search = {
+		kind: 'memory',
+		capabilities: { index: true },
+		search: async () => ({ list: [], more: false }),
+		index: async (_model: unknown, _id: unknown, data: OutboxAccountData) => {
+			indexedHandle = data.handle;
+		},
+		delete: async () => {
+			indexedHandle = undefined;
+			if (rejectDelete) {
+				rejectDelete = false;
+				throw new Error('delete response lost');
+			}
+		}
+	} satisfies SearchAdapter;
+
+	await Account.create({ id: 52, handle: 'authoritative' });
+	await outbox.append({
+		id: 'delete-applied-before-reject',
+		model: 'outbox_transaction_account',
+		modelId: 52,
+		operation: 'delete',
+		createdAt: '2026-05-13T00:00:02.000Z'
+	});
+
+	await assert.rejects(
+		() => runSearchSyncWorker({ outbox, search, models: [OutboxAccount], context }),
+		/delete response lost/
+	);
+	assert.equal(indexedHandle, undefined);
+	const failedPending = await outbox.list();
+	assert.equal(failedPending.length, 2);
+	assert.equal(failedPending[0].id, 'delete-applied-before-reject');
+	assert.equal(failedPending[1].reconcileFromStore, true);
+
+	assert.equal(await runSearchSyncWorker({ outbox, search, models: [OutboxAccount], context }), 1);
+	assert.equal(indexedHandle, undefined);
+	assert.equal((await outbox.list())[0].reconcileFromStore, true);
+	assert.equal(await runSearchSyncWorker({ outbox, search, models: [OutboxAccount], context }), 1);
+	assert.equal(indexedHandle, 'authoritative');
 	assert.deepEqual(await outbox.list(), []);
 });
 
@@ -2481,6 +2614,7 @@ test('store outbox search sync skips stale leased events before indexing', async
 		lease: async () => staleLease,
 		isLeaseCurrent: (event: any) => outbox.isLeaseCurrent!(event),
 		release: (events: any) => outbox.release!(events),
+		retry: (failures: any) => outbox.retry!(failures),
 		ack: (events: any) => outbox.ack!(events)
 	};
 
@@ -2516,6 +2650,7 @@ test('store outbox search sync rechecks leased events immediately before indexin
 		lease: async () => leased,
 		isLeaseCurrent: async () => ++leaseChecks === 1,
 		release: (events: any) => outbox.release!(events),
+		retry: (failures: any) => outbox.retry!(failures),
 		ack: (events: any) => outbox.ack!(events)
 	};
 
@@ -2569,6 +2704,7 @@ test('store outbox search sync rechecks leases before index hooks', async () => 
 		lease: async () => leased,
 		isLeaseCurrent: async () => ++leaseChecks === 1,
 		release: (events: any) => outbox.release!(events),
+		retry: (failures: any) => outbox.retry!(failures),
 		ack: (events: any) => outbox.ack!(events)
 	};
 
@@ -2624,6 +2760,7 @@ test('store outbox search sync rechecks leased events after indexing before hook
 		lease: async () => leased,
 		isLeaseCurrent: async () => ++leaseChecks <= 3,
 		release: (events: any) => outbox.release!(events),
+		retry: (failures: any) => outbox.retry!(failures),
 		ack: async (events: any) => {
 			acked += events.length;
 			await outbox.ack!(events);
@@ -2637,6 +2774,109 @@ test('store outbox search sync rechecks leased events after indexing before hook
 	const [remaining] = await outbox.list();
 	assert.equal(remaining.id, 'lease-stale-after-index');
 	assert.equal(remaining.leaseToken, undefined);
+});
+
+test('search sync repairs a delayed stale write after another worker indexes newer state', async () => {
+	let releaseOldIndex!: () => void;
+	let markOldIndexStarted!: () => void;
+	const oldIndexStarted = new Promise<void>((resolve) => {
+		markOldIndexStarted = resolve;
+	});
+	const oldIndexRelease = new Promise<void>((resolve) => {
+		releaseOldIndex = resolve;
+	});
+	let indexedHandle: string | undefined;
+	let oldIndexBlocked = false;
+	const search = {
+		kind: 'memory',
+		capabilities: { index: true },
+		search: async () => ({ list: [], more: false }),
+		index: async (_model: ResolvedModelMeta, _id: EntityId, data: OutboxAccountData) => {
+			if (data.handle === 'old-before-lease-expiry' && !oldIndexBlocked) {
+				oldIndexBlocked = true;
+				markOldIndexStarted();
+				await oldIndexRelease;
+			}
+			indexedHandle = data.handle;
+		},
+		delete: async () => {
+			indexedHandle = undefined;
+		}
+	} satisfies SearchAdapter;
+	const context = createActiveTs({
+		stores: { default: new MemoryStoreAdapter() },
+		search: { memory: search },
+		defaultSearch: 'memory'
+	});
+	const Account = OutboxAccount.use(context) as unknown as typeof OutboxAccount;
+	await Account.create({ id: 91, handle: 'old-before-lease-expiry' });
+
+	const oldExpiresAt = new Date(Date.now() + 250).toISOString();
+	const oldEvent: OutboxEvent = {
+		id: 'delayed-old-lease',
+		model: 'outbox_transaction_account',
+		modelId: 91,
+		operation: 'update',
+		data: { id: 91, handle: 'old-before-lease-expiry' },
+		reconcileFromStore: true,
+		createdAt: '2026-05-13T00:00:00.000Z',
+		leaseToken: 'old-lease-token',
+		leaseExpiresAt: oldExpiresAt
+	};
+	const newEvent: OutboxEvent = {
+		id: 'new-worker-lease',
+		model: 'outbox_transaction_account',
+		modelId: 91,
+		operation: 'update',
+		data: { id: 91, handle: 'new-final-store' },
+		reconcileFromStore: true,
+		createdAt: '2026-05-13T00:00:01.000Z',
+		leaseToken: 'new-lease-token',
+		leaseExpiresAt: new Date(Date.now() + 60_000).toISOString()
+	};
+	let leaseCalls = 0;
+	let activeLeaseToken: string | undefined = oldEvent.leaseToken;
+	const repairEvents: OutboxEvent[] = [];
+	const pendingRepairIds = new Set<string>();
+	const outbox = {
+		transactionStore: 'default',
+		append: async (event: OutboxEvent) => {
+			repairEvents.push(event);
+			pendingRepairIds.add(event.id);
+			return event;
+		},
+		lease: async () => ++leaseCalls === 1 ? [oldEvent] : [newEvent],
+		isLeaseCurrent: async (event: OutboxEvent) =>
+			event.leaseToken === activeLeaseToken && Date.parse(event.leaseExpiresAt!) > Date.now(),
+		release: async () => undefined,
+		retry: async () => undefined,
+		ack: async (events: OutboxEvent[]) => {
+			if (events[0]?.leaseToken === activeLeaseToken) activeLeaseToken = undefined;
+			for (const event of events) {
+				if (event.leaseToken === undefined) pendingRepairIds.delete(event.id);
+			}
+		}
+	};
+
+	const oldWorker = runSearchSyncWorker({ outbox, search, models: [OutboxAccount], context });
+	await oldIndexStarted;
+	await Account.update(91, { handle: 'new-final-store' });
+	await new Promise((resolve) => setTimeout(resolve, Math.max(0, Date.parse(oldExpiresAt) - Date.now() + 5)));
+	activeLeaseToken = newEvent.leaseToken;
+
+	assert.equal(await runSearchSyncWorker({ outbox, search, models: [OutboxAccount], context }), 1);
+	assert.equal(indexedHandle, 'new-final-store');
+	releaseOldIndex();
+	assert.equal(await oldWorker, 0);
+
+	assert.equal(indexedHandle, 'new-final-store');
+	assert.equal(repairEvents.length, 2);
+	for (const repair of repairEvents) {
+		assert.equal(repair.model, 'outbox_transaction_account');
+		assert.equal(repair.modelId, 91);
+		assert.equal(repair.data, undefined);
+	}
+	assert.deepEqual([...pendingRepairIds], [repairEvents[0].id]);
 });
 
 test('store outbox search sync rechecks leased events immediately before deletes', async () => {
@@ -2666,6 +2906,7 @@ test('store outbox search sync rechecks leased events immediately before deletes
 		lease: async () => leased,
 		isLeaseCurrent: async () => ++leaseChecks === 1,
 		release: (events: any) => outbox.release!(events),
+		retry: (failures: any) => outbox.retry!(failures),
 		ack: (events: any) => outbox.ack!(events)
 	};
 
@@ -2718,6 +2959,7 @@ test('store outbox search sync rechecks leases before delete hooks', async () =>
 		lease: async () => leased,
 		isLeaseCurrent: async () => ++leaseChecks === 1,
 		release: (events: any) => outbox.release!(events),
+		retry: (failures: any) => outbox.retry!(failures),
 		ack: (events: any) => outbox.ack!(events)
 	};
 
@@ -2772,6 +3014,7 @@ test('store outbox search sync rechecks leased delete events after deletion befo
 		lease: async () => leased,
 		isLeaseCurrent: async () => ++leaseChecks <= 3,
 		release: (events: any) => outbox.release!(events),
+		retry: (failures: any) => outbox.retry!(failures),
 		ack: async (events: any) => {
 			acked += events.length;
 			await outbox.ack!(events);
@@ -2779,12 +3022,13 @@ test('store outbox search sync rechecks leased delete events after deletion befo
 	};
 
 	assert.equal(await runSearchSyncWorker({ outbox: racingOutbox, search, models: [OutboxAccount], context }), 0);
-	assert.equal(deleted, 1);
+	assert.equal(deleted, 2);
 	assert.equal(acked, 0);
 	assert.deepEqual(hookEvents, ['beforeIndex']);
-	const [remaining] = await outbox.list();
+	const [remaining, repair] = await outbox.list();
 	assert.equal(remaining.id, 'lease-stale-after-delete');
 	assert.equal(remaining.leaseToken, undefined);
+	assert.equal(repair.reconcileFromStore, true);
 });
 
 test('store outbox search sync rechecks payload-free stale updates after search deletion', async () => {
@@ -2830,6 +3074,7 @@ test('store outbox search sync rechecks payload-free stale updates after search 
 		lease: async () => leased,
 		isLeaseCurrent: async () => ++leaseChecks <= 3,
 		release: (events: any) => outbox.release!(events),
+		retry: (failures: any) => outbox.retry!(failures),
 		ack: async (events: any) => {
 			acked += events.length;
 			await outbox.ack!(events);
@@ -2837,12 +3082,13 @@ test('store outbox search sync rechecks payload-free stale updates after search 
 	};
 
 	assert.equal(await runSearchSyncWorker({ outbox: racingOutbox, search, models: [OutboxAccount], context }), 0);
-	assert.equal(deleted, 1);
+	assert.equal(deleted, 2);
 	assert.equal(acked, 0);
 	assert.deepEqual(hookEvents, ['beforeIndex']);
-	const [remaining] = await outbox.list();
+	const [remaining, repair] = await outbox.list();
 	assert.equal(remaining.id, 'payload-free-stale-after-delete');
 	assert.equal(remaining.leaseToken, undefined);
+	assert.equal(repair.reconcileFromStore, true);
 });
 
 test('store outbox treats expired leases as no longer current', async () => {
@@ -3484,6 +3730,7 @@ test('outbox plugin uses captured Map size for resolved hook metadata', async ()
 			operation: 'create',
 			data: { id: 902, handle: 'map-size' },
 			dataEncoding: 'public',
+			reconcileFromStore: true,
 			createdAt: events[0].createdAt
 		}
 	]);
@@ -3842,6 +4089,119 @@ test('outbox search sync worker requeues malformed events instead of dropping th
 		}
 	);
 	assert.deepEqual(customDateOutbox.events, []);
+});
+
+test('outbox search sync isolates poison entities while processing unrelated events', async () => {
+	const outbox = new MemoryOutboxAdapter();
+	const search = new MemorySearchAdapter();
+	const context = createActiveTs({ stores: { default: new MemoryStoreAdapter() } });
+	const Account = OutboxAccount.use(context) as unknown as typeof OutboxAccount;
+	await Account.create({ id: 93, handle: 'unrelated-event-processed' });
+
+	await outbox.append({
+		id: 'poison-entity-first',
+		model: 'permanently_missing_model',
+		modelId: 1,
+		operation: 'update',
+		data: { id: 1, handle: 'poison-first' },
+		createdAt: '2026-05-13T00:00:00.000Z'
+	});
+	await outbox.append({
+		id: 'poison-entity-successor',
+		model: 'permanently_missing_model',
+		modelId: 1,
+		operation: 'update',
+		data: { id: 1, handle: 'poison-successor' },
+		createdAt: '2026-05-13T00:00:01.000Z'
+	});
+	await outbox.append({
+		id: 'unrelated-valid-event',
+		model: 'outbox_transaction_account',
+		modelId: 93,
+		operation: 'update',
+		data: { id: 93, handle: 'payload-is-only-a-trigger' },
+		reconcileFromStore: true,
+		createdAt: '2026-05-13T00:00:02.000Z'
+	});
+
+	await assert.rejects(
+		() => runSearchSyncWorker({ outbox, search, models: [OutboxAccount], context }),
+		/unregistered model "permanently_missing_model"/
+	);
+	assert.deepEqual(
+		(await outbox.list()).map((event) => event.id),
+		['poison-entity-first', 'poison-entity-successor']
+	);
+	assert.deepEqual(
+		(await search.search(context.meta(OutboxAccount), 'unrelated-event-processed', {})).list.map((row) => row.id),
+		[93]
+	);
+});
+
+test('outbox search sync dead-letters a batchSize one poison before advancing unrelated work', async () => {
+	const outbox = new MemoryOutboxAdapter();
+	const search = new MemorySearchAdapter();
+	const context = createActiveTs({ stores: { default: new MemoryStoreAdapter() } });
+	const retryAttempts: number[] = [];
+	await outbox.append({
+		id: 'batch-one-poison',
+		model: 'permanently_missing_batch_model',
+		modelId: 1,
+		operation: 'update',
+		data: { id: 1, handle: 'poison' },
+		createdAt: '2026-05-13T00:00:00.000Z'
+	});
+	await outbox.append({
+		id: 'batch-one-unrelated',
+		model: 'outbox_transaction_account',
+		modelId: 94,
+		operation: 'create',
+		data: { id: 94, handle: 'after-dead-letter' },
+		createdAt: '2026-05-13T00:00:01.000Z'
+	});
+	const workerOptions = {
+		outbox,
+		search,
+		models: [OutboxAccount],
+		context,
+		batchSize: 1,
+		retryDelayMs: (attempt: number) => {
+			retryAttempts.push(attempt);
+			return 0;
+		}
+	};
+
+	for (let attempt = 1; attempt < 5; attempt++) {
+		await assert.rejects(
+			() => runSearchSyncWorker(workerOptions),
+			/unregistered model "permanently_missing_batch_model"/
+		);
+		const [retry, waiting] = await outbox.list();
+		assert.equal(retry.id, 'batch-one-poison');
+		assert.equal(retry.deliveryAttempts, attempt);
+		assert.equal(retry.version, attempt);
+		assert.equal(waiting.id, 'batch-one-unrelated');
+		assert.deepEqual(retryAttempts, Array.from({ length: attempt }, (_value, index) => index + 1));
+	}
+	await assert.rejects(
+		() => runSearchSyncWorker(workerOptions),
+		/unregistered model "permanently_missing_batch_model"/
+	);
+	assert.deepEqual((await outbox.list()).map((event) => event.id), ['batch-one-unrelated']);
+	const [deadLetter] = await outbox.listDeadLetters();
+	assert.equal(deadLetter.id, 'batch-one-poison');
+	assert.equal(deadLetter.deliveryAttempts, 5);
+	assert.equal(deadLetter.version, 5);
+	assert.deepEqual(retryAttempts, [1, 2, 3, 4]);
+	assert.equal(new Date(deadLetter.deadLetteredAt!).toISOString(), deadLetter.deadLetteredAt);
+	assert.match(deadLetter.lastDeliveryError!, /permanently_missing_batch_model/);
+
+	assert.equal(await runSearchSyncWorker(workerOptions), 1);
+	assert.deepEqual(await outbox.list(), []);
+	assert.deepEqual(
+		(await search.search(context.meta(OutboxAccount), 'after-dead-letter', {})).list.map((row) => row.id),
+		[94]
+	);
 });
 
 test('outbox plugin and memory adapter validate event identifiers', async () => {
@@ -4443,11 +4803,12 @@ test('outbox search sync validates options before draining', async () => {
 			leaseCalls++;
 			return [];
 		},
+		retry: async () => undefined,
 		ack: async () => undefined
 	};
 	await assert.rejects(
 		() => runSearchSyncWorker({ outbox: leaseWithoutCurrent, search, models: [OutboxAccount] } as any),
-		/lease, Outbox search sync outbox\.ack, Outbox search sync outbox\.isLeaseCurrent, and Outbox search sync outbox\.release/
+		/must be configured together for search sync/
 	);
 	assert.equal(leaseCalls, 0);
 	const leaseWithoutRelease = {
@@ -4457,11 +4818,34 @@ test('outbox search sync validates options before draining', async () => {
 			return [];
 		},
 		isLeaseCurrent: async () => true,
+		retry: async () => undefined,
 		ack: async () => undefined
 	};
 	await assert.rejects(
 		() => runSearchSyncWorker({ outbox: leaseWithoutRelease, search, models: [OutboxAccount] } as any),
-		/lease, Outbox search sync outbox\.ack, Outbox search sync outbox\.isLeaseCurrent, and Outbox search sync outbox\.release/
+		/must be configured together for search sync/
+	);
+	assert.equal(leaseCalls, 0);
+	const leaseWithoutRetry = {
+		append: async () => undefined,
+		lease: async () => {
+			leaseCalls++;
+			return [];
+		},
+		isLeaseCurrent: async () => true,
+		release: async () => undefined,
+		ack: async () => undefined
+	};
+	const leaseContext = createActiveTs({ stores: { default: new MemoryStoreAdapter() } });
+	await assert.rejects(
+		() => runSearchSyncWorker({
+			outbox: leaseWithoutRetry,
+			search,
+			models: [OutboxAccount],
+			context: leaseContext,
+			batchSize: 1
+		}),
+		/Outbox search sync outbox\.retry must be configured together for search sync/
 	);
 	assert.equal(leaseCalls, 0);
 	await assert.rejects(
@@ -4657,7 +5041,7 @@ test('outbox search sync requeues failed drain batches and preserves original fa
 			assert.match(error.message, /index down/);
 			assert.deepEqual(
 				error.errors.map((item: Error) => item.message),
-				['index down', 'requeue down']
+				['index down', 'index down', 'requeue down']
 			);
 			return true;
 		}
