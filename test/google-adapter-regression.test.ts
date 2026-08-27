@@ -16,6 +16,7 @@ import {
 	createSearchMiddlewareAdapter,
 	createStoreMiddlewareAdapter,
 	datastoreKey,
+	datastoreReadOptions,
 	defineModel,
 	type AggregatePlan,
 	type DatastoreKey,
@@ -4095,6 +4096,10 @@ test('Datastore transaction aggregate preserves min max fieldType constraints', 
 
 test('Datastore transaction query overlay preserves inequality limit constraints', async () => {
 	let createQueryCalls = 0;
+	const typedMeta: ResolvedModelMeta<GoogleRegressionData> = {
+		...meta,
+		fieldTypes: new Map([['score', 'number']])
+	};
 	const client = datastoreClient({
 		createQuery: () => {
 			createQueryCalls++;
@@ -4117,7 +4122,7 @@ test('Datastore transaction query overlay preserves inequality limit constraints
 
 	await assert.rejects(
 		() => datastore.transaction!(async (tx) => {
-			await tx.query(meta, {
+			await tx.query(typedMeta, {
 				where: [{ field: 'score', op: '>=', value: 10 }],
 				or: [],
 				sort: [],
@@ -4298,6 +4303,165 @@ test('Datastore context transactions skip afterRollback callbacks after commit-p
 	);
 	assert.deepEqual(calls, ['run', 'insert', 'commit']);
 	assert.deepEqual(lifecycle, []);
+});
+
+test('Datastore transaction outcome classification fails closed for frozen commit and rollback failures', async () => {
+	const frozenCommitError = Object.freeze(new Error('frozen datastore commit outcome'));
+	const frozenLifecycle: string[] = [];
+	const frozenAdapter = await createDatastoreStoreAdapter({
+		client: datastoreClient({
+			transaction: () => ({
+				run: async () => undefined,
+				commit: async () => { throw frozenCommitError; },
+				rollback: async () => assert.fail('commit-phase failures must not be rolled back'),
+				get: async () => [null],
+				runQuery: async () => [[], { moreResults: 'NO_MORE_RESULTS' }],
+				insert: async () => undefined,
+				update: async () => undefined,
+				delete: async () => undefined
+			})
+		})
+	});
+	const frozenContext = createActiveTs({ stores: { default: frozenAdapter } });
+	await assert.rejects(
+		() => frozenContext.transaction(async (tx) => {
+			await tx.afterRollback(() => { frozenLifecycle.push('afterRollback'); });
+		}),
+		(error: unknown) => error === frozenCommitError
+	);
+	assert.deepEqual(frozenLifecycle, []);
+
+	const rollbackLifecycle: string[] = [];
+	const rollbackAdapter = await createDatastoreStoreAdapter({
+		client: datastoreClient({
+			transaction: () => ({
+				run: async () => undefined,
+				commit: async () => assert.fail('failed callbacks must not commit'),
+				rollback: async () => { throw new Error('datastore rollback transport failed'); },
+				get: async () => [null],
+				runQuery: async () => [[], { moreResults: 'NO_MORE_RESULTS' }],
+				insert: async () => undefined,
+				update: async () => undefined,
+				delete: async () => undefined
+			})
+		})
+	});
+	const rollbackContext = createActiveTs({ stores: { default: rollbackAdapter } });
+	await assert.rejects(
+		() => rollbackContext.transaction(async (tx) => {
+			await tx.afterRollback(() => { rollbackLifecycle.push('afterRollback'); });
+			throw new Error('datastore callback failed');
+		}),
+		/Datastore transaction failed and rollback failed/
+	);
+	assert.deepEqual(rollbackLifecycle, []);
+});
+
+test('Datastore definitive gRPC commit failures retain rollback semantics', async () => {
+	for (const code of [3, 'ALREADY_EXISTS', 'NOT_FOUND', 'FAILED_PRECONDITION', 'UNAUTHENTICATED']) {
+		const calls: string[] = [];
+		const lifecycle: string[] = [];
+		const commitError = Object.assign(new Error(`definitive commit failure ${String(code)}`), { code });
+		const adapter = await createDatastoreStoreAdapter({
+			client: datastoreClient({
+				transaction: () => ({
+					run: async () => { calls.push('run'); },
+					commit: async () => {
+						calls.push('commit');
+						throw commitError;
+					},
+					rollback: async () => { calls.push('rollback'); },
+					get: async () => [null],
+					runQuery: async () => [[], { moreResults: 'NO_MORE_RESULTS' }],
+					insert: async () => undefined,
+					update: async () => undefined,
+					delete: async () => undefined
+				})
+			})
+		});
+		const context = createActiveTs({ stores: { default: adapter } });
+
+		await assert.rejects(
+			() => context.transaction(async (tx) => {
+				await tx.afterRollback(() => { lifecycle.push('afterRollback'); });
+			}),
+			(error: unknown) => error === commitError
+		);
+		assert.deepEqual(calls, ['run', 'commit'], String(code));
+		assert.deepEqual(lifecycle, ['afterRollback'], String(code));
+	}
+});
+
+test('Datastore transactions map ABORTED commits and retry only with explicit maxAttempts', async () => {
+	const terminalLifecycle: string[] = [];
+	const terminalAdapter = await createDatastoreStoreAdapter({
+		client: datastoreClient({
+			transaction: () => ({
+				run: async () => undefined,
+				commit: async () => { throw Object.assign(new Error('transaction aborted'), { code: 10 }); },
+				rollback: async () => assert.fail('ABORTED commits are already rolled back'),
+				get: async () => [null],
+				runQuery: async () => [[], { moreResults: 'NO_MORE_RESULTS' }],
+				insert: async () => undefined,
+				update: async () => undefined,
+				delete: async () => undefined
+			})
+		})
+	});
+	const terminalContext = createActiveTs({ stores: { default: terminalAdapter } });
+	await assert.rejects(
+		() => terminalContext.transaction(async (tx) => {
+			await tx.afterRollback(() => { terminalLifecycle.push('afterRollback'); });
+		}),
+		ActiveTsConflictError
+	);
+	assert.deepEqual(terminalLifecycle, ['afterRollback']);
+
+	let transactionAttempts = 0;
+	let callbackAttempts = 0;
+	const retryLifecycle: string[] = [];
+	const retryAdapter = await createDatastoreStoreAdapter({
+		client: datastoreClient({
+			transaction: () => {
+				const attempt = ++transactionAttempts;
+				return {
+					run: async () => undefined,
+					commit: async () => {
+						if (attempt === 1) throw Object.assign(new Error('retryable abort'), { code: 'ABORTED' });
+					},
+					rollback: async () => assert.fail('ABORTED commits are already rolled back'),
+					get: async () => [null],
+					runQuery: async () => [[], { moreResults: 'NO_MORE_RESULTS' }],
+					insert: async () => undefined,
+					update: async () => undefined,
+					delete: async () => undefined
+				};
+			}
+		})
+	});
+	const retryContext = createActiveTs({ stores: { default: retryAdapter } });
+	const result = await retryContext.transaction(async (tx) => {
+		const attempt = ++callbackAttempts;
+		await tx.afterRollback(() => { retryLifecycle.push(`rollback:${attempt}`); });
+		await tx.afterCommit(() => { retryLifecycle.push(`commit:${attempt}`); });
+		return `attempt:${attempt}`;
+	}, {
+		native: {
+			maxAttempts: 2,
+			retryInitialDelayMs: 0,
+			retryMaxDelayMs: 0,
+			retryJitter: false
+		}
+	});
+
+	assert.equal(result, 'attempt:2');
+	assert.equal(transactionAttempts, 2);
+	assert.equal(callbackAttempts, 2);
+	assert.deepEqual(retryLifecycle, ['rollback:1', 'commit:2']);
+	await assert.rejects(
+		() => retryAdapter.transaction!(async () => undefined, { native: { maxAttempts: 0 } }),
+		/Datastore transaction options\.native\.maxAttempts must be a positive safe integer/
+	);
 });
 
 test('Datastore transaction direct reads use explicit ancestor metadata for buffered rows', async () => {
@@ -4988,7 +5152,10 @@ test('Datastore nested paths preserve codecs, ancestor scope, ordering, selectio
 				encodeQuery: (value) => `stored:${String(value)}`
 			}
 		]]),
-		fieldTypes: new Map([['metadata.createdAt', 'number']]),
+		fieldTypes: new Map([
+			['metadata.category', 'string'],
+			['metadata.createdAt', 'number']
+		]),
 		datastore: {
 			ancestor: ({ data }) => data ? datastoreKey('nested_query_parent', data.parentId) : undefined,
 			ancestorFields: ['parentId']
@@ -5193,6 +5360,47 @@ test('Datastore getMany ignores patched Array map', async () => {
 	assert.equal((datastoreGetInput as unknown[]).length, 2);
 });
 
+test('Datastore getMany requires one snapshot before chunking more than 1000 keys', async () => {
+	const lookupSizes: number[] = [];
+	const lookupOptions: unknown[] = [];
+	const datastore = await createDatastoreStoreAdapter({
+		client: datastoreClient({
+			get: async (input: unknown, options: unknown) => {
+				assert.ok(Array.isArray(input));
+				lookupSizes.push(input.length);
+				lookupOptions.push(options);
+				const rows: Array<{ id: number; handle: string }> = [];
+				for (let index = input.length - 1; index >= 0; index--) {
+					const key = input[index] as { path: Array<string | number> };
+					const encodedId = String(key.path[key.path.length - 1]);
+					const id = Number(encodedId.slice('number:'.length));
+					rows.push({ id, handle: `row:${id}` });
+				}
+				return [rows];
+			}
+		})
+	});
+	const ids: number[] = [];
+	for (let id = 1; id <= 1001; id++) ids.push(id);
+
+	await assert.rejects(
+		() => datastore.getMany(meta, ids),
+		/requires readAt\(\) or a Datastore transaction to preserve one snapshot/
+	);
+	assert.deepEqual(lookupSizes, []);
+	const rows = await datastore.getMany(meta, ids, datastoreReadOptions({ readTime: 1_753_000_000_000 }));
+
+	assert.deepEqual(lookupSizes, [1000, 1]);
+	assert.deepEqual(lookupOptions, [
+		{ readTime: 1_753_000_000_000 },
+		{ readTime: 1_753_000_000_000 }
+	]);
+	assert.equal(rows.length, ids.length);
+	for (let index = 0; index < rows.length; index++) {
+		assert.deepEqual(rows[index], { id: index + 1, handle: `row:${index + 1}` });
+	}
+});
+
 test('Datastore key factory, ancestor query, and unindexed writes map to SDK calls', async () => {
 	const sdkKeys: unknown[] = [];
 	const queries: unknown[] = [];
@@ -5293,6 +5501,9 @@ test('Datastore continuation cursors round-trip SDK cursors and fail closed on s
 		limit() {
 			return this;
 		},
+		offset() {
+			return this;
+		},
 		start(cursor: string) {
 			starts[starts.length] = cursor;
 			return this;
@@ -5316,6 +5527,7 @@ test('Datastore continuation cursors round-trip SDK cursors and fail closed on s
 		or: [],
 		sort: [],
 		include: [],
+		offset: 3,
 		limit: 1
 	} satisfies QueryPlan;
 	let inheritedToJsonCalls = 0;
@@ -5336,14 +5548,48 @@ test('Datastore continuation cursors round-trip SDK cursors and fail closed on s
 	assert.equal(inheritedToJsonCalls, 0);
 	assert.equal(first.more, true);
 	assert.equal(typeof first.cursor, 'string');
-	assert.deepEqual(JSON.parse(Buffer.from(first.cursor!, 'base64url').toString('utf8')), {
-		v: 1,
-		kind: 'datastore',
-		cursor: 'sdk-cursor-1'
+	const cursorEnvelope = JSON.parse(Buffer.from(first.cursor!, 'base64url').toString('utf8'));
+	assert.deepEqual(Object.keys(cursorEnvelope).sort(), ['cursor', 'kind', 'query', 'v']);
+	assert.equal(cursorEnvelope.v, 2);
+	assert.equal(cursorEnvelope.kind, 'datastore');
+	assert.equal(cursorEnvelope.cursor, 'sdk-cursor-1');
+	assert.match(cursorEnvelope.query, /^[A-Za-z0-9_-]{43}$/);
+	const continuationPlan = { ...plan, offset: undefined };
+
+	const cursorCalls = runQueryCalls;
+	for (const incompatiblePlan of [
+		{ ...continuationPlan, where: [{ field: 'handle', op: '=' as const, value: 'other' }] },
+		{ ...continuationPlan, sort: [{ field: 'id', direction: 'asc' as const }] },
+		{ ...continuationPlan, select: ['handle'] }
+	]) {
+		await assert.rejects(
+			() => datastore.query(meta, { ...incompatiblePlan, cursor: first.cursor }),
+			/Invalid Datastore continuation cursor/
+		);
+	}
+	await assert.rejects(
+		() => datastore.query({ ...meta, name: 'different_datastore_model' }, { ...continuationPlan, cursor: first.cursor }),
+		/Invalid Datastore continuation cursor/
+	);
+	const projectAdapter = await createDatastoreStoreAdapter({
+		client: datastoreClient({ options: { projectId: 'different-project' } })
 	});
+	await assert.rejects(
+		() => projectAdapter.query(meta, { ...continuationPlan, cursor: first.cursor }),
+		/Invalid Datastore continuation cursor/
+	);
+	const namespaceAdapter = await createDatastoreStoreAdapter({
+		namespace: 'different-namespace',
+		client: datastoreClient()
+	});
+	await assert.rejects(
+		() => namespaceAdapter.query(meta, { ...continuationPlan, cursor: first.cursor }),
+		/Invalid Datastore continuation cursor/
+	);
+	assert.equal(runQueryCalls, cursorCalls);
 
 	response = [[], { moreResults: 'MORE_RESULTS_AFTER_LIMIT', endCursor: 'sdk-cursor-1' }];
-	const terminal = await datastore.query(meta, { ...plan, cursor: first.cursor });
+	const terminal = await datastore.query(meta, { ...continuationPlan, limit: 2, cursor: first.cursor });
 	assert.deepEqual(terminal.list, []);
 	assert.equal(terminal.more, false);
 	assert.equal(terminal.cursor, undefined);
@@ -5354,7 +5600,7 @@ test('Datastore continuation cursors round-trip SDK cursors and fail closed on s
 		endCursor: 'sdk-cursor-1'
 	}];
 	await assert.rejects(
-		() => datastore.query(meta, { ...plan, cursor: first.cursor }),
+		() => datastore.query(meta, { ...continuationPlan, cursor: first.cursor }),
 		/repeated non-empty page cursor/
 	);
 
@@ -5365,13 +5611,14 @@ test('Datastore continuation cursors round-trip SDK cursors and fail closed on s
 	);
 
 	const invalidVersion = Buffer.from(JSON.stringify({
-		v: 2,
+		v: 3,
 		kind: 'datastore',
+		query: cursorEnvelope.query,
 		cursor: 'sdk-cursor-1'
 	}), 'utf8').toString('base64url');
 	const callsBeforeInvalidCursor = runQueryCalls;
 	await assert.rejects(
-		() => datastore.query(meta, { ...plan, cursor: invalidVersion }),
+		() => datastore.query(meta, { ...continuationPlan, cursor: invalidVersion }),
 		/Invalid Datastore continuation cursor/
 	);
 	assert.equal(runQueryCalls, callsBeforeInvalidCursor);
@@ -5382,12 +5629,78 @@ test('Datastore continuation cursors round-trip SDK cursors and fail closed on s
 	});
 	await assert.rejects(
 		() => fallback.query(meta, {
-			...plan,
+			...continuationPlan,
 			where: [{ field: 'handle', op: '!=', value: 'other' }],
 			cursor: first.cursor
 		}),
 		/continuation cursors are not supported with query scan fallback/
 	);
+});
+
+test('Datastore resolves SDK project ids and binds injected-client cursors to configured projects', async () => {
+	const queryBuilder = () => ({
+		limit() { return this; },
+		start() { return this; }
+	});
+	const previousProject = process.env.GOOGLE_CLOUD_PROJECT;
+	process.env.GOOGLE_CLOUD_PROJECT = 'adc-project';
+	try {
+		const sdkClient = await createDatastoreStoreAdapter();
+		assert.equal(sdkClient.datastoreProjectId, 'adc-project');
+	} finally {
+		if (previousProject === undefined) delete process.env.GOOGLE_CLOUD_PROJECT;
+		else process.env.GOOGLE_CLOUD_PROJECT = previousProject;
+	}
+
+	let firstProjectLookupCalled = false;
+	const first = await createDatastoreStoreAdapter({
+		client: datastoreClient({
+			options: { projectId: 'injected-project-a' },
+			async getProjectId() {
+				firstProjectLookupCalled = true;
+				return 'ignored-project-a';
+			},
+			createQuery: queryBuilder,
+			runQuery: async () => [[{ id: 1, handle: 'one' }], {
+				moreResults: 'MORE_RESULTS_AFTER_LIMIT',
+				endCursor: 'adc-project-cursor'
+			}]
+		})
+	});
+	assert.equal(firstProjectLookupCalled, false);
+	assert.equal(first.datastoreProjectId, 'injected-project-a');
+	const page = await first.query(meta, {
+		where: [],
+		or: [],
+		sort: [],
+		include: [],
+		limit: 1
+	});
+	assert.equal(typeof page.cursor, 'string');
+
+	let secondBackendCalls = 0;
+	const second = await createDatastoreStoreAdapter({
+		client: datastoreClient({
+			options: { projectId: 'injected-project-b' },
+			createQuery: queryBuilder,
+			runQuery: async () => {
+				secondBackendCalls++;
+				return [[], { moreResults: 'NO_MORE_RESULTS' }];
+			}
+		})
+	});
+	await assert.rejects(
+		() => second.query(meta, {
+			where: [],
+			or: [],
+			sort: [],
+			include: [],
+			limit: 1,
+			cursor: page.cursor
+		}),
+		/Invalid Datastore continuation cursor/
+	);
+	assert.equal(secondBackendCalls, 0);
 });
 
 test('Datastore offset queries map to SDK offset before limit', async () => {
@@ -5735,7 +6048,7 @@ test('Datastore native key encoding passes typed ids to SDK key paths', async ()
 	await datastore.delete(meta, 17);
 	await assert.rejects(
 		() => datastore.get(meta, 0),
-		/must be a positive integer for native Datastore key encoding/
+		/cannot be zero for native Datastore key encoding/
 	);
 	await assert.rejects(
 		() => datastore.query(ancestorMeta, {
@@ -5745,7 +6058,7 @@ test('Datastore native key encoding passes typed ids to SDK key paths', async ()
 			include: [],
 			meta: { datastoreAncestor: datastoreKey('parent_record', 0, { namespace: 'tenant' }) }
 		}),
-		/must be a positive integer for native Datastore key encoding/
+		/cannot be zero for native Datastore key encoding/
 	);
 	await datastore.delete(meta, '0');
 
@@ -5873,7 +6186,7 @@ test('Datastore native key encoding preserves numeric ids, string names, and log
 	});
 	await assert.rejects(
 		() => zeroIdAdapter.get(meta, 1),
-		/must be a positive integer for native Datastore key encoding/
+		/cannot be zero for native Datastore key encoding/
 	);
 });
 
@@ -11886,6 +12199,94 @@ test('Google direct query paths ignore patched Array transforms', async () => {
 	assert.deepEqual(datastoreSelects, []);
 });
 
+test('Datastore portable scalar filters run before offset and limit across candidate pages', async () => {
+	const scalarMeta: ResolvedModelMeta<any> = {
+		...meta,
+		name: 'datastore_scalar_record'
+	};
+	const rows = [
+		{ id: 1, handle: 'array', value: [5] },
+		{ id: 2, handle: 'five-a', value: 5 },
+		{ id: 3, handle: 'six', value: 6 },
+		{ id: 4, handle: 'seven', value: 7 },
+		{ id: 5, handle: 'missing' },
+		{ id: 6, handle: 'null', value: null },
+		{ id: 8, handle: 'five-b', value: 5 },
+		{ id: 9, handle: 'five-c', value: 5 }
+	];
+	const conditions: QueryPlan['where'] = [
+		{ field: 'value', op: '=', value: 5 },
+		{ field: 'value', op: 'in', value: [5, 6, 7] },
+		{ field: 'value', op: '>', value: 5 },
+		{ field: 'value', op: '>=', value: 5 },
+		{ field: 'value', op: '<', value: 7 },
+		{ field: 'value', op: '<=', value: 6 },
+		{ field: 'value', op: 'between', value: 5, value2: 7 },
+		{ field: 'value', op: '!=', value: 5 },
+		{ field: 'value', op: 'isNull', value: undefined },
+		{ field: 'value', op: 'isNotNull', value: undefined }
+	];
+	for (const condition of conditions) {
+		const filters: unknown[][] = [];
+		const limits: number[] = [];
+		const offsets: number[] = [];
+		const starts: string[] = [];
+		let page = 0;
+		const datastore = await createDatastoreStoreAdapter({
+			allowQueryScanFallback: true,
+			client: datastoreClient({
+				createQuery: () => ({
+					filter(field: unknown, op: unknown, value: unknown) {
+						filters.push([field, op, value]);
+						return this;
+					},
+					limit(value: number) {
+						limits.push(value);
+						return this;
+					},
+					offset(value: number) {
+						offsets.push(value);
+						return this;
+					},
+					start(cursor: string) {
+						starts.push(cursor);
+						return this;
+					}
+				}),
+				runQuery: async () => page++ === 0
+					? [rows.slice(0, 4), { moreResults: 'MORE_RESULTS_AFTER_LIMIT', endCursor: 'scalar-page-2' }]
+					: [rows.slice(4), { moreResults: 'NO_MORE_RESULTS' }]
+			})
+		});
+		const memory = new MemoryStoreAdapter();
+		await memory.seed(scalarMeta, rows);
+		const plan: QueryPlan = {
+			where: [condition],
+			or: [],
+			sort: [],
+			include: [],
+			offset: 1,
+			limit: 2
+		};
+
+		const [datastoreResult, memoryResult] = await Promise.all([
+			datastore.query(scalarMeta, plan),
+			memory.query(scalarMeta, plan)
+		]);
+
+		assert.deepEqual(datastoreResult.list, memoryResult.list, condition.op);
+		assert.deepEqual(offsets, [], condition.op);
+		assert.deepEqual(starts, ['scalar-page-2'], condition.op);
+		if (condition.op === '!=' || condition.op === 'isNull' || condition.op === 'isNotNull') {
+			assert.deepEqual(filters, [], condition.op);
+			assert.deepEqual(limits, [500], condition.op);
+		} else {
+			assert.equal(filters.length > 0, true, condition.op);
+			assert.deepEqual(limits, [], condition.op);
+		}
+	}
+});
+
 test('Datastore portable select avoids native projection semantics', async () => {
 	const calls: string[] = [];
 	const seenAt = new Date('2026-07-17T00:00:00.000Z');
@@ -12350,6 +12751,7 @@ test('Datastore query scan fallback reads all pages before filtering and aggrega
 	const aggregate = await datastore.aggregate!(typedMeta, {
 		where: [{ field: 'optionalMarker', op: '!=', value: null }],
 		or: [],
+		meta: datastoreReadOptions({ readTime: 1_753_000_000_000 }).meta,
 		aggregates: [
 			{ op: 'count', as: 'count' },
 			{ op: 'sum', field: 'score', as: 'totalScore' }
@@ -13020,6 +13422,7 @@ test('Datastore aggregate scan fallback is explicit and avoids projection querie
 	const result = await datastore.aggregate!(typedMeta, {
 		where: [{ field: 'handle', op: 'in', value: ['one', 'two'] }],
 		or: [],
+		meta: datastoreReadOptions({ readTime: 1_753_000_000_000 }).meta,
 		aggregates: [
 			{ op: 'count', as: 'count' },
 			{ op: 'sum', field: 'score', as: 'totalScore' },
@@ -13109,11 +13512,14 @@ test('Datastore aggregate fallback preserves ancestor fields without native proj
 	assert.deepEqual(calls, []);
 });
 
-test('Datastore aggregate combines SDK aggregation and typed min max queries', async () => {
+test('Datastore aggregate rejects SDK and min max combinations that would mix snapshots', async () => {
 	const calls: string[] = [];
 	const typedMeta: ResolvedModelMeta<GoogleRegressionData> = {
 		...meta,
-		fieldTypes: new Map([['score', 'number']])
+		fieldTypes: new Map([
+			['handle', 'string'],
+			['score', 'number']
+		])
 	};
 	const datastore = await createDatastoreStoreAdapter({
 		client: datastoreClient({
@@ -13140,24 +13546,33 @@ test('Datastore aggregate combines SDK aggregation and typed min max queries', a
 			},
 			createAggregationQuery: () => {
 				calls[calls.length] = 'createAggregationQuery';
+				const specs: Array<{ op: 'count' | 'sum' | 'avg'; alias: string }> = [];
 				return {
+					specs,
 					count(alias: string) {
 						calls[calls.length] = `count:${alias}`;
+						specs[specs.length] = { op: 'count', alias };
 						return this;
 					},
 					sum(field: string, alias: string) {
 						calls[calls.length] = `sum:${field}:${alias}`;
+						specs[specs.length] = { op: 'sum', alias };
 						return this;
 					},
 					average(field: string, alias: string) {
 						calls[calls.length] = `average:${field}:${alias}`;
+						specs[specs.length] = { op: 'avg', alias };
 						return this;
 					}
 				};
 			},
-			runAggregationQuery: async () => {
+			runAggregationQuery: async (query: { specs: Array<{ op: 'count' | 'sum' | 'avg'; alias: string }> }) => {
 				calls[calls.length] = 'runAggregationQuery';
-				return [[{ count: 2, total: 50, average: 25 }], {}];
+				const row: Record<string, number> = {};
+				for (const spec of query.specs) {
+					row[spec.alias] = spec.op === 'count' ? 2 : spec.op === 'sum' ? 50 : 25;
+				}
+				return [[row], {}];
 			},
 			runQuery: async () => {
 				calls[calls.length] = 'runQuery';
@@ -13167,8 +13582,8 @@ test('Datastore aggregate combines SDK aggregation and typed min max queries', a
 	});
 
 	assert.equal(datastore.capabilities?.aggregate, true);
-	assert.deepEqual(
-		await datastore.aggregate!(typedMeta, {
+	await assert.rejects(
+		() => datastore.aggregate!(typedMeta, {
 			where: [{ field: 'handle', op: 'in', value: ['alpha', 'beta'] }],
 			or: [],
 			aggregates: [
@@ -13178,24 +13593,215 @@ test('Datastore aggregate combines SDK aggregation and typed min max queries', a
 				{ op: 'max', field: 'score', as: 'maxScore' }
 			]
 		}),
-		{ count: 2, total: 50, average: 25, maxScore: 30 }
+		/multiple backend queries with different snapshots/
 	);
-	assert.deepEqual(calls, [
-		'createQuery:google_regression_record',
-		'filter:handle:IN:["alpha","beta"]',
-		'createAggregationQuery',
-		'count:count',
-		'sum:score:total',
-		'average:score:average',
-		'runAggregationQuery',
-		'createQuery:google_regression_record',
-		'filter:handle:IN:["alpha","beta"]',
-		'filter:score:!=:null',
-		'order:score:desc',
-		'limit:1',
-		'select:["id","score"]',
-		'runQuery'
-	]);
+	assert.deepEqual(calls, []);
+});
+
+test('Datastore native aggregates combine different fields in one backend request', async () => {
+	const aggregateGroups: string[][] = [];
+	const aggregateMeta: ResolvedModelMeta<any> = {
+		...meta,
+		name: 'datastore_multi_aggregate_record',
+		fieldTypes: new Map([
+			['left', 'number'],
+			['right', 'number']
+		])
+	};
+	const datastore = await createDatastoreStoreAdapter({
+		client: datastoreClient({
+			createAggregationQuery: () => {
+				const specs: Array<{ op: string; field?: string; alias: string }> = [];
+				return {
+					specs,
+					count(alias: string) {
+						specs.push({ op: 'count', alias });
+						return this;
+					},
+					sum(field: string, alias: string) {
+						specs.push({ op: 'sum', field, alias });
+						return this;
+					},
+					average(field: string, alias: string) {
+						specs.push({ op: 'avg', field, alias });
+						return this;
+					}
+				};
+			},
+			runAggregationQuery: async (query: { specs: Array<{ op: string; field?: string; alias: string }> }) => {
+				aggregateGroups.push(query.specs.map((spec) => `${spec.op}:${spec.field ?? '-'}:${spec.alias}`));
+				const row: Record<string, number> = {};
+				for (const spec of query.specs) {
+					if (spec.op === 'count') row[spec.alias] = 2;
+					else if (spec.field === 'left' && spec.op === 'sum') row[spec.alias] = 10;
+					else if (spec.field === 'left') row[spec.alias] = 10;
+					else row[spec.alias] = 20;
+				}
+				return [[row], {}];
+			}
+		})
+	});
+
+	assert.deepEqual(
+		await datastore.aggregate!(aggregateMeta, {
+			where: [],
+			or: [],
+			aggregates: [
+				{ op: 'count', as: 'count' },
+				{ op: 'sum', field: 'left', as: 'leftTotal' },
+				{ op: 'avg', field: 'left', as: 'leftAverage' },
+				{ op: 'sum', field: 'right', as: 'rightTotal' }
+			]
+		}),
+		{ count: 2, leftTotal: 10, leftAverage: 10, rightTotal: 20 }
+	);
+	assert.deepEqual(aggregateGroups, [[
+		'count:-:count',
+		'sum:left:leftTotal',
+		'avg:left:leftAverage',
+		'sum:right:rightTotal'
+	]]);
+});
+
+test('Datastore native aggregates keep compatible specs in one backend request', async () => {
+	const groups: string[][] = [];
+	const aggregateMeta: ResolvedModelMeta<any> = {
+		...meta,
+		name: 'datastore_single_aggregate_request_record',
+		fieldTypes: new Map([['score', 'number']])
+	};
+	const datastore = await createDatastoreStoreAdapter({
+		client: datastoreClient({
+			createAggregationQuery: () => {
+				const specs: string[] = [];
+				return {
+					specs,
+					sum(field: string, alias: string) {
+						specs.push(`sum:${field}:${alias}`);
+						return this;
+					},
+					average(field: string, alias: string) {
+						specs.push(`avg:${field}:${alias}`);
+						return this;
+					}
+				};
+			},
+			runAggregationQuery: async (query: { specs: string[] }) => {
+				groups.push([...query.specs]);
+				return [[{ total: 30, average: 15 }], {}];
+			}
+		})
+	});
+
+	assert.deepEqual(await datastore.aggregate!(aggregateMeta, {
+		where: [],
+		or: [],
+		aggregates: [
+			{ op: 'sum', field: 'score', as: 'total' },
+			{ op: 'avg', field: 'score', as: 'average' }
+		]
+	}), { total: 30, average: 15 });
+	assert.deepEqual(groups, [['sum:score:total', 'avg:score:average']]);
+});
+
+test('Datastore multi-aggregate scan fallback requires a fixed snapshot and enforces five specs', async () => {
+	let backendCalls = 0;
+	const readOptions: unknown[] = [];
+	const datastore = await createDatastoreStoreAdapter({
+		allowAggregateScanFallback: true,
+		client: datastoreClient({
+			runQuery: async (_query: unknown, options: unknown) => {
+				backendCalls++;
+				readOptions.push(options);
+				return [[
+					{ id: 1, handle: 'one', score: 10 },
+					{ id: 2, handle: 'two', score: 20 }
+				], { moreResults: 'NO_MORE_RESULTS' }];
+			}
+		})
+	});
+	const aggregates: AggregatePlan['aggregates'] = [
+		{ op: 'count', as: 'count' },
+		{ op: 'sum', field: 'score', as: 'total' }
+	];
+
+	await assert.rejects(
+		() => datastore.aggregate!(meta, { where: [], or: [], aggregates }),
+		/requires readAt\(\) or a Datastore transaction to preserve one snapshot/
+	);
+	assert.equal(backendCalls, 0);
+	const readTime = 1_753_000_000_000;
+	assert.deepEqual(await datastore.aggregate!(meta, {
+		where: [],
+		or: [],
+		aggregates,
+		meta: datastoreReadOptions({ readTime }).meta
+	}), { count: 2, total: 30 });
+	assert.deepEqual(readOptions, [{ readTime }]);
+
+	await assert.rejects(
+		() => datastore.aggregate!(meta, {
+			where: [],
+			or: [],
+			aggregates: [
+				{ op: 'count', as: 'a' },
+				{ op: 'count', as: 'b' },
+				{ op: 'count', as: 'c' },
+				{ op: 'count', as: 'd' },
+				{ op: 'count', as: 'e' },
+				{ op: 'count', as: 'f' }
+			]
+		}),
+		/supports at most 5 aggregate fields/
+	);
+	assert.equal(backendCalls, 1);
+});
+
+test('Datastore numeric native aggregates require a declared number field or explicit scan validation', async () => {
+	let nativeCalls = 0;
+	const untypedMeta: ResolvedModelMeta<any> = {
+		...meta,
+		name: 'datastore_untyped_aggregate_record'
+	};
+	const native = await createDatastoreStoreAdapter({
+		client: datastoreClient({
+			createAggregationQuery: () => {
+				nativeCalls++;
+				return {};
+			},
+			runAggregationQuery: async () => {
+				nativeCalls++;
+				return [[{ total: 1 }], {}];
+			}
+		})
+	});
+	await assert.rejects(
+		() => native.aggregate!(untypedMeta, {
+			where: [],
+			or: [],
+			aggregates: [{ op: 'sum', field: 'score', as: 'total' }]
+		}),
+		/requires number fieldType metadata or allowAggregateScanFallback: true/
+	);
+	assert.equal(nativeCalls, 0);
+
+	const scan = await createDatastoreStoreAdapter({
+		allowAggregateScanFallback: true,
+		client: datastoreClient({
+			runQuery: async () => [[
+				{ id: 1, handle: 'valid', score: 10 },
+				{ id: 2, handle: 'invalid', score: 'not-a-number' }
+			], { moreResults: 'NO_MORE_RESULTS' }]
+		})
+	});
+	await assert.rejects(
+		() => scan.aggregate!(untypedMeta, {
+			where: [],
+			or: [],
+			aggregates: [{ op: 'sum', field: 'score', as: 'total' }]
+		}),
+		/Aggregate "total" expected numeric values in field "score"/
+	);
 });
 
 test('Datastore aggregate validates SDK aggregation result containers', async () => {

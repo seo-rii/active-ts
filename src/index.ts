@@ -1,5 +1,11 @@
 export * from './core/types.js';
 export * from './core/errors.js';
+export {
+	datastoreInt64Id,
+	datastoreInt64IdValue,
+	isDatastoreInt64Id,
+	type DatastoreInt64Id
+} from './core/datastore-int64-id.js';
 export * from './core/cursor.js';
 export { applyModelMeta, getModelMeta } from './core/metadata.js';
 export * from './core/define-model.js';

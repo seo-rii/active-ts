@@ -1,5 +1,6 @@
 import { ActiveTsValidationError } from './errors.js';
 import type { EntityId } from './types.js';
+import { isDatastoreInt64Id } from './datastore-int64-id.js';
 import { dateTime } from './date-intrinsics.js';
 import {
 	SET_ADD,
@@ -178,6 +179,7 @@ export function assertDenseArrayItems(array: readonly unknown[], context = 'arra
 }
 
 export function assertSafeEntityId(id: unknown, context = 'Entity id'): asserts id is EntityId {
+	if (isDatastoreInt64Id(id)) return;
 	if (typeof id === 'string') {
 		if (!id) throw new ActiveTsValidationError(`${context} cannot be an empty string.`);
 		if (Buffer.byteLength(id, 'utf8') > MAX_ENTITY_ID_BYTES) {

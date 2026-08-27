@@ -6,6 +6,11 @@ import {
 } from './safe-keys.js';
 import { SET_ADD, SET_HAS, WEAKSET_ADD, WEAKSET_HAS } from './collection-intrinsics.js';
 import { entityIdFromCanonicalKey, entityIdFromKey, entityIdKey } from './query-utils.js';
+import {
+	datastoreInt64Id,
+	isDatastoreInt64Id,
+	type DatastoreInt64Id
+} from './datastore-int64-id.js';
 import type { DatastoreKey, DatastoreKeyPart, EntityId } from './types.js';
 
 export type DatastoreAncestorMetadata = {
@@ -191,9 +196,9 @@ export function datastoreKeyWithNamespace(
 export function datastoreKeyPathValues(
 	key: DatastoreKey,
 	keyEncoding: DatastoreKeyEncoding = 'active-ts'
-): Array<string | number> {
+): Array<string | number | DatastoreInt64Id> {
 	const safeKey = normalizeDatastoreKey(key);
-	const path: Array<string | number> = [];
+	const path: Array<string | number | DatastoreInt64Id> = [];
 	for (let index = 0; index < safeKey.path.length; index++) {
 		const part = safeKey.path[index];
 		path[path.length] = part.kind;
@@ -206,10 +211,30 @@ export function datastoreKeyPathValues(
 
 export function assertNativeDatastoreEntityId(value: EntityId, context: string): EntityId {
 	assertSafeEntityId(value, context);
-	if (typeof value === 'number' && value <= 0) {
-		throw new ActiveTsValidationError(`${context} must be a positive integer for native Datastore key encoding.`);
+	if (isDatastoreInt64Id(value)) return value;
+	if (typeof value === 'number' && value === 0) {
+		throw new ActiveTsValidationError(`${context} cannot be zero for native Datastore key encoding.`);
 	}
 	return value;
+}
+
+export function datastoreEntityIdFromNativeNumeric(value: string | number, context: string): EntityId {
+	if (typeof value === 'number') return assertNativeDatastoreEntityId(value, context);
+	if (!/^-?(0|[1-9]\d*)$/.test(value) || value === '-0') {
+		throw new ActiveTsValidationError(`${context} must be a canonical Datastore integer.`);
+	}
+	let parsed: bigint;
+	try {
+		parsed = BigInt(value);
+	} catch {
+		throw new ActiveTsValidationError(`${context} must be a canonical Datastore integer.`);
+	}
+	if (parsed >= BigInt(Number.MIN_SAFE_INTEGER) && parsed <= BigInt(Number.MAX_SAFE_INTEGER)) {
+		const id = Number(parsed);
+		assertNativeDatastoreEntityId(id, context);
+		return id;
+	}
+	return datastoreInt64Id(value);
 }
 
 export function datastoreAncestorFromEntityKey(
@@ -246,16 +271,8 @@ export function datastoreAncestorFromEntityKey(
 				}
 				assertSafeEntityId(name, `${partContext}.name`);
 				id = name;
-			} else if (typeof rawId === 'number') {
-				assertSafeEntityId(rawId, `${partContext}.id`);
-				id = rawId;
-			} else if (typeof rawId === 'string' && /^-?(0|[1-9]\d*)$/.test(rawId)) {
-				const parsed = Number(rawId);
-				assertSafeEntityId(parsed, `${partContext}.id`);
-				if (String(parsed) !== rawId) {
-					throw new ActiveTsValidationError(`${partContext}.id must be canonical.`);
-				}
-				id = parsed;
+			} else if (typeof rawId === 'number' || typeof rawId === 'string') {
+				id = datastoreEntityIdFromNativeNumeric(rawId, `${partContext}.id`);
 			} else {
 				throw new ActiveTsValidationError(`${partContext}.id must be a number or canonical integer string.`);
 			}

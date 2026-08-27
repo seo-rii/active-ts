@@ -659,6 +659,9 @@ function buildRepairOperation(
 		: payload.value;
 	assertSafeEntityId(replacementId, 'Datastore ID repair replacementId');
 	if (policy === 'payload-wins') {
+		if (typeof replacementId === 'number' && replacementId <= 0) {
+			throw new ActiveTsValidationError('Datastore ID repair target key ID must be a positive integer.');
+		}
 		assertNativeDatastoreEntityId(replacementId, 'Datastore ID repair target key ID');
 	}
 	const target = policy === 'key-wins'

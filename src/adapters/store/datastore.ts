@@ -1,4 +1,5 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomInt, randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import { optionalImport } from '../../core/optional-import.js';
 import {
 	ActiveTsConfigurationError,
@@ -53,6 +54,7 @@ import {
 import {
 	assertNativeDatastoreEntityId,
 	datastoreAncestorFromEntityKey,
+	datastoreEntityIdFromNativeNumeric,
 	datastoreEntityKeyNamespace,
 	datastoreKeyIdentity,
 	datastoreKeyPathValues,
@@ -62,6 +64,13 @@ import {
 	type DatastoreReadPolicy,
 	type DatastoreKeyEncoding
 } from '../../core/datastore-key.js';
+import { datastoreInt64IdValue, isDatastoreInt64Id } from '../../core/datastore-int64-id.js';
+export {
+	datastoreInt64Id,
+	datastoreInt64IdValue,
+	isDatastoreInt64Id,
+	type DatastoreInt64Id
+} from '../../core/datastore-int64-id.js';
 import { datastoreSchemaAncestorModes, normalizeSchemaModels } from '../../core/schema-utils.js';
 import { normalizeStoreSchemaApplyOptions } from '../../core/schema-options.js';
 import { normalizeAggregatePlanFieldTypes, normalizeQueryPlanFieldTypes } from '../../core/field-types.js';
@@ -92,6 +101,7 @@ import {
 	WEAKMAP_GET,
 	WEAKMAP_SET,
 	WEAKSET_ADD,
+	WEAKSET_DELETE,
 	WEAKSET_HAS
 } from '../../core/collection-intrinsics.js';
 import type {
@@ -234,6 +244,10 @@ export type DatastoreTransactionNativeOptions = {
 	gaxOptions?: Record<string, unknown>;
 	commitGaxOptions?: Record<string, unknown>;
 	rollbackGaxOptions?: Record<string, unknown>;
+	maxAttempts?: number;
+	retryInitialDelayMs?: number;
+	retryMaxDelayMs?: number;
+	retryJitter?: boolean;
 };
 export type DatastoreStoreTransactionOptions = Omit<StoreTransactionOptions, 'native'> & {
 	native?: DatastoreTransactionNativeOptions;
@@ -407,7 +421,15 @@ const DATASTORE_NAMESPACE_FACTORY_OPTION_KEYS = [
 	'allowQueryScanFallback',
 	'requireAncestorTransactionQueries'
 ] as const;
-const DATASTORE_TRANSACTION_NATIVE_OPTION_KEYS = ['gaxOptions', 'commitGaxOptions', 'rollbackGaxOptions'] as const;
+const DATASTORE_TRANSACTION_NATIVE_OPTION_KEYS = [
+	'gaxOptions',
+	'commitGaxOptions',
+	'rollbackGaxOptions',
+	'maxAttempts',
+	'retryInitialDelayMs',
+	'retryMaxDelayMs',
+	'retryJitter'
+] as const;
 const DATASTORE_BULK_MUTATION_OPTION_KEYS = ['atomic', 'chunkSize'] as const;
 const DATASTORE_BULK_UPSERT_ENTRY_KEYS = ['id', 'data', 'options'] as const;
 const DATASTORE_BULK_DELETE_ENTRY_KEYS = ['id', 'options'] as const;
@@ -421,6 +443,15 @@ const DATASTORE_ID_INVENTORY_OPTION_KEYS = [
 	'onIssue'
 ] as const;
 const DATASTORE_SCAN_FALLBACK_PAGE_SIZE = 500;
+const DATASTORE_LOOKUP_MAX_KEYS = 1000;
+const DATASTORE_AGGREGATE_MAX_SPECS = 5;
+const DATASTORE_MAX_ENTITY_BYTES = 1_048_572;
+const DATASTORE_SAFE_BULK_REQUEST_BYTES = 8 * 1024 * 1024;
+const DATASTORE_BULK_REQUEST_OVERHEAD_BYTES = 4 * 1024;
+const DATASTORE_BULK_MUTATION_OVERHEAD_BYTES = 64;
+const DATASTORE_RETRY_INITIAL_DELAY_MS = 25;
+const DATASTORE_RETRY_MAX_DELAY_MS = 1000;
+const DATASTORE_RETRY_DELAY_LIMIT_MS = 60_000;
 const DATASTORE_SCAN_FALLBACK_INCOMPLETE_RESULTS = new WeakSet<object>();
 const DATASTORE_CLIENT_CACHE_SCOPE_IDS = new WeakMap<object, string>();
 
@@ -530,20 +561,18 @@ function keyId(entity: any, keySymbol: symbol, keyEncoding: DatastoreKeyEncoding
 	}
 	if (id === undefined) return undefined;
 	if (typeof id === 'number') {
-		if (keyEncoding === 'native') return assertNativeDatastoreEntityId(id, 'Datastore entity key id');
+		if (keyEncoding === 'native') return datastoreEntityIdFromNativeNumeric(id, 'Datastore entity key id');
 		assertSafeEntityId(id, 'Datastore entity key id');
 		return id;
 	}
 	if (typeof id === 'string') {
+		if (keyEncoding === 'native') return datastoreEntityIdFromNativeNumeric(id, 'Datastore entity key id');
 		if (!/^-?(0|[1-9]\d*)$/.test(id)) {
 			throw new ActiveTsValidationError('Datastore entity key id must be a canonical integer string.');
 		}
 		const parsed = Number(id);
-		if (keyEncoding === 'native') assertNativeDatastoreEntityId(parsed, 'Datastore entity key id');
-		else assertSafeEntityId(parsed, 'Datastore entity key id');
-		if (String(parsed) !== id) {
-			throw new ActiveTsValidationError('Datastore entity key id must be canonical.');
-		}
+		assertSafeEntityId(parsed, 'Datastore entity key id');
+		if (String(parsed) !== id) throw new ActiveTsValidationError('Datastore entity key id must be canonical.');
 		return parsed;
 	}
 	throw new ActiveTsValidationError('Datastore entity key id must be a number or numeric string.');
@@ -615,6 +644,41 @@ function applyDatastoreWhere(query: any, where: QueryPlan['where'][number]) {
 	if (where.op === 'startsWith')
 		throw new ActiveTsConfigurationError('Datastore adapter does not support safe startsWith queries.');
 	return datastoreMethod(query, 'filter', 'Datastore query.filter')(field, where.op, where.value);
+}
+
+function datastorePlanNeedsPortableScalarFilter(model: ResolvedModelMeta, plan: Pick<QueryPlan, 'where'>) {
+	for (let index = 0; index < plan.where.length; index++) {
+		const condition = plan.where[index];
+		if (condition.field === model.idField) continue;
+		const op = condition.op;
+		if (op !== 'isNull' && MAP_HAS.call(model.fieldTypes, condition.field)) continue;
+		if (
+			op === '=' || op === '!=' || op === 'in' || op === 'between' ||
+			op === '>' || op === '>=' || op === '<' || op === '<=' ||
+			op === 'isNull' || op === 'isNotNull'
+		) return true;
+	}
+	return false;
+}
+
+function datastorePlanRequiresPortableFullScan(model: ResolvedModelMeta, plan: Pick<QueryPlan, 'where'>) {
+	for (let index = 0; index < plan.where.length; index++) {
+		const condition = plan.where[index];
+		if (condition.field === model.idField) continue;
+		if (condition.op === 'isNull') return true;
+		if (MAP_HAS.call(model.fieldTypes, condition.field)) continue;
+		if (condition.op === '!=' || condition.op === 'isNotNull') return true;
+	}
+	return false;
+}
+
+function datastoreNativeAggregateFiltersAreSafe(model: ResolvedModelMeta, plan: Pick<AggregatePlan, 'where'>) {
+	for (let index = 0; index < plan.where.length; index++) {
+		const condition = plan.where[index];
+		if (condition.field === model.idField) continue;
+		if (datastorePlanNeedsPortableScalarFilter(model, { where: [condition] })) return false;
+	}
+	return true;
 }
 
 function normalizeDatastoreEntity(entity: any, keySymbol: symbol) {
@@ -1219,23 +1283,15 @@ export async function createDatastoreStoreAdapter(options: DatastoreStoreOptions
 	const datastoreKeySymbol = configuredKeySymbol ?? await resolveDatastoreKeySymbol();
 	const supportsKeyOnlyProjection = configuredKeySymbol !== undefined;
 	const transactionFactory = datastoreOptionalMethod(rawClient, 'transaction', 'Datastore adapter client.transaction');
-	const datastoreProjectId = readDatastoreProjectId(rawClient);
+	const datastoreProjectId = injectedClient
+		? readConfiguredDatastoreProjectId(rawClient)
+		: await resolveDatastoreProjectId(rawClient);
 	const datastoreDatabaseId = readDatastoreDatabaseId(rawClient);
 	if (options.cacheScope === undefined) {
-		const projectId = !injectedClient && options.datastoreOptions
-			? ownFactoryOptionValue(options.datastoreOptions, 'projectId', 'Datastore adapter datastoreOptions')
-			: undefined;
-		const databaseId = !injectedClient && options.datastoreOptions
-			? ownFactoryOptionValue(options.datastoreOptions, 'databaseId', 'Datastore adapter datastoreOptions')
-			: undefined;
-		if (projectId !== undefined && (typeof projectId !== 'string' || !projectId || projectId.includes('\0'))) {
-			throw new ActiveTsConfigurationError('Datastore adapter projectId must be a non-empty string without null bytes.');
-		}
-		if (databaseId !== undefined && (typeof databaseId !== 'string' || !databaseId || databaseId.includes('\0'))) {
-			throw new ActiveTsConfigurationError('Datastore adapter databaseId must be a non-empty string without null bytes.');
-		}
+		const projectId = datastoreProjectId;
+		const databaseId = datastoreDatabaseId;
 		let clientIdentity: string | undefined;
-		if (injectedClient || projectId === undefined) {
+		if (projectId === undefined || databaseId === undefined) {
 			clientIdentity = WEAKMAP_GET.call(DATASTORE_CLIENT_CACHE_SCOPE_IDS, rawClient) as string | undefined;
 			if (clientIdentity === undefined) {
 				clientIdentity = randomUUID();
@@ -1243,7 +1299,11 @@ export async function createDatastoreStoreAdapter(options: DatastoreStoreOptions
 			}
 		}
 		const projectPart = projectId === undefined ? '-' : `${projectId.length}:${projectId}`;
-		const databasePart = databaseId === undefined ? '-' : `${databaseId.length}:${databaseId}`;
+		const databasePart = databaseId === undefined
+			? '-'
+			: databaseId === null
+				? 'default'
+				: `${databaseId.length}:${databaseId}`;
 		const namespacePart = options.namespace === undefined ? '-' : `${options.namespace.length}:${options.namespace}`;
 		const clientPart = clientIdentity === undefined ? '-' : `${clientIdentity.length}:${clientIdentity}`;
 		const keyEncodingPart = keyEncoding === 'native' ? '|keyEncoding=6:native' : '';
@@ -1405,7 +1465,21 @@ function createDatastoreAdapter(
 		if (namespace !== undefined && options.namespace !== undefined && namespace !== options.namespace) {
 			throw new ActiveTsConfigurationError('Datastore key namespace must match adapter namespace.');
 		}
-		return rootClient.key({ path, namespace: namespace ?? options.namespace });
+		const sdkPath: unknown[] = [];
+		for (let index = 0; index < path.length; index++) {
+			const part = path[index];
+			if (!isDatastoreInt64Id(part)) {
+				sdkPath[index] = part;
+				continue;
+			}
+			if (!rootClient.int) {
+				throw new ActiveTsConfigurationError(
+					'Datastore native int64 ids require client.int() support from @google-cloud/datastore.'
+				);
+			}
+			sdkPath[index] = rootClient.int(datastoreInt64IdValue(part));
+		}
+		return rootClient.key({ path: sdkPath, namespace: namespace ?? options.namespace });
 	};
 	const assertAncestorNamespace = (ancestor: DatastoreKey | undefined) => {
 		if (ancestor?.namespace !== undefined && options.namespace !== undefined && ancestor.namespace !== options.namespace) {
@@ -1413,7 +1487,12 @@ function createDatastoreAdapter(
 		}
 	};
 	const entityKeyPath = (model: ResolvedModelMeta, id: EntityId, ancestor: DatastoreKey | undefined) => {
-		const path = ancestor ? datastoreKeyPathValues(ancestor, keyEncoding) : [];
+		if (isDatastoreInt64Id(id) && keyEncoding !== 'native') {
+			throw new ActiveTsConfigurationError(
+				'Datastore int64 ids require keyEncoding: "native".'
+			);
+		}
+		const path: Array<string | number> = ancestor ? datastoreKeyPathValues(ancestor, keyEncoding) : [];
 		path[path.length] = kindName(model);
 		path[path.length] = keyEncoding === 'native'
 			? assertNativeDatastoreEntityId(id, `${model.name} store id`)
@@ -1614,7 +1693,7 @@ function createDatastoreAdapter(
 			uniqueIndex: false,
 			optimisticLock: false,
 			nullOperators: true,
-			missingFieldNulls: false,
+			missingFieldNulls: true,
 			native: true,
 			datastoreAncestor: true,
 			datastoreReadPolicy: !scopedTransaction
@@ -1634,6 +1713,10 @@ function createDatastoreAdapter(
 					let nativeGaxOptions: Record<string, unknown> | undefined;
 					let nativeCommitGaxOptions: Record<string, unknown> | undefined;
 					let nativeRollbackGaxOptions: Record<string, unknown> | undefined;
+					let maxAttempts = 1;
+					let retryInitialDelayMs = DATASTORE_RETRY_INITIAL_DELAY_MS;
+					let retryMaxDelayMs = DATASTORE_RETRY_MAX_DELAY_MS;
+					let retryJitter = true;
 					if (txOptions.native !== undefined) {
 						if (!txOptions.native || typeof txOptions.native !== 'object' || Array.isArray(txOptions.native)) {
 							throw new ActiveTsConfigurationError('Datastore transaction options.native must be a plain object.');
@@ -1657,6 +1740,56 @@ function createDatastoreAdapter(
 							'rollbackGaxOptions',
 							'Datastore transaction native option'
 						);
+						const nativeMaxAttempts = ownFactoryOptionValue(
+							nativeRecord,
+							'maxAttempts',
+							'Datastore transaction native option'
+						);
+						if (
+							nativeMaxAttempts !== undefined &&
+							(typeof nativeMaxAttempts !== 'number' || !Number.isSafeInteger(nativeMaxAttempts) || nativeMaxAttempts < 1)
+						) {
+							throw new ActiveTsConfigurationError(
+								'Datastore transaction options.native.maxAttempts must be a positive safe integer.'
+							);
+						}
+						if (nativeMaxAttempts !== undefined) maxAttempts = nativeMaxAttempts;
+						const nativeRetryInitialDelayMs = ownFactoryOptionValue(
+							nativeRecord,
+							'retryInitialDelayMs',
+							'Datastore transaction native option'
+						);
+						const nativeRetryMaxDelayMs = ownFactoryOptionValue(
+							nativeRecord,
+							'retryMaxDelayMs',
+							'Datastore transaction native option'
+						);
+						const nativeRetryJitter = ownFactoryOptionValue(
+							nativeRecord,
+							'retryJitter',
+							'Datastore transaction native option'
+						);
+						retryInitialDelayMs = normalizeDatastoreRetryDelay(
+							nativeRetryInitialDelayMs,
+							DATASTORE_RETRY_INITIAL_DELAY_MS,
+							'Datastore transaction options.native.retryInitialDelayMs'
+						);
+						retryMaxDelayMs = normalizeDatastoreRetryDelay(
+							nativeRetryMaxDelayMs,
+							DATASTORE_RETRY_MAX_DELAY_MS,
+							'Datastore transaction options.native.retryMaxDelayMs'
+						);
+						if (retryMaxDelayMs < retryInitialDelayMs) {
+							throw new ActiveTsConfigurationError(
+								'Datastore transaction options.native.retryMaxDelayMs must be greater than or equal to retryInitialDelayMs.'
+							);
+						}
+						if (nativeRetryJitter !== undefined && typeof nativeRetryJitter !== 'boolean') {
+							throw new ActiveTsConfigurationError(
+								'Datastore transaction options.native.retryJitter must be a boolean.'
+							);
+						}
+						if (nativeRetryJitter !== undefined) retryJitter = nativeRetryJitter;
 						nativeGaxOptions = gaxOptions === undefined
 							? undefined
 							: snapshotSdkOptions(gaxOptions, 'Datastore transaction options.native.gaxOptions');
@@ -1674,12 +1807,13 @@ function createDatastoreAdapter(
 						if (readOnlyOptions !== undefined) runOptions.readOnly = true;
 						if (nativeGaxOptions !== undefined) runOptions.gaxOptions = nativeGaxOptions;
 					}
-					const rawTransaction = transactionFactory(readOnlyOptions);
-					const transaction = normalizeDatastoreTransaction(rawTransaction, rootClient);
-					let started = false;
-					let committing = false;
-					let result: Awaited<ReturnType<typeof fn>>;
-					try {
+					for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+						const rawTransaction = transactionFactory(readOnlyOptions);
+						const transaction = normalizeDatastoreTransaction(rawTransaction, rootClient);
+						let started = false;
+						let committing = false;
+						let result: Awaited<ReturnType<typeof fn>>;
+						try {
 						await transaction.run(runOptions);
 						started = true;
 						let closed: string | undefined;
@@ -2101,16 +2235,18 @@ function createDatastoreAdapter(
 									return txNativeReadStore.query(model, typedPlan, safeReadOptions);
 								}
 								assertDatastoreQueryLimits(encodedPlan);
-								let needsScanFallback = false;
-								for (let whereIndex = 0; whereIndex < encodedPlan.where.length; whereIndex++) {
-									const op = encodedPlan.where[whereIndex].op;
-									if (op === '!=' || op === 'in' || op === 'isNotNull') {
-										needsScanFallback = true;
-										break;
+					const needsScanFallback = datastorePlanRequiresPortableFullScan(model, encodedPlan);
+					const portableScalarFilter = datastorePlanNeedsPortableScalarFilter(model, encodedPlan);
+					if (!portableScalarFilter || !allowQueryScanFallback) {
+						assertGoogleInequalitySortOrder('Datastore', encodedPlan, 'order');
+					}
+					if (needsScanFallback && !allowQueryScanFallback) {
+						assertGoogleSortableFieldsDeclared('Datastore', model, encodedPlan, 'order');
+						throw new ActiveTsConfigurationError(
+							'Datastore portable filter semantics require allowQueryScanFallback: true because the native query can omit matching rows.'
+						);
 									}
-								}
-								if (!allowQueryScanFallback || !needsScanFallback) {
-									assertGoogleInequalitySortOrder('Datastore', encodedPlan, 'order');
+					if (!portableScalarFilter) {
 									assertGoogleSortableFieldsDeclared('Datastore', model, encodedPlan, 'order');
 								}
 								const planAncestor = requireAncestorTransactionQueries
@@ -2289,6 +2425,11 @@ function createDatastoreAdapter(
 											encodedPlan.aggregates,
 											'Datastore transaction aggregate'
 										);
+										if (specs.length > DATASTORE_AGGREGATE_MAX_SPECS) {
+											throw new ActiveTsConfigurationError(
+												`Datastore transaction aggregate supports at most ${DATASTORE_AGGREGATE_MAX_SPECS} aggregate fields per operation.`
+											);
+										}
 										assertNoAggregateFieldCodecSpecs(model, specs, 'Datastore transaction aggregate');
 										await waitForBufferedMutations();
 										if (encodedPlan.native !== undefined) {
@@ -2526,17 +2667,34 @@ function createDatastoreAdapter(
 						return result;
 					} catch (error) {
 						if (!started) throw error;
-						if (committing) throw markTransactionRollbackSkipped(error);
+						if (committing) {
+							if (isDatastoreAbortedError(error)) {
+								if (attempt < maxAttempts) {
+									await waitForDatastoreTransactionRetry(
+										attempt,
+										retryInitialDelayMs,
+										retryMaxDelayMs,
+										retryJitter
+									);
+									continue;
+								}
+								throw datastoreTransactionConflict(error);
+							}
+							if (isDatastoreDefiniteCommitFailure(error)) throw error;
+							throw markTransactionRollbackSkipped(error);
+						}
 						try {
 							await transaction.rollback(nativeRollbackGaxOptions);
 						} catch (rollbackError) {
-							throw new AggregateError(
+							throw markTransactionRollbackSkipped(new AggregateError(
 								[error, rollbackError],
 								`Datastore transaction failed and rollback failed: ${safeErrorMessage(error)}`
-							);
+							));
 						}
 						throw error;
 					}
+				}
+					throw new ActiveTsConfigurationError('Datastore transaction exhausted attempts without an outcome.');
 				}
 			: undefined,
 		async get(model, id, options) {
@@ -2609,21 +2767,36 @@ function createDatastoreAdapter(
 				SET_ADD.call(requested, encoded);
 				uniqueIds.push(id);
 			}
+			if (
+				uniqueIds.length > DATASTORE_LOOKUP_MAX_KEYS &&
+				!scopedTransaction &&
+				sdkReadOptions?.readTime === undefined
+			) {
+				throw new ActiveTsConfigurationError(
+					'Datastore getMany() with more than 1000 unique ids requires readAt() or a Datastore transaction to preserve one snapshot.'
+				);
+			}
 			const entityKeys: any[] = [];
 			for (let index = 0; index < uniqueIds.length; index++) {
 				entityKeys[index] = makeEntityKey(model, uniqueIds[index], undefined, ancestorOverride);
 			}
-			const entities = datastoreRequiredResultSlot(
-				await runDatastoreRead(
-					datastoreMethod(client, 'get', 'Datastore client.get'),
-					entityKeys,
-					sdkReadOptions
-				),
-				'Datastore getMany',
-				0
-			);
-			if (!Array.isArray(entities)) throw new ActiveTsValidationError('Datastore getMany result must be an array.');
-			const safeEntities = snapshotArrayInput<any>(entities, 'Datastore getMany result');
+				const safeEntities: any[] = [];
+				const get = datastoreMethod(client, 'get', 'Datastore client.get');
+				for (let offset = 0; offset < entityKeys.length; offset += DATASTORE_LOOKUP_MAX_KEYS) {
+					const keys: any[] = [];
+					const end = Math.min(offset + DATASTORE_LOOKUP_MAX_KEYS, entityKeys.length);
+					for (let index = offset; index < end; index++) keys[keys.length] = entityKeys[index];
+					const entities = datastoreRequiredResultSlot(
+						await runDatastoreRead(get, keys, sdkReadOptions),
+						'Datastore getMany',
+						0
+					);
+					if (!Array.isArray(entities)) throw new ActiveTsValidationError('Datastore getMany result must be an array.');
+					const chunkEntities = snapshotArrayInput<any>(entities, 'Datastore getMany result');
+					for (let index = 0; index < chunkEntities.length; index++) {
+						safeEntities[safeEntities.length] = chunkEntities[index];
+					}
+				}
 			const byId = new Map<string, any>();
 			for (const entity of safeEntities) {
 				const { id, data } = normalizeDatastoreEntityForResult(
@@ -2693,16 +2866,19 @@ function createDatastoreAdapter(
 				);
 			if (plan.or.length) throw new ActiveTsConfigurationError('Datastore adapter does not support orWhere().');
 			assertDatastoreQueryLimits(plan);
-			let needsScanFallback = false;
-			for (let whereIndex = 0; whereIndex < plan.where.length; whereIndex++) {
-				const op = plan.where[whereIndex].op;
-				if (op === '!=' || op === 'in' || op === 'isNotNull') {
-					needsScanFallback = true;
-					break;
+				const needsScanFallback = datastorePlanRequiresPortableFullScan(model, plan);
+				const portableScalarFilter = datastorePlanNeedsPortableScalarFilter(model, plan);
+				if (!portableScalarFilter || !allowQueryScanFallback) {
+					assertGoogleInequalitySortOrder('Datastore', plan, 'order');
 				}
-			}
-			const kind = kindName(model);
-			const queryNamespace = ancestor?.namespace ?? options.namespace;
+				if (needsScanFallback && !allowQueryScanFallback) {
+					assertGoogleSortableFieldsDeclared('Datastore', model, plan, 'order');
+					throw new ActiveTsConfigurationError(
+						'Datastore portable filter semantics require allowQueryScanFallback: true because the native query can omit matching rows.'
+					);
+				}
+				const kind = kindName(model);
+				const queryNamespace = ancestor?.namespace ?? options.namespace;
 			if (allowQueryScanFallback && needsScanFallback) {
 				if (plan.cursor) {
 					throw new ActiveTsConfigurationError(
@@ -2764,11 +2940,30 @@ function createDatastoreAdapter(
 				}
 				return result;
 			}
-			assertGoogleInequalitySortOrder('Datastore', plan, 'order');
-			assertGoogleSortableFieldsDeclared('Datastore', model, plan, 'order');
-			const startCursor = plan.cursor === undefined ? undefined : decodeDatastoreContinuationCursor(plan.cursor);
-			const keyOnlyProjection =
-				supportsKeyOnlyProjection && plan.select?.length === 1 && plan.select[0] === model.idField;
+					if (!portableScalarFilter) {
+						assertGoogleSortableFieldsDeclared('Datastore', model, plan, 'order');
+					}
+						const keyOnlyProjection =
+							!portableScalarFilter && supportsKeyOnlyProjection && plan.select?.length === 1 && plan.select[0] === model.idField;
+				const cursorQuery = datastoreContinuationQueryFingerprint(model, plan, {
+					projectId: datastoreProjectId,
+					databaseId: datastoreDatabaseId,
+					namespace: queryNamespace,
+					ancestor: ancestor === undefined
+						? undefined
+						: datastoreKeyWithNamespace(ancestor, adapterNamespace, 'Datastore continuation cursor ancestor'),
+					keyEncoding,
+					keyOnlyProjection,
+					readOptions: sdkReadOptions
+				});
+					const startCursor = plan.cursor === undefined
+						? undefined
+						: decodeDatastoreContinuationCursor(plan.cursor, cursorQuery);
+					if (portableScalarFilter && plan.cursor) {
+						throw new ActiveTsConfigurationError(
+							'Datastore continuation cursors are not supported when portable scalar filtering is required.'
+						);
+					}
 			let query = normalizeDatastoreQuery(
 				queryNamespace
 					? datastoreMethod(rootClient, 'createQuery', 'Datastore client.createQuery')(queryNamespace, kind)
@@ -2798,24 +2993,119 @@ function createDatastoreAdapter(
 					datastoreMethod(query, 'select', 'Datastore query.select')('__key__'),
 					'Datastore query'
 				);
-			if (plan.offset !== undefined)
+				if (!portableScalarFilter && plan.offset !== undefined)
 				query = normalizeDatastoreQuery(
 					datastoreMethod(query, 'offset', 'Datastore query.offset')(
 						assertSafeOffset(plan.offset, 'Datastore offset')
 					),
 					'Datastore query'
 				);
-			if (plan.limit !== undefined)
+				if (!portableScalarFilter && plan.limit !== undefined)
 				query = normalizeDatastoreQuery(
 					datastoreMethod(query, 'limit', 'Datastore query.limit')(assertSafeLimit(plan.limit, 'Datastore limit')),
 					'Datastore query'
 				);
-			if (startCursor !== undefined)
+				if (startCursor !== undefined)
 				query = normalizeDatastoreQuery(
 					datastoreMethod(query, 'start', 'Datastore query.start')(startCursor),
 					'Datastore query'
 				);
-			const result = datastoreResultTuple(
+				if (portableScalarFilter) {
+					const candidateRows: any[] = [];
+					const seenPageCursors = new Set<string>();
+					const portablePlan = stripFieldCodecQueryOperandMarker(plan);
+					const expectedAncestor = ancestor === undefined
+						? undefined
+						: datastoreKeyWithNamespace(ancestor, adapterNamespace, 'Datastore query meta.datastoreAncestor');
+					let pageIndex = 0;
+					while (true) {
+						const result = datastoreResultTuple(
+							await runDatastoreRead(
+								datastoreMethod(client, 'runQuery', 'Datastore client.runQuery'),
+								query,
+								sdkReadOptions
+							),
+							'Datastore runQuery'
+						);
+						const list = datastoreRequiredResultSlot(result, 'Datastore runQuery', 0);
+						const entities = datastoreQueryEntities(list);
+						for (let index = 0; index < entities.length; index++) {
+							const normalized = normalizeDatastoreEntityForResult(
+								entities[index],
+								model,
+								datastoreKeySymbol,
+								`Datastore query page[${pageIndex}] entity[${index}]`,
+								expectedAncestor,
+								true,
+								adapterNamespace,
+								!deferScopedQueryPayloadValidation,
+								keyEncoding
+							);
+							if (filterRows([normalized.data], portablePlan, model.idField).length) {
+								candidateRows[candidateRows.length] = normalized.data;
+							}
+						}
+						if (!datastoreQueryHasMore(result[1])) break;
+						const info = result[1];
+						if (!info || typeof info !== 'object' || Array.isArray(info)) {
+							throw new ActiveTsValidationError('Datastore query info must be an object.');
+						}
+						const rawEndCursor = ownOptionValue(info as Record<string, unknown>, 'endCursor');
+						if (typeof rawEndCursor !== 'string' || !rawEndCursor) {
+							throw new ActiveTsValidationError(
+								'Datastore query info.endCursor must be a non-empty string when more results are available.'
+							);
+						}
+						if (SET_HAS.call(seenPageCursors, rawEndCursor)) {
+							if (!entities.length) break;
+							throw new ActiveTsValidationError('Datastore query returned a repeated non-empty page cursor.');
+						}
+						SET_ADD.call(seenPageCursors, rawEndCursor);
+						query = normalizeDatastoreQuery(
+							datastoreMethod(query, 'start', 'Datastore query.start')(rawEndCursor),
+							'Datastore query'
+						);
+						pageIndex++;
+					}
+					const sort = sortWithStableId(plan, model.idField);
+					const sortedRows: any[] = [];
+					for (let rowIndex = 0; rowIndex < candidateRows.length; rowIndex++) {
+						const row = candidateRows[rowIndex];
+						let insertAt = sortedRows.length;
+						for (let sortedIndex = 0; sortedIndex < sortedRows.length; sortedIndex++) {
+							if (compareRowsBySort(row, sortedRows[sortedIndex], sort) < 0) {
+								insertAt = sortedIndex;
+								break;
+							}
+						}
+						for (let shift = sortedRows.length; shift > insertAt; shift--) {
+							sortedRows[shift] = sortedRows[shift - 1];
+						}
+						sortedRows[insertAt] = row;
+					}
+					let filteredRows = offsetDatastoreRows(sortedRows, plan.offset);
+					let more = false;
+					if (plan.limit !== undefined) {
+						const safeLimit = assertSafeLimit(plan.limit, 'Datastore limit') as number;
+						more = filteredRows.length > safeLimit;
+						if (more) {
+							const limitedRows: any[] = [];
+							for (let index = 0; index < safeLimit; index++) limitedRows[index] = filteredRows[index];
+							filteredRows = limitedRows;
+						}
+					}
+					const rows: any[] = [];
+					for (let index = 0; index < filteredRows.length; index++) {
+						rows[index] = pickDatastoreResultFields(
+							filteredRows[index],
+							plan.select,
+							model.idField,
+							`Datastore query result[${index}]`
+						);
+					}
+					return { list: rows, more };
+				}
+				const result = datastoreResultTuple(
 				await runDatastoreRead(
 					datastoreMethod(client, 'runQuery', 'Datastore client.runQuery'),
 					query,
@@ -2826,9 +3116,9 @@ function createDatastoreAdapter(
 			const list = datastoreRequiredResultSlot(result, 'Datastore runQuery', 0);
 			const info = result[1];
 			const entities = datastoreQueryEntities(list);
-			const page = scopedTransaction
-				? { more: datastoreQueryHasMore(info) }
-				: datastoreDirectQueryPageInfo(info, startCursor, entities.length);
+				const page = scopedTransaction
+					? { more: datastoreQueryHasMore(info) }
+					: datastoreDirectQueryPageInfo(info, startCursor, entities.length, cursorQuery);
 			const rows: any[] = [];
 			const expectedAncestor = ancestor === undefined
 				? undefined
@@ -2866,7 +3156,16 @@ function createDatastoreAdapter(
 						adapterNamespace
 					);
 				}
-				rows[index] = pickDatastoreResultFields(row, plan.select, model.idField, `Datastore query entity[${index}]`);
+					if (
+						portableScalarFilter &&
+						filterRows([row], stripFieldCodecQueryOperandMarker(plan), model.idField).length === 0
+					) continue;
+					rows[rows.length] = pickDatastoreResultFields(
+						row,
+						plan.select,
+						model.idField,
+						`Datastore query entity[${index}]`
+					);
 			}
 			return {
 				list: rows,
@@ -2902,7 +3201,17 @@ function createDatastoreAdapter(
 					);
 					if (plan.or.length) throw new ActiveTsConfigurationError('Datastore adapter does not support orWhere().');
 					assertDatastoreQueryLimits(plan);
+					if (specs.length > DATASTORE_AGGREGATE_MAX_SPECS) {
+						throw new ActiveTsConfigurationError(
+							`Datastore aggregate supports at most ${DATASTORE_AGGREGATE_MAX_SPECS} aggregate fields per operation.`
+						);
+					}
 					if (allowAggregateScanFallback) {
+						if (specs.length > 1 && !scopedTransaction && sdkReadOptions?.readTime === undefined) {
+							throw new ActiveTsConfigurationError(
+								'Datastore multi-aggregate scan fallback requires readAt() or a Datastore transaction to preserve one snapshot.'
+							);
+						}
 						const kind = kindName(model);
 						const queryNamespace = ancestor?.namespace ?? options.namespace;
 						const scanResult = await scanDatastoreRows(
@@ -2918,18 +3227,23 @@ function createDatastoreAdapter(
 								'Datastore aggregate scan fallback cannot aggregate a paginated query result.'
 							);
 						}
-						return aggregateRows(
-							filterRows(scanResult.rows, stripFieldCodecQueryOperandMarker(plan), model.idField),
-							specs
-						);
-					}
+							return aggregateRows(
+								filterRows(scanResult.rows, stripFieldCodecQueryOperandMarker(plan), model.idField),
+								specs
+							);
+						}
+						if (!datastoreNativeAggregateFiltersAreSafe(model, plan)) {
+							throw new ActiveTsConfigurationError(
+								'Datastore native aggregates with portable scalar filters require fieldType metadata or allowAggregateScanFallback: true.'
+							);
+						}
 
-					const aggregateResult: Record<string, unknown> = {};
+						const aggregateResult: Record<string, unknown> = {};
 					const minMaxQueryOptions = new Map<
 						string,
 						{ field: string; onlyNull: boolean; alreadyExcludesNull: boolean }
 					>();
-					for (let index = 0; index < specs.length; index++) {
+							for (let index = 0; index < specs.length; index++) {
 						const spec = specs[index];
 						if (spec.op !== 'min' && spec.op !== 'max') continue;
 						const type = MAP_GET.call(model.fieldTypes, spec.field!) as FieldType | undefined;
@@ -2973,15 +3287,37 @@ function createDatastoreAdapter(
 						}
 						MAP_SET.call(minMaxQueryOptions, spec.as, { field, onlyNull, alreadyExcludesNull });
 					}
-					const sdkSpecs: AggregatePlan['aggregates'] = [];
-					for (let index = 0; index < specs.length; index++) {
-						const spec = specs[index];
-						if (spec.op === 'count' || spec.op === 'sum' || spec.op === 'avg') {
+						const sdkSpecs: AggregatePlan['aggregates'] = [];
+						for (let index = 0; index < specs.length; index++) {
+							const spec = specs[index];
+							if (spec.op !== 'count' && spec.op !== 'sum' && spec.op !== 'avg') continue;
+							if (spec.op !== 'count') {
+								const type = MAP_GET.call(model.fieldTypes, spec.field!) as FieldType | undefined;
+								if (type !== 'number') {
+									throw new ActiveTsConfigurationError(
+										`Datastore aggregate "${spec.as}" requires number fieldType metadata or allowAggregateScanFallback: true.`
+									);
+								}
+								assertSafeDatastoreField(spec.field, `Datastore ${spec.op} aggregate field`);
+							}
 							sdkSpecs[sdkSpecs.length] = spec;
-						}
-					}
-					if (sdkSpecs.length) {
-						const kind = kindName(model);
+							}
+							let nativeAggregateRequests = sdkSpecs.length ? 1 : 0;
+							for (let index = 0; index < specs.length; index++) {
+								const spec = specs[index];
+								if (spec.op !== 'min' && spec.op !== 'max') continue;
+								const minMaxOptions = MAP_GET.call(minMaxQueryOptions, spec.as) as
+									| { onlyNull: boolean }
+									| undefined;
+								if (minMaxOptions !== undefined && !minMaxOptions.onlyNull) nativeAggregateRequests++;
+							}
+							if (nativeAggregateRequests > 1) {
+								throw new ActiveTsConfigurationError(
+									'Datastore aggregate would require multiple backend queries with different snapshots; use allowAggregateScanFallback with readAt(), or run it in a Datastore transaction.'
+								);
+							}
+							if (sdkSpecs.length) {
+							const kind = kindName(model);
 						const queryNamespace = ancestor?.namespace ?? options.namespace;
 						let query = normalizeDatastoreQuery(
 							queryNamespace
@@ -3266,12 +3602,25 @@ function createDatastoreAdapter(
 	if (!scopedTransaction) {
 		const runBulkMutation = async <T>(
 			items: T[],
+			itemBytes: number[],
 			mutationOptions: ReturnType<typeof normalizeDatastoreBulkMutationOptions>,
 			mutate: (target: NormalizedDatastoreClient, batch: T[]) => Promise<void>,
 			context: string
 		) => {
 			if (!items.length) return;
+			if (items.length !== itemBytes.length) {
+				throw new ActiveTsValidationError(`${context} size validation state is inconsistent.`);
+			}
 			if (mutationOptions.atomic) {
+				let requestBytes = DATASTORE_BULK_REQUEST_OVERHEAD_BYTES;
+				for (let index = 0; index < itemBytes.length; index++) {
+					requestBytes += itemBytes[index];
+					if (requestBytes > DATASTORE_SAFE_BULK_REQUEST_BYTES) {
+						throw new ActiveTsValidationError(
+							`${context} atomic batch exceeds the defensive 8 MiB protobuf request budget.`
+						);
+					}
+				}
 				if (!transactionFactory) {
 					throw new ActiveTsConfigurationError(
 						`${context} atomic mode requires Datastore transaction support.`
@@ -3291,24 +3640,40 @@ function createDatastoreAdapter(
 					await transaction.commit();
 				} catch (error) {
 					if (!started) throw error;
-					if (committing) throw markTransactionRollbackSkipped(error);
+					if (committing) {
+						if (isDatastoreAbortedError(error)) throw datastoreTransactionConflict(error);
+						if (isDatastoreDefiniteCommitFailure(error)) throw error;
+						throw markTransactionRollbackSkipped(error);
+					}
 					try {
 						await transaction.rollback();
 					} catch (rollbackError) {
-						throw new AggregateError(
-							[error, rollbackError],
-							`${context} failed and rollback failed: ${safeErrorMessage(error)}`
+						throw markTransactionRollbackSkipped(
+							new AggregateError(
+								[error, rollbackError],
+								`${context} failed and rollback failed: ${safeErrorMessage(error)}`
+							)
 						);
 					}
 					throw error;
 				}
 				return;
 			}
-			const chunkSize = mutationOptions.chunkSize ?? items.length;
-			for (let offset = 0; offset < items.length; offset += chunkSize) {
+			const chunkSize = mutationOptions.chunkSize ?? Number.MAX_SAFE_INTEGER;
+			let offset = 0;
+			while (offset < items.length) {
 				const batch: T[] = [];
-				const end = Math.min(offset + chunkSize, items.length);
-				for (let index = offset; index < end; index++) batch[batch.length] = items[index];
+				let batchBytes = DATASTORE_BULK_REQUEST_OVERHEAD_BYTES;
+				while (offset < items.length && batch.length < chunkSize) {
+					const nextBytes = itemBytes[offset];
+					if (DATASTORE_BULK_REQUEST_OVERHEAD_BYTES + nextBytes > DATASTORE_SAFE_BULK_REQUEST_BYTES) {
+						throw new ActiveTsValidationError(`${context} item[${offset}] exceeds the safe request budget.`);
+					}
+					if (batch.length && batchBytes + nextBytes > DATASTORE_SAFE_BULK_REQUEST_BYTES) break;
+					batch[batch.length] = items[offset];
+					batchBytes += nextBytes;
+					offset++;
+				}
 				await mutate(client, batch);
 			}
 		};
@@ -3319,9 +3684,10 @@ function createDatastoreAdapter(
 				const safeMutationOptions = normalizeDatastoreBulkMutationOptions(
 					mutationOptions,
 					'Datastore bulk upsert options'
-				);
-				const entities: Array<{ key: unknown; data: any; excludeFromIndexes?: string[] }> = [];
-				const seenKeys = new Map<string, number>();
+					);
+					const entities: Array<{ key: unknown; data: any; excludeFromIndexes?: string[] }> = [];
+					const entityBytes: number[] = [];
+					const seenKeys = new Map<string, number>();
 				for (let index = 0; index < rawEntries.length; index++) {
 					const rawEntry = rawEntries[index];
 					const entryContext = `Datastore bulk upsert entries[${index}]`;
@@ -3365,13 +3731,26 @@ function createDatastoreAdapter(
 						throw new ActiveTsValidationError(
 							`${entryContext} resolves to the same Datastore key as entries[${duplicateIndex}].`
 						);
+						}
+						MAP_SET.call(seenKeys, identity, index);
+						const estimatedEntityBytes = datastoreBulkValueBytes(
+							{
+								key: identity,
+								data: clean,
+								excludeFromIndexes: model.datastore?.unindexed
+							},
+							entryContext
+						);
+						if (estimatedEntityBytes > DATASTORE_MAX_ENTITY_BYTES) {
+							throw new ActiveTsValidationError(`${entryContext} exceeds the Datastore entity size limit.`);
+						}
+						entities[entities.length] = entityPayloadFromAncestor(model, id, clean, ancestor);
+						entityBytes[entityBytes.length] = estimatedEntityBytes + DATASTORE_BULK_MUTATION_OVERHEAD_BYTES;
 					}
-					MAP_SET.call(seenKeys, identity, index);
-					entities[entities.length] = entityPayloadFromAncestor(model, id, clean, ancestor);
-				}
-				await runBulkMutation(
-					entities,
-					safeMutationOptions,
+					await runBulkMutation(
+						entities,
+						entityBytes,
+						safeMutationOptions,
 					async (target, batch) => {
 						if (!target.upsert) {
 							throw new ActiveTsConfigurationError(
@@ -3389,9 +3768,10 @@ function createDatastoreAdapter(
 				const safeMutationOptions = normalizeDatastoreBulkMutationOptions(
 					mutationOptions,
 					'Datastore bulk delete options'
-				);
-				const keys: unknown[] = [];
-				const seenKeys = new Map<string, number>();
+					);
+					const keys: unknown[] = [];
+					const keyBytes: number[] = [];
+					const seenKeys = new Map<string, number>();
 				for (let index = 0; index < rawEntries.length; index++) {
 					const rawEntry = rawEntries[index];
 					const entryContext = `Datastore bulk delete entries[${index}]`;
@@ -3426,13 +3806,16 @@ function createDatastoreAdapter(
 						throw new ActiveTsValidationError(
 							`${entryContext} resolves to the same Datastore key as entries[${duplicateIndex}].`
 						);
+						}
+						MAP_SET.call(seenKeys, identity, index);
+						keys[keys.length] = makeEntityKeyFromAncestor(model, id, ancestor);
+						keyBytes[keyBytes.length] = datastoreBulkValueBytes(identity, entryContext)
+							+ DATASTORE_BULK_MUTATION_OVERHEAD_BYTES;
 					}
-					MAP_SET.call(seenKeys, identity, index);
-					keys[keys.length] = makeEntityKeyFromAncestor(model, id, ancestor);
-				}
-				await runBulkMutation(
-					keys,
-					safeMutationOptions,
+					await runBulkMutation(
+						keys,
+						keyBytes,
+						safeMutationOptions,
 					async (target, batch) => {
 						await target.delete(batch);
 					},
@@ -4168,6 +4551,7 @@ function normalizeDatastoreClient(client: unknown) {
 		throw new ActiveTsConfigurationError('Datastore adapter client must be an object.');
 	}
 	const key = datastoreMethod(client, 'key', 'Datastore adapter client.key');
+	const int = datastoreOptionalMethod(client, 'int', 'Datastore adapter client.int');
 	const get = datastoreMethod(client, 'get', 'Datastore adapter client.get');
 	const deleteEntity = datastoreMethod(client, 'delete', 'Datastore adapter client.delete');
 	const createQuery = datastoreMethod(client, 'createQuery', 'Datastore adapter client.createQuery');
@@ -4188,6 +4572,7 @@ function normalizeDatastoreClient(client: unknown) {
 		?? datastoreOptionalMethod(client, 'save', 'Datastore adapter client.save');
 	return Object.freeze({
 		key,
+		int,
 		get,
 		delete: deleteEntity,
 		createQuery,
@@ -4231,6 +4616,7 @@ function normalizeDatastoreTransaction(transaction: unknown, rootClient: Normali
 		rollback,
 		client: normalizeDatastoreClient({
 			key: rootClient.key,
+			int: rootClient.int,
 			get,
 			delete: deleteEntity,
 			createQuery: createQuery ?? rootClient.createQuery,
@@ -4321,6 +4707,7 @@ function createDatastoreTransactionNativeReadClient(client: NormalizedDatastoreC
 	const runAggregationQuery = client.runAggregationQuery;
 	guarded = Object.freeze({
 		key: (...args: any[]) => client.key(...args),
+		int: client.int ? (...args: any[]) => client.int!(...args) : undefined,
 		get: (...args: any[]) => trackRead('get', client.get, args),
 		delete: rejectWrite,
 		createQuery: (...args: any[]) => guardBuilder(client.createQuery(...args), 'query'),
@@ -4368,20 +4755,178 @@ function datastoreQueryHasMore(info: unknown) {
 	throw new ActiveTsValidationError(`Datastore query info.moreResults "${moreResults}" is not supported.`);
 }
 
-function encodeDatastoreContinuationCursor(cursor: unknown) {
+function datastoreContinuationQueryFingerprint(
+	model: ResolvedModelMeta,
+	plan: QueryPlan,
+	physical: {
+		projectId: string | undefined;
+		databaseId: string | null | undefined;
+		namespace: string | undefined;
+		ancestor: DatastoreKey | undefined;
+		keyEncoding: DatastoreKeyEncoding;
+		keyOnlyProjection: boolean;
+		readOptions: DatastoreSdkReadOptions | undefined;
+	}
+) {
+	const identity = {
+		projectId: physical.projectId,
+		databaseId: physical.databaseId,
+		namespace: physical.namespace,
+		model: model.name,
+		idField: model.idField,
+		ancestor: physical.ancestor === undefined ? undefined : datastoreKeyIdentity(physical.ancestor),
+		keyEncoding: physical.keyEncoding,
+		keyOnlyProjection: physical.keyOnlyProjection,
+		where: plan.where,
+		sort: plan.sort,
+		select: plan.select,
+		readOptions: physical.readOptions
+	};
+	return createHash('sha256')
+		.update(datastoreCanonicalValue(identity, 'Datastore continuation cursor query'))
+		.digest('base64url');
+}
+
+function datastoreCanonicalValue(value: unknown, context: string, seen = new WeakSet<object>()): string {
+	if (value === undefined) return 'u';
+	if (value === null) return 'z';
+	if (typeof value === 'string') return `s${Buffer.byteLength(value, 'utf8')}:${value}`;
+	if (typeof value === 'boolean') return value ? 'b1' : 'b0';
+	if (typeof value === 'number') {
+		if (!Number.isFinite(value)) throw new ActiveTsConfigurationError(`${context} contains a non-finite number.`);
+		return `n${Object.is(value, -0) ? '0' : String(value)}`;
+	}
+	if (typeof value !== 'object') {
+		throw new ActiveTsConfigurationError(`${context} contains an unsupported value.`);
+	}
+	if (value instanceof Date) {
+		const time = Date.prototype.getTime.call(value);
+		if (!Number.isFinite(time)) throw new ActiveTsConfigurationError(`${context} contains an invalid Date.`);
+		return `d${Date.prototype.toISOString.call(value)}`;
+	}
+	if (value instanceof Uint8Array) return `x${Buffer.from(value).toString('base64url')}`;
+	if (WEAKSET_HAS.call(seen, value)) {
+		throw new ActiveTsConfigurationError(`${context} cannot contain circular values.`);
+	}
+	WEAKSET_ADD.call(seen, value);
+	try {
+		if (Array.isArray(value)) {
+			const items = snapshotArrayInput<unknown>(value, context);
+			let encoded = `a${items.length}:`;
+			for (let index = 0; index < items.length; index++) {
+				const item = datastoreCanonicalValue(items[index], `${context}[${index}]`, seen);
+				encoded += `${Buffer.byteLength(item, 'utf8')}:${item}`;
+			}
+			return encoded;
+		}
+		const prototype = Object.getPrototypeOf(value);
+		if (prototype !== Object.prototype && prototype !== null) {
+			throw new ActiveTsConfigurationError(`${context} must contain only plain objects.`);
+		}
+		if (Object.getOwnPropertySymbols(value).length) {
+			throw new ActiveTsConfigurationError(`${context} cannot contain symbol fields.`);
+		}
+		const keys = Object.getOwnPropertyNames(value);
+		for (let index = 1; index < keys.length; index++) {
+			const key = keys[index];
+			let position = index;
+			while (position > 0 && keys[position - 1] > key) {
+				keys[position] = keys[position - 1];
+				position--;
+			}
+			keys[position] = key;
+		}
+		let encoded = `o${keys.length}:`;
+		for (let index = 0; index < keys.length; index++) {
+			const key = keys[index];
+			const descriptor = Object.getOwnPropertyDescriptor(value, key);
+			if (!descriptor || !('value' in descriptor) || !descriptor.enumerable) {
+				throw new ActiveTsConfigurationError(`${context}.${key} must be an enumerable data property.`);
+			}
+			const item = datastoreCanonicalValue(descriptor.value, `${context}.${key}`, seen);
+			encoded += `${Buffer.byteLength(key, 'utf8')}:${key}${Buffer.byteLength(item, 'utf8')}:${item}`;
+		}
+		return encoded;
+	} finally {
+		WEAKSET_DELETE.call(seen, value);
+	}
+}
+
+function datastoreBulkValueBytes(value: unknown, context: string) {
+	const seen = new WeakSet<object>();
+	const estimate = (current: unknown, currentContext: string): number => {
+		if (current === undefined) return 0;
+		if (current === null || typeof current === 'boolean') return 16;
+		if (typeof current === 'string') return 16 + Buffer.byteLength(current, 'utf8');
+		if (typeof current === 'number') {
+			if (!Number.isFinite(current)) {
+				throw new ActiveTsValidationError(`${currentContext} contains a non-finite number.`);
+			}
+			return 24;
+		}
+		if (typeof current !== 'object') {
+			throw new ActiveTsValidationError(`${currentContext} contains an unsupported value.`);
+		}
+		if (current instanceof Date) {
+			const time = Date.prototype.getTime.call(current);
+			if (!Number.isFinite(time)) throw new ActiveTsValidationError(`${currentContext} contains an invalid Date.`);
+			return 48;
+		}
+		if (current instanceof Uint8Array) return 16 + current.byteLength;
+		if (WEAKSET_HAS.call(seen, current)) {
+			throw new ActiveTsValidationError(`${currentContext} cannot contain circular values.`);
+		}
+		WEAKSET_ADD.call(seen, current);
+		try {
+			if (Array.isArray(current)) {
+				const items = snapshotArrayInput<unknown>(current, currentContext);
+				let bytes = 32;
+				for (let index = 0; index < items.length; index++) {
+					bytes += 16 + estimate(items[index], `${currentContext}[${index}]`);
+				}
+				return bytes;
+			}
+			const prototype = Object.getPrototypeOf(current);
+			if (prototype !== Object.prototype && prototype !== null) {
+				throw new ActiveTsValidationError(`${currentContext} must contain only plain objects.`);
+			}
+			if (Object.getOwnPropertySymbols(current).length) {
+				throw new ActiveTsValidationError(`${currentContext} cannot contain symbol fields.`);
+			}
+			let bytes = 32;
+			for (const key of Object.getOwnPropertyNames(current)) {
+				const descriptor = Object.getOwnPropertyDescriptor(current, key);
+				if (!descriptor || !('value' in descriptor) || !descriptor.enumerable) {
+					throw new ActiveTsValidationError(`${currentContext}.${key} must be an enumerable data property.`);
+				}
+				bytes += 64 + Buffer.byteLength(key, 'utf8') + estimate(
+					descriptor.value,
+					`${currentContext}.${key}`
+				);
+			}
+			return bytes;
+		} finally {
+			WEAKSET_DELETE.call(seen, current);
+		}
+	};
+	return estimate(value, `${context} bulk payload`);
+}
+
+function encodeDatastoreContinuationCursor(cursor: unknown, query: string) {
 	const safeCursor = assertSafeCursor(cursor, 'Datastore SDK cursor');
 	if (!safeCursor) {
 		throw new ActiveTsValidationError('Datastore SDK cursor must be a non-empty string.');
 	}
 	const payload = Object.create(null);
-	defineDataProperty(payload, 'v', 1, { enumerable: true, configurable: true, writable: true });
+	defineDataProperty(payload, 'v', 2, { enumerable: true, configurable: true, writable: true });
 	defineDataProperty(payload, 'kind', 'datastore', { enumerable: true, configurable: true, writable: true });
+	defineDataProperty(payload, 'query', query, { enumerable: true, configurable: true, writable: true });
 	defineDataProperty(payload, 'cursor', safeCursor, { enumerable: true, configurable: true, writable: true });
 	const encoded = Buffer.from(JSON_STRINGIFY(payload), 'utf8').toString('base64url');
 	return assertSafeCursor(encoded, 'Datastore continuation cursor')!;
 }
 
-function decodeDatastoreContinuationCursor(cursor: string) {
+function decodeDatastoreContinuationCursor(cursor: string, expectedQuery: string) {
 	const invalid = () => new ActiveTsConfigurationError('Invalid Datastore continuation cursor.');
 	let decoded: unknown;
 	try {
@@ -4393,23 +4938,25 @@ function decodeDatastoreContinuationCursor(cursor: string) {
 	if (Object.getPrototypeOf(decoded) !== Object.prototype) throw invalid();
 	if (Object.getOwnPropertySymbols(decoded).length) throw invalid();
 	const properties = Object.getOwnPropertyNames(decoded);
-	if (properties.length !== 3) throw invalid();
+	if (properties.length !== 4) throw invalid();
 	for (let index = 0; index < properties.length; index++) {
 		const property = properties[index];
-		if (property !== 'v' && property !== 'kind' && property !== 'cursor') throw invalid();
+		if (property !== 'v' && property !== 'kind' && property !== 'query' && property !== 'cursor') throw invalid();
 	}
 	const record = decoded as Record<string, unknown>;
 	let version: unknown;
 	let kind: unknown;
+	let query: unknown;
 	let rawCursor: unknown;
 	try {
 		version = ownOptionValue(record, 'v');
 		kind = ownOptionValue(record, 'kind');
+		query = ownOptionValue(record, 'query');
 		rawCursor = ownOptionValue(record, 'cursor');
 	} catch {
 		throw invalid();
 	}
-	if (version !== 1 || kind !== 'datastore') throw invalid();
+	if (version !== 2 || kind !== 'datastore' || query !== expectedQuery) throw invalid();
 	try {
 		const safeCursor = assertSafeCursor(rawCursor, 'Datastore SDK cursor');
 		if (!safeCursor) throw invalid();
@@ -4422,7 +4969,8 @@ function decodeDatastoreContinuationCursor(cursor: string) {
 function datastoreDirectQueryPageInfo(
 	info: unknown,
 	startCursor: string | undefined,
-	rowCount: number
+	rowCount: number,
+	query: string
 ): { more: boolean; cursor?: string } {
 	if (!datastoreQueryHasMore(info)) return { more: false };
 	if (!info || typeof info !== 'object' || Array.isArray(info)) {
@@ -4440,7 +4988,7 @@ function datastoreDirectQueryPageInfo(
 		if (rowCount === 0) return { more: false };
 		throw new ActiveTsValidationError('Datastore query returned a repeated non-empty page cursor.');
 	}
-	return { more: true, cursor: encodeDatastoreContinuationCursor(endCursor) };
+	return { more: true, cursor: encodeDatastoreContinuationCursor(endCursor, query) };
 }
 
 function datastoreQueryEntities(list: unknown) {
@@ -4470,6 +5018,62 @@ function isDatastoreNotFoundError(error: unknown) {
 	return code === 5 || code === 'not-found' || code === 'NOT_FOUND';
 }
 
+function isDatastoreAbortedError(error: unknown) {
+	const code = datastoreErrorCode(error);
+	return code === 10 || code === 'aborted' || code === 'ABORTED';
+}
+
+function isDatastoreDefiniteCommitFailure(error: unknown) {
+	const code = datastoreErrorCode(error);
+	return code === 3 || code === 5 || code === 6 || code === 7 || code === 8 || code === 9 ||
+		code === 11 || code === 12 || code === 16 ||
+		code === 'INVALID_ARGUMENT' || code === 'NOT_FOUND' || code === 'ALREADY_EXISTS' ||
+		code === 'PERMISSION_DENIED' || code === 'RESOURCE_EXHAUSTED' || code === 'FAILED_PRECONDITION' ||
+		code === 'OUT_OF_RANGE' || code === 'UNIMPLEMENTED' || code === 'UNAUTHENTICATED';
+}
+
+function datastoreErrorCode(error: unknown) {
+	const code = ownErrorValue(error, 'code') ?? ownErrorValue(error, 'status');
+	if (typeof code !== 'string') return code;
+	return code.replaceAll('-', '_').toUpperCase();
+}
+
+function normalizeDatastoreRetryDelay(value: unknown, fallback: number, context: string) {
+	if (value === undefined) return fallback;
+	if (
+		typeof value !== 'number' ||
+		!Number.isSafeInteger(value) ||
+		value < 0 ||
+		value > DATASTORE_RETRY_DELAY_LIMIT_MS
+	) {
+		throw new ActiveTsConfigurationError(
+			`${context} must be a non-negative safe integer no greater than ${DATASTORE_RETRY_DELAY_LIMIT_MS}.`
+		);
+	}
+	return value;
+}
+
+async function waitForDatastoreTransactionRetry(
+	attempt: number,
+	initialDelayMs: number,
+	maxDelayMs: number,
+	jitter: boolean
+) {
+	let ceiling = initialDelayMs;
+	for (let index = 1; index < attempt && ceiling < maxDelayMs; index++) {
+		ceiling = ceiling > maxDelayMs / 2 ? maxDelayMs : ceiling * 2;
+	}
+	if (ceiling > maxDelayMs) ceiling = maxDelayMs;
+	const waitMs = jitter && ceiling > 0 ? randomInt(ceiling + 1) : ceiling;
+	if (waitMs > 0) await delay(waitMs);
+}
+
+function datastoreTransactionConflict(error: unknown) {
+	const conflict = new ActiveTsConflictError(`Datastore transaction aborted: ${safeErrorMessage(error)}`);
+	defineDataProperty(conflict, 'cause', error, { enumerable: false, configurable: true });
+	return conflict;
+}
+
 function datastoreOptionalMethod(target: object, method: string, context: string) {
 	const value = datastoreMember(target, method, context, { requireEnumerableOwn: true });
 	if (value === undefined) return undefined;
@@ -4479,7 +5083,7 @@ function datastoreOptionalMethod(target: object, method: string, context: string
 	return value.bind(target);
 }
 
-function readDatastoreProjectId(client: object): string | undefined {
+function readConfiguredDatastoreProjectId(client: object): string | undefined {
 	const descriptor = Object.getOwnPropertyDescriptor(client, 'options');
 	if (!descriptor) return undefined;
 	if (!('value' in descriptor)) {
@@ -4502,6 +5106,30 @@ function readDatastoreProjectId(client: object): string | undefined {
 	if (typeof projectId !== 'string' || !projectId || projectId.includes('\0')) {
 		throw new ActiveTsConfigurationError(
 			'Datastore adapter client.options.projectId must be a non-empty string without null bytes.'
+		);
+	}
+	return projectId;
+}
+
+async function resolveDatastoreProjectId(client: object): Promise<string | undefined> {
+	const configured = readConfiguredDatastoreProjectId(client);
+	if (configured !== undefined) return configured;
+	const getProjectId = datastoreMember(client, 'getProjectId', 'Datastore adapter client.getProjectId');
+	if (getProjectId === undefined) return undefined;
+	if (typeof getProjectId !== 'function') {
+		throw new ActiveTsConfigurationError('Datastore adapter client.getProjectId must be a function.');
+	}
+	let projectId: unknown;
+	try {
+		projectId = await Reflect.apply(getProjectId, client, []);
+	} catch (error) {
+		throw new ActiveTsConfigurationError(
+			`Datastore adapter client.getProjectId failed: ${safeErrorMessage(error)}`
+		);
+	}
+	if (typeof projectId !== 'string' || !projectId || projectId.includes('\0')) {
+		throw new ActiveTsConfigurationError(
+			'Datastore adapter client.getProjectId must resolve to a non-empty string without null bytes.'
 		);
 	}
 	return projectId;

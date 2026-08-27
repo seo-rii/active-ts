@@ -3,6 +3,7 @@ import { assertSafeDataKeys, assertSafeEntityId, assertSafeFieldPath, assertSafe
 import { ActiveTsConfigurationError, ActiveTsValidationError } from './errors.js';
 import { snapshotArrayInput } from './array-input.js';
 import { dateIsoString, dateTime } from './date-intrinsics.js';
+import { datastoreInt64Id, datastoreInt64IdValue, isDatastoreInt64Id } from './datastore-int64-id.js';
 import { SET_ADD, SET_HAS, WEAKSET_ADD, WEAKSET_HAS } from './collection-intrinsics.js';
 import {
 	OBJECT_GET_OWN_PROPERTY_DESCRIPTOR,
@@ -40,6 +41,7 @@ function capturedSet<T>(values: readonly T[]) {
 
 export function entityIdKey(id: EntityId) {
 	assertSafeEntityId(id);
+	if (isDatastoreInt64Id(id)) return `datastore-int64:${datastoreInt64IdValue(id)}`;
 	return `${typeof id}:${String(id)}`;
 }
 
@@ -51,6 +53,11 @@ export function entityIdFromKey(key: string): EntityId {
 	}
 	const type = key.slice(0, separator);
 	const value = key.slice(separator + 1);
+	if (type === 'datastore-int64') {
+		const id = datastoreInt64Id(value);
+		if (entityIdKey(id) !== key) throw new ActiveTsValidationError(`Encoded entity id "${key}" is not canonical.`);
+		return id;
+	}
 	if (type === 'number') {
 		const id = Number(value);
 		assertSafeEntityId(id, `Encoded entity id "${key}"`);

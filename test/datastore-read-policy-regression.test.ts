@@ -311,6 +311,7 @@ test('Datastore adapter forwards readTime and consistency to every SDK read shap
 test('Datastore scan fallbacks retain read policy on backend pages', async () => {
 	const optionsSeen: unknown[] = [];
 	let queryPages = 0;
+	const fallbackMeta = { ...adapterMeta, fieldTypes: new Map<string, never>() };
 	const datastore = await createDatastoreStoreAdapter({
 		client: datastoreClient({
 			runQuery: async (_query: unknown, options: unknown) => {
@@ -324,7 +325,7 @@ test('Datastore scan fallbacks retain read policy on backend pages', async () =>
 		allowQueryScanFallback: true,
 		allowAggregateScanFallback: true
 	});
-	await datastore.query(adapterMeta, {
+	await datastore.query(fallbackMeta, {
 		...emptyPlan,
 		where: [{ field: 'value', op: '!=', value: 'skip' }],
 		meta: { datastoreRead: { readTime: 1234 } }

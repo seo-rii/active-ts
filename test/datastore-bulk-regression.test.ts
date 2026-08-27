@@ -241,6 +241,50 @@ test('Datastore bulk mutations reject ambiguous keys and invalid options before 
 	assert.equal(writes, 0);
 });
 
+test('Datastore bulk upsert chunks by a conservative request budget and rejects unsafe atomic batches', async () => {
+	const batches: any[][] = [];
+	let transactionCalls = 0;
+	const transaction = datastoreClient({
+		run: async () => undefined,
+		commit: async () => undefined,
+		rollback: async () => undefined,
+		upsert: async () => undefined
+	});
+	const store = await createDatastoreStoreAdapter({
+		client: datastoreClient({
+			save: async (entities: any[]) => { batches.push(entities); },
+			transaction: () => {
+				transactionCalls++;
+				return transaction;
+			}
+		})
+	});
+	const value = 'x'.repeat(900_000);
+	const entries: DatastoreBulkUpsertEntry[] = [];
+	for (let id = 1; id <= 10; id++) {
+		entries.push({ id, data: { id, value } });
+	}
+
+	await store.bulk.upsertMany(rootMeta, entries, { chunkSize: 100 });
+
+	assert.equal(batches.length >= 2, true);
+	assert.equal(batches.reduce((total, batch) => total + batch.length, 0), entries.length);
+	for (const batch of batches) assert.equal(batch.length < entries.length, true);
+	await assert.rejects(
+		() => store.bulk.upsertMany(rootMeta, entries, { atomic: true }),
+		/Datastore bulk upsert atomic batch exceeds the defensive 8 MiB protobuf request budget/
+	);
+	assert.equal(transactionCalls, 0);
+
+	await assert.rejects(
+		() => store.bulk.upsertMany(rootMeta, [{
+			id: 11,
+			data: { id: 11, value: 'x'.repeat(1_100_000) }
+		}]),
+		/Datastore bulk upsert entries\[0\] exceeds the Datastore entity size limit/
+	);
+});
+
 test('Datastore bulk input accessors are rejected without evaluation', async () => {
 	let accessorCalls = 0;
 	let writes = 0;

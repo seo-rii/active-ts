@@ -1,5 +1,8 @@
 const ACTIVE_TS_TRANSACTION_ROLLBACK_SKIPPED = Symbol('active-ts.transaction-rollback-skipped');
 const ACTIVE_TS_SAVEPOINT_ROLLBACK_UNCONFIRMED = Symbol('active-ts.savepoint-rollback-unconfirmed');
+const TRANSACTION_ROLLBACK_SKIPPED_ERRORS = new WeakSet<object>();
+const WEAKSET_ADD = WeakSet.prototype.add;
+const WEAKSET_HAS = WeakSet.prototype.has;
 
 export function ownErrorValue(error: unknown, key: string) {
 	if (!error || typeof error !== 'object' || Array.isArray(error)) return undefined;
@@ -15,8 +18,9 @@ export function isPlainErrorObject(value: unknown): value is Record<string, unkn
 	return prototype === Object.prototype || prototype === null;
 }
 
-export function markTransactionRollbackSkipped<T>(error: T): T {
+export function markTransactionRollbackSkipped<T>(error: T): T | Error {
 	if (error && (typeof error === 'object' || typeof error === 'function')) {
+		WEAKSET_ADD.call(TRANSACTION_ROLLBACK_SKIPPED_ERRORS, error as object);
 		try {
 			Object.defineProperty(error, ACTIVE_TS_TRANSACTION_ROLLBACK_SKIPPED, {
 				value: true,
@@ -24,16 +28,24 @@ export function markTransactionRollbackSkipped<T>(error: T): T {
 				configurable: true
 			});
 		} catch {
-			// Keep the original transaction failure authoritative even for non-extensible errors.
+			// The module-local WeakSet keeps frozen errors fail-closed without replacing them.
 		}
+		return error;
 	}
-	return error;
+	const wrapped = new Error('Transaction rollback outcome is unconfirmed.', { cause: error });
+	WEAKSET_ADD.call(TRANSACTION_ROLLBACK_SKIPPED_ERRORS, wrapped);
+	return wrapped;
 }
 
 export function transactionRollbackSkipped(error: unknown): boolean {
 	if (!error || (typeof error !== 'object' && typeof error !== 'function')) return false;
-	const descriptor = Object.getOwnPropertyDescriptor(error, ACTIVE_TS_TRANSACTION_ROLLBACK_SKIPPED);
-	return descriptor !== undefined && 'value' in descriptor && descriptor.value === true;
+	if (WEAKSET_HAS.call(TRANSACTION_ROLLBACK_SKIPPED_ERRORS, error as object)) return true;
+	try {
+		const descriptor = Object.getOwnPropertyDescriptor(error, ACTIVE_TS_TRANSACTION_ROLLBACK_SKIPPED);
+		return descriptor !== undefined && 'value' in descriptor && descriptor.value === true;
+	} catch {
+		return false;
+	}
 }
 
 export function markSavepointRollbackUnconfirmed<T>(error: T): T {
