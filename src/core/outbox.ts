@@ -2318,7 +2318,6 @@ async function runSearchSyncMutationWithLease(
 				}
 			});
 		}, interval);
-		timer.unref();
 	}
 	try {
 		await mutation();

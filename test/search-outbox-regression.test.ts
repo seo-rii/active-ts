@@ -3282,11 +3282,13 @@ test('search sync retries the latest renewed snapshot when a mutation rejects', 
 	let renewals = 0;
 	const repairs: any[] = [];
 	const retryFailures: any[] = [];
+	let renewalTimer: ReturnType<typeof setInterval> | undefined;
 	const search = {
 		kind: 'memory',
 		capabilities: { index: true },
 		search: async () => ({ list: [], more: false }),
 		index: async () => {
+			assert.equal(renewalTimer?.hasRef(), true);
 			await renewed;
 			throw new Error('mutation rejected after renewal');
 		},
@@ -3340,10 +3342,23 @@ test('search sync retries the latest renewed snapshot when a mutation rejects', 
 		ack: async () => undefined
 	};
 
-	await assert.rejects(
-		() => runSearchSyncWorker({ outbox, search, models: [OutboxSearchDoc], context }),
-		/mutation rejected after renewal/
-	);
+	const originalSetInterval = globalThis.setInterval;
+	globalThis.setInterval = ((
+		callback: (...args: any[]) => void,
+		delay?: number,
+		...args: any[]
+	) => {
+		renewalTimer = originalSetInterval(callback, delay, ...args);
+		return renewalTimer;
+	}) as typeof setInterval;
+	try {
+		await assert.rejects(
+			() => runSearchSyncWorker({ outbox, search, models: [OutboxSearchDoc], context }),
+			/mutation rejected after renewal/
+		);
+	} finally {
+		globalThis.setInterval = originalSetInterval;
+	}
 	assert.equal(renewals, 1);
 	assert.equal(retryFailures.length, 1);
 	assert.equal(retryFailures[0].event.version, 2);
