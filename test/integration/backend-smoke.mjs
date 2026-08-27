@@ -5,6 +5,7 @@ import {
 	createActiveTs,
 	createOutboxPlugin,
 	datastoreKey,
+	datastoreReadOptions,
 	datastoreSearchDocumentIdentity,
 	defineModel,
 	MemoryStoreAdapter,
@@ -476,16 +477,22 @@ if (targets.has('datastore')) {
 	const adapter = await namespaceStoreFactory.forNamespace(namespace);
 	const diagnosticAdapter = diagnosticStoreAdapter(adapter, 'datastore');
 	const directAggregate = diagnosticAdapter.aggregate;
-	if (directAggregate && diagnosticAdapter.transaction) {
+	if (directAggregate) {
 		diagnosticAdapter.aggregate = (model, plan) => {
 			const specsDescriptor = plan && typeof plan === 'object'
 				? Object.getOwnPropertyDescriptor(plan, 'aggregates')
 				: undefined;
 			const specs = specsDescriptor && 'value' in specsDescriptor ? specsDescriptor.value : undefined;
 			if (!Array.isArray(specs) || specs.length <= 1) return directAggregate(model, plan);
-			return diagnosticAdapter.transaction(async (transactionStore) =>
-				transactionStore.aggregate(model, plan)
-			);
+			const metaDescriptor = Object.getOwnPropertyDescriptor(plan, 'meta');
+			if (metaDescriptor && !('value' in metaDescriptor)) return directAggregate(model, plan);
+			return directAggregate(model, {
+				...plan,
+				meta: {
+					...(metaDescriptor?.value ?? {}),
+					...datastoreReadOptions({ readTime: Date.now() }).meta
+				}
+			});
 		};
 	}
 	await runStoreAdapterContract(diagnosticAdapter, {
