@@ -3101,13 +3101,13 @@ async function assertSearchContractRevisionWrites(
 ) {
 	const current = {
 		id: 4,
-		title: 'revision current',
+		title: 'currentfencetoken',
 		subtitle: null,
 		score: 40,
 		tags: ['revision'],
 		profile: { city: 'Daejeon' }
 	};
-	const stale = { ...current, title: 'revision stale' };
+	const stale = { ...current, title: 'stalefencetoken' };
 	if (capabilities?.revisionWrites !== true) {
 		await assert.rejects(() => adapter.index(model, 4, current, { revision: 100 }));
 		await assert.rejects(() => adapter.delete(model, 4, { revision: 100 }));
@@ -3118,15 +3118,15 @@ async function assertSearchContractRevisionWrites(
 	await adapter.index(model, 4, stale, { revision: 99 });
 	await adapter.index(model, 4, stale, { revision: 100 });
 	await adapter.delete(model, 4, { revision: 99 });
-	await searchContractResult(adapter, model, 'revision current', {}, [4], contractOptions);
-	await searchContractResult(adapter, model, 'revision stale', {}, [], contractOptions);
+	await searchContractResult(adapter, model, 'currentfencetoken', {}, [4], contractOptions);
+	await searchContractResult(adapter, model, 'stalefencetoken', {}, [], contractOptions);
 
 	await adapter.delete(model, 4, { revision: 101 });
 	await adapter.index(model, 4, stale, { revision: 100 });
-	await searchContractResult(adapter, model, 'revision stale', {}, [], contractOptions);
+	await searchContractResult(adapter, model, 'stalefencetoken', {}, [], contractOptions);
 
 	await adapter.index(model, 4, current, { revision: 102 });
-	await searchContractResult(adapter, model, 'revision current', {}, [4], contractOptions);
+	await searchContractResult(adapter, model, 'currentfencetoken', {}, [4], contractOptions);
 	await adapter.delete(model, 4, { revision: 103 });
 }
 
