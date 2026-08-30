@@ -45,6 +45,7 @@ import { normalizeSchemaModels, normalizeSchemaPlan } from './schema-utils.js';
 import {
 	assertSafeSearchQuery,
 	assertSearchOptionsSupported,
+	assertSearchWriteOptionsSupported,
 	contextBoundSearchDatastoreNamespace,
 	datastoreSearchHitDocumentIdentityOrForced,
 	markNativeSearchAdapter,
@@ -52,6 +53,7 @@ import {
 	markSearchAdapterSource,
 	nativeSearchSourceStore,
 	normalizeSearchAdapterOptions,
+	normalizeSearchWriteOptions,
 	projectSearchDocument,
 	rebindNativeSearchAdapter,
 	searchDocumentIdentity,
@@ -570,10 +572,11 @@ export function createSearchMiddlewareAdapter(
 				}
 			);
 		}),
-		index: (model: ResolvedModelMeta, id: EntityId, data: any) => track(async () => {
+		index: (model: ResolvedModelMeta, id: EntityId, data: any, options) => track(async () => {
 			model = snapshotSearchAdapterModel(model, 'search middleware model metadata', indexAdapterKind);
 			const safeId = normalizeMiddlewareEntityId(id, 'search middleware index id');
 			const safeData = normalizeMiddlewareWriteData(data, 'search middleware index data');
+			const safeOptions = normalizeSearchWriteOptions(options, 'search middleware index options');
 			const indexModel = withDatastoreSearchNamespace(
 				model,
 				contextBoundSearchDatastoreNamespace(adapter, model)
@@ -583,14 +586,17 @@ export function createSearchMiddlewareAdapter(
 			});
 			const adapterData = cloneSafeDataObjectWithoutActiveEntityKey(safeData, 'search middleware index data');
 			assertSearchIndexSupported(adapterKind, wrapped.capabilities);
-			await runMutation({ operation: 'index', model: indexModel, args: snapshotMiddlewareArgs([safeId, adapterData]) }, () => wrapped.index(model, safeId, adapterData));
+			assertSearchWriteOptionsSupported(wrapped, safeOptions);
+			await runMutation({ operation: 'index', model: indexModel, args: snapshotMiddlewareArgs([safeId, adapterData, safeOptions]) }, () => wrapped.index(model, safeId, adapterData, safeOptions));
 		}),
-		delete: (model: ResolvedModelMeta, id: EntityId) => track(async () => {
+		delete: (model: ResolvedModelMeta, id: EntityId, options) => track(async () => {
 			model = snapshotSearchAdapterModel(model, 'search middleware model metadata', indexAdapterKind);
 			const safeId = normalizeMiddlewareEntityId(id, 'search middleware delete id');
+			const safeOptions = normalizeSearchWriteOptions(options, 'search middleware delete options');
 			assertSearchIndexSupported(adapterKind, wrapped.capabilities);
+			assertSearchWriteOptionsSupported(wrapped, safeOptions);
 			searchDocumentIdentity(model, safeId, 'search middleware delete id');
-			await runMutation({ operation: 'delete', model, args: snapshotMiddlewareArgs([safeId]) }, () => wrapped.delete(model, safeId));
+			await runMutation({ operation: 'delete', model, args: snapshotMiddlewareArgs([safeId, safeOptions]) }, () => wrapped.delete(model, safeId, safeOptions));
 		})
 	};
 	const readCapabilities = searchCapabilityReader(wrapped);
@@ -937,7 +943,8 @@ const SEARCH_CAPABILITY_KEYS = [
 	'nullOperators',
 	'cursor',
 	'native',
-	'index'
+	'index',
+	'revisionWrites'
 ] as const;
 const STORE_CAPABILITY_READERS = new WeakMap<object, () => StoreCapabilities>();
 const SEARCH_CAPABILITY_READERS = new WeakMap<object, () => SearchCapabilities>();

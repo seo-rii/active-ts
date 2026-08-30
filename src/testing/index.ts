@@ -186,7 +186,8 @@ const SEARCH_CONTRACT_CAPABILITY_KEYS = [
 	'nullOperators',
 	'cursor',
 	'native',
-	'index'
+	'index',
+	'revisionWrites'
 ] as const;
 const STORE_CONTRACT_TOKEN_CODEC: FieldCodec = {
 	name: 'store_contract_token_codec',
@@ -3070,6 +3071,7 @@ export async function runSearchAdapterContract(
 	await assertSearchContractRejectsUnsupportedCapabilities(adapter, model, capabilities);
 	await assertSearchContractCustomIdFields(adapter, customIdModel, contractOptions);
 	await assertSearchContractDatastoreAncestorIdentities(adapter, datastoreAncestorModel, contractOptions);
+	await assertSearchContractRevisionWrites(adapter, model, capabilities, contractOptions);
 	await assert.rejects(() => adapter.search(model, null as any, {}));
 	await assert.rejects(() => adapter.search(model, 'shared', null as any));
 	await assert.rejects(() => adapter.index(model, 3, { id: 4, title: 'mismatched id' }));
@@ -3089,6 +3091,43 @@ export async function runSearchAdapterContract(
 	}
 	if (contractError) throw contractError;
 	if (cleanupError) throw cleanupError.reason;
+}
+
+async function assertSearchContractRevisionWrites(
+	adapter: SearchAdapter,
+	model: ResolvedModelMeta<SearchContractModel>,
+	capabilities: SearchAdapter['capabilities'],
+	contractOptions: NormalizedSearchAdapterContractOptions
+) {
+	const current = {
+		id: 4,
+		title: 'revision current',
+		subtitle: null,
+		score: 40,
+		tags: ['revision'],
+		profile: { city: 'Daejeon' }
+	};
+	const stale = { ...current, title: 'revision stale' };
+	if (capabilities?.revisionWrites !== true) {
+		await assert.rejects(() => adapter.index(model, 4, current, { revision: 100 }));
+		await assert.rejects(() => adapter.delete(model, 4, { revision: 100 }));
+		return;
+	}
+
+	await adapter.index(model, 4, current, { revision: 100 });
+	await adapter.index(model, 4, stale, { revision: 99 });
+	await adapter.index(model, 4, stale, { revision: 100 });
+	await adapter.delete(model, 4, { revision: 99 });
+	await searchContractResult(adapter, model, 'revision current', {}, [4], contractOptions);
+	await searchContractResult(adapter, model, 'revision stale', {}, [], contractOptions);
+
+	await adapter.delete(model, 4, { revision: 101 });
+	await adapter.index(model, 4, stale, { revision: 100 });
+	await searchContractResult(adapter, model, 'revision stale', {}, [], contractOptions);
+
+	await adapter.index(model, 4, current, { revision: 102 });
+	await searchContractResult(adapter, model, 'revision current', {}, [4], contractOptions);
+	await adapter.delete(model, 4, { revision: 103 });
 }
 
 async function assertStoreContractRejectsUnsupportedCapabilities(

@@ -153,7 +153,8 @@ const SEARCH_SYNC_CAPABILITY_KEYS: Array<Exclude<keyof SearchCapabilities, 'wher
 	'nullOperators',
 	'cursor',
 	'native',
-	'index'
+	'index',
+	'revisionWrites'
 ];
 const SEARCH_SYNC_WHERE_OPERATOR_KEYS = [
 	'=',

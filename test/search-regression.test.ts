@@ -1259,6 +1259,65 @@ test('built-in search adapter deletes validate runtime ids before backend calls'
 	assert.equal(elasticDeletes, 0);
 });
 
+test('search revision writes reject stale indexes, deletes, and resurrection', async () => {
+	const meta = createActiveTs({ stores: { default: new MemoryStoreAdapter() } }).meta(SearchParityRecord);
+	const memory = new MemorySearchAdapter();
+	await memory.index(meta, 1, { id: 1, title: 'current revision', body: 'hidden' }, { revision: 10 });
+	await memory.index(meta, 1, { id: 1, title: 'stale revision', body: 'hidden' }, { revision: 9 });
+	await memory.delete(meta, 1, { revision: 9 });
+	assert.deepEqual((await memory.search(meta, 'current', {})).list, [{ id: 1, title: 'current revision' }]);
+	assert.deepEqual((await memory.search(meta, 'stale', {})).list, []);
+
+	await memory.delete(meta, 1, { revision: 11 });
+	await memory.index(meta, 1, { id: 1, title: 'stale resurrection', body: 'hidden' }, { revision: 10 });
+	assert.deepEqual(memory.snapshot(meta.name), []);
+	await memory.index(meta, 1, { id: 1, title: 'restored revision', body: 'hidden' }, { revision: 12 });
+	assert.deepEqual((await memory.search(meta, 'restored', {})).list, [{ id: 1, title: 'restored revision' }]);
+
+	const elasticCalls: any[] = [];
+	const elastic = await createElasticsearchSearchAdapter({
+		client: {
+			search: async () => ({ hits: { hits: [], total: { value: 0 } } }),
+			index: async (payload: any) => elasticCalls.push(payload),
+			delete: async () => assert.fail('revision deletes must persist an Elasticsearch tombstone')
+		}
+	});
+	await elastic.index(meta, 1, { id: 1, title: 'current revision', body: 'hidden' }, { revision: 20 });
+	await elastic.delete(meta, 1, { revision: 21 });
+	assert.deepEqual(elasticCalls.map((call) => ({ version: call.version, versionType: call.version_type })), [
+		{ version: 20, versionType: 'external' },
+		{ version: 21, versionType: 'external' }
+	]);
+	assert.deepEqual({ ...elasticCalls[1].document }, { active_ts_deleted: true });
+
+	const staleElastic = await createElasticsearchSearchAdapter({
+		client: {
+			search: async () => ({ hits: { hits: [], total: { value: 0 } } }),
+			index: async () => {
+				const error = new Error('version conflict') as Error & { meta?: { statusCode: number } };
+				error.meta = { statusCode: 409 };
+				throw error;
+			},
+			delete: async () => undefined
+		}
+	});
+	await staleElastic.index(meta, 1, { id: 1, title: 'stale revision', body: 'hidden' }, { revision: 19 });
+	await staleElastic.delete(meta, 1, { revision: 19 });
+
+	const algolia = await createAlgoliaSearchAdapter({
+		client: {
+			searchSingleIndex: async () => ({ hits: [], nbHits: 0, nbPages: 0, page: 0 }),
+			saveObject: async () => undefined,
+			deleteObject: async () => undefined
+		}
+	});
+	await assert.rejects(
+		() => algolia.index(meta, 1, { id: 1, title: 'unsupported', body: 'hidden' }, { revision: 1 }),
+		/does not support revision-ordered writes/
+	);
+	await assert.rejects(() => algolia.delete(meta, 1, { revision: 1 }), /does not support revision-ordered writes/);
+});
+
 test('algolia search adapter rejects reserved backend projection fields before backend calls', async () => {
 	const context = createActiveTs({ stores: { default: new MemoryStoreAdapter() } });
 	const meta = context.meta(SearchParityRecord);
@@ -1365,7 +1424,8 @@ test('elasticsearch search adapter rejects reserved backend fields and long ids 
 		'_seq_no',
 		'_primary_term',
 		'_version',
-		'_ignored'
+		'_ignored',
+		'active_ts_deleted'
 	];
 
 	for (const field of reservedFields) {
@@ -1750,7 +1810,7 @@ test('search middleware preserves full index payloads for wrapped adapters', asy
 
 	await wrapped.index(meta, 1, { id: 1, title: 'visible title', body: 'custom full payload' });
 
-	assert.deepEqual(middlewareArgs[0], [1, { id: 1, title: 'visible title', body: 'custom full payload' }]);
+	assert.deepEqual(middlewareArgs[0], [1, { id: 1, title: 'visible title', body: 'custom full payload' }, {}]);
 	assert.deepEqual(indexed, { id: 1, title: 'visible title', body: 'custom full payload' });
 });
 
@@ -4110,7 +4170,11 @@ test('algolia and elasticsearch search lifecycle uses typed ids and projected do
 		count: 1,
 		total: 9
 	});
-	assert.deepEqual(JSON.parse(JSON.stringify(elasticSearches[2].body)), { query: { match_all: {} }, size: 2 });
+	assert.deepEqual(JSON.parse(JSON.stringify(elasticSearches[2].body)), {
+		query: { match_all: {} },
+		size: 2,
+		post_filter: { bool: { must_not: [{ term: { active_ts_deleted: true } }] } }
+	});
 	await assert.rejects(
 		() => elastic.search(nativeOnlyMeta, 'ignored', { limit: 1, native: { query: { match_all: {} }, size: 2 } }),
 		/Elasticsearch native parameter "size" cannot be combined/

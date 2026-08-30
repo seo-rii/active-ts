@@ -4115,7 +4115,10 @@ test('search adapters validate index names, fields, and indexed documents', asyn
 	});
 	assert.equal(elasticCalls.length, 1);
 	await elastic.search({ ...meta, searchIndexes: [] }, 'safe', { native: { query: { match_all: {} } } });
-	assert.deepEqual(JSON.parse(JSON.stringify(elasticCalls[1].payload.body)), { query: { match_all: {} } });
+	assert.deepEqual(JSON.parse(JSON.stringify(elasticCalls[1].payload.body)), {
+		query: { match_all: {} },
+		post_filter: { bool: { must_not: [{ term: { active_ts_deleted: true } }] } }
+	});
 	await assert.rejects(
 		() =>
 			elastic.search({ ...meta, name: 'Bad Index', searchIndexes: [] }, 'safe', {

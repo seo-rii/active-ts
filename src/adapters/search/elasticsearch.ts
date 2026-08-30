@@ -17,6 +17,7 @@ import {
 	markProjectingSearchAdapter,
 	markSearchDocumentIdentity,
 	normalizeSearchAdapterOptions,
+	normalizeSearchWriteOptions,
 	projectSearchDocument,
 	rejectUnsupportedSearchOption,
 	searchDocumentIdentity,
@@ -39,6 +40,7 @@ const ELASTICSEARCH_OPTION_KEYS = ['client', 'node', 'indexPrefix'] as const;
 const ELASTICSEARCH_PREFIX_VALIDATION_SUFFIX = 'active_ts_model';
 const ELASTICSEARCH_INDEX_MAX_BYTES = 255;
 const ELASTICSEARCH_ID_MAX_BYTES = 512;
+const ELASTICSEARCH_TOMBSTONE_FIELD = 'active_ts_deleted';
 const ELASTICSEARCH_RESERVED_PROJECTION_FIELD_NAMES = stringSet([
 	'_id',
 	'_source',
@@ -49,7 +51,8 @@ const ELASTICSEARCH_RESERVED_PROJECTION_FIELD_NAMES = stringSet([
 	'_seq_no',
 	'_primary_term',
 	'_version',
-	'_ignored'
+	'_ignored',
+	ELASTICSEARCH_TOMBSTONE_FIELD
 ]);
 
 function stringSet(values: readonly string[]) {
@@ -112,7 +115,7 @@ function elasticsearchSearchBody(
 				`Elasticsearch native parameter "${key}" cannot be combined with portable search fields. active-ts owns pagination for portable searches.`
 			);
 		}
-		return { ...native, ...elasticsearchTextBody(query, fields, sourceFields) };
+		return withElasticsearchLiveDocumentFilter({ ...native, ...elasticsearchTextBody(query, fields, sourceFields) });
 	}
 	if (native && hasActiveTsLimit) {
 		for (const key of ['size', 'from', 'search_after']) {
@@ -122,7 +125,18 @@ function elasticsearchSearchBody(
 			);
 		}
 	}
-	return native ?? elasticsearchTextBody(query, fields, sourceFields);
+	return withElasticsearchLiveDocumentFilter(native ?? elasticsearchTextBody(query, fields, sourceFields));
+}
+
+function withElasticsearchLiveDocumentFilter(body: Record<string, unknown>) {
+	const tombstone = { term: { [ELASTICSEARCH_TOMBSTONE_FIELD]: true } };
+	const postFilter = ownOptionValue(body, 'post_filter');
+	return {
+		...body,
+		post_filter: postFilter === undefined
+			? { bool: { must_not: [tombstone] } }
+			: { bool: { filter: [postFilter], must_not: [tombstone] } }
+	};
 }
 
 type ElasticsearchNativePagination = {
@@ -183,7 +197,7 @@ export async function createElasticsearchSearchAdapter(options: ElasticsearchOpt
 
 	return markProjectingSearchAdapter({
 		kind: 'elasticsearch',
-		capabilities: { where: false, cursor: false, native: true, index: true },
+		capabilities: { where: false, cursor: false, native: true, index: true, revisionWrites: true },
 		async search(model, query: string, searchOptions: SearchOptions = {}): Promise<QueryResult> {
 			model = snapshotSearchAdapterModel(model, 'Elasticsearch model metadata', 'elasticsearch');
 			searchOptions = normalizeSearchAdapterOptions(searchOptions, 'Elasticsearch search options', {
@@ -219,8 +233,9 @@ export async function createElasticsearchSearchAdapter(options: ElasticsearchOpt
 			if (more !== undefined) result.more = more;
 			return result;
 		},
-		async index(model, id: EntityId, data: any) {
+		async index(model, id: EntityId, data: any, writeOptions = {}) {
 			model = snapshotSearchAdapterModel(model, 'Elasticsearch model metadata', 'elasticsearch');
+			writeOptions = normalizeSearchWriteOptions(writeOptions, 'Elasticsearch index options');
 			assertSafeElasticsearchProjectionField(model.idField, 'Elasticsearch model id field');
 			elasticsearchSearchFields(model);
 			elasticsearchProjectionFields(model);
@@ -233,17 +248,37 @@ export async function createElasticsearchSearchAdapter(options: ElasticsearchOpt
 			await client.index(cloneJsonTransportPayload({
 				index: indexName(model.name),
 				id: documentId,
+				...(writeOptions.revision === undefined
+					? {}
+					: { version: writeOptions.revision, version_type: 'external' }),
 				document: projectSearchDocument(model, 'elasticsearch', id, data, {
 					trustDatastoreEntityKey: false
 				})
-			}, 'Elasticsearch index request'));
+			}, 'Elasticsearch index request')).catch((error: unknown) => {
+				if (writeOptions.revision !== undefined && isVersionConflictError(error)) return undefined;
+				throw error;
+			});
 		},
-		async delete(model, id: EntityId) {
+		async delete(model, id: EntityId, writeOptions = {}) {
 			model = snapshotSearchAdapterModel(model, 'Elasticsearch model metadata', 'elasticsearch');
+			writeOptions = normalizeSearchWriteOptions(writeOptions, 'Elasticsearch delete options');
 			const documentId = elasticsearchDocumentId(
 				searchDocumentIdentity(model, id, `${model.name} search delete id`),
 				`${model.name} search delete id`
 			);
+			if (writeOptions.revision !== undefined) {
+				await client.index(cloneJsonTransportPayload({
+					index: indexName(model.name),
+					id: documentId,
+					version: writeOptions.revision,
+					version_type: 'external',
+					document: { [ELASTICSEARCH_TOMBSTONE_FIELD]: true }
+				}, 'Elasticsearch delete tombstone request')).catch((error: unknown) => {
+					if (isVersionConflictError(error)) return undefined;
+					throw error;
+				});
+				return;
+			}
 			await client.delete(cloneJsonTransportPayload({
 				index: indexName(model.name),
 				id: documentId
@@ -579,7 +614,16 @@ function documentIdentityFromElasticsearchHit(hit: any, model: ResolvedModelMeta
 }
 
 function isMissingDocumentError(error: unknown) {
+	return elasticsearchErrorStatus(error) === 404;
+}
+
+function isVersionConflictError(error: unknown) {
+	return elasticsearchErrorStatus(error) === 409;
+}
+
+function elasticsearchErrorStatus(error: unknown) {
 	const statusCode = ownErrorValue(error, 'statusCode');
+	if (typeof statusCode === 'number') return statusCode;
 	const meta = ownErrorValue(error, 'meta');
-	return statusCode === 404 || (isPlainErrorObject(meta) && ownErrorValue(meta, 'statusCode') === 404);
+	return isPlainErrorObject(meta) ? ownErrorValue(meta, 'statusCode') : undefined;
 }

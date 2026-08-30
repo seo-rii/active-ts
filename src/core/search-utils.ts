@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { DatastoreKey, QueryPlan, ResolvedModelMeta, SearchAdapter, SearchIndexMeta, SearchOptions, StoreAdapter, WhereValue } from './types.js';
+import type { DatastoreKey, QueryPlan, ResolvedModelMeta, SearchAdapter, SearchIndexMeta, SearchOptions, SearchWriteOptions, StoreAdapter, WhereValue } from './types.js';
 import { ActiveTsConfigurationError, ActiveTsValidationError } from './errors.js';
 import {
 	assertSafeCacheKey,
@@ -40,6 +40,7 @@ import {
 const MAX_SEARCH_QUERY_LENGTH = 4096;
 const SEARCH_OPTION_KEYS = ['where', 'native', 'limit', 'cursor'] as const;
 const SEARCH_OPTION_KEY_SET = stringSet(SEARCH_OPTION_KEYS);
+const SEARCH_WRITE_OPTION_KEY_SET = stringSet(['revision']);
 const NATIVE_SEARCH_SOURCE_STORE = Symbol('active-ts.native-search.source-store');
 const NATIVE_SEARCH_REBIND = Symbol('active-ts.native-search.rebind');
 const SEARCH_ADAPTER_SOURCE = Symbol('active-ts.search-adapter.source');
@@ -310,6 +311,41 @@ export function normalizeSearchAdapterOptions(
 		limit: limit === undefined ? undefined : assertSafeLimit(limit as number, diagnostics.limit ?? `${context} limit`),
 		cursor: assertSafeCursor(cursor, diagnostics.cursor ?? `${context} cursor`)
 	};
+}
+
+export function normalizeSearchWriteOptions(options: unknown, context: string): SearchWriteOptions {
+	if (options === undefined) return {};
+	if (!options || typeof options !== 'object' || Array.isArray(options)) {
+		throw new ActiveTsValidationError(`${context} must be a plain object.`);
+	}
+	const prototype = OBJECT_GET_PROTOTYPE_OF(options);
+	if (prototype !== Object.prototype && prototype !== null) {
+		throw new ActiveTsValidationError(`${context} must be a plain object.`);
+	}
+	if (OBJECT_GET_OWN_PROPERTY_SYMBOLS(options).length) {
+		throw new ActiveTsValidationError(`${context} cannot contain symbol fields.`);
+	}
+	for (const property of OBJECT_GET_OWN_PROPERTY_NAMES(options)) {
+		if (!SET_HAS.call(SEARCH_WRITE_OPTION_KEY_SET, property)) {
+			throw new ActiveTsValidationError(`${context} contains unknown option "${property}".`);
+		}
+	}
+	const revision = ownOptionValue(options as Record<string, unknown>, 'revision', context);
+	if (revision !== undefined && (typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision <= 0)) {
+		throw new ActiveTsValidationError(`${context}.revision must be a positive safe integer.`);
+	}
+	return revision === undefined ? {} : { revision };
+}
+
+export function assertSearchWriteOptionsSupported(
+	adapter: Pick<SearchAdapter, 'kind' | 'capabilities'>,
+	options: SearchWriteOptions
+) {
+	if (options.revision !== undefined && !searchCapability(adapter.capabilities, 'revisionWrites')) {
+		throw new ActiveTsConfigurationError(
+			`Search adapter "${adapter.kind}" does not support revision-ordered writes.`
+		);
+	}
 }
 
 export function rejectUnsupportedSearchOption(value: unknown, option: string, context: string) {

@@ -56,12 +56,14 @@ import { normalizeStoreSchemaApplyOptions } from './schema-options.js';
 import {
 	assertSafeSearchQuery,
 	assertSearchOptionsSupported,
+	assertSearchWriteOptionsSupported,
 	CONTEXT_BOUND_SEARCH_DATASTORE_NAMESPACE,
 	datastoreSearchHitDocumentIdentityOrForced,
 	markSearchAdapterSource,
 	markSearchDocumentIdentity,
 	nativeSearchSourceStore,
 	normalizeSearchAdapterOptions,
+	normalizeSearchWriteOptions,
 	projectSearchDocument,
 	rebindNativeSearchAdapter,
 	searchDocumentIdentity,
@@ -236,7 +238,8 @@ const SEARCH_CAPABILITY_KEYS: Array<Exclude<keyof SearchCapabilities, 'whereOper
 	'nullOperators',
 	'cursor',
 	'native',
-	'index'
+	'index',
+	'revisionWrites'
 ];
 const HOOK_PAYLOAD_INPUT_KEYS = capturedSet<keyof ActiveTsHookPayload>([
 	'context',
@@ -1612,10 +1615,11 @@ export class ActiveContext {
 					'context search'
 				);
 			}),
-			index: (model, id, data) => this.trackOperation(async () => {
+			index: (model, id, data, options) => this.trackOperation(async () => {
 				const retained = this.searchForRetainedHandle(name);
 				const safeModel = snapshotAdapterModel(model, 'context search index model metadata');
 				const safeId = normalizeContextEntityId(id, 'context search index id');
+				const safeOptions = normalizeSearchWriteOptions(options, 'context search index options');
 				const indexKind = searchIndexAdapterKind(retained, name);
 				const adapterMeta = withDatastoreSearchNamespace(
 					withSearchIndexesForAdapter(safeModel, name, indexKind),
@@ -1627,20 +1631,23 @@ export class ActiveContext {
 				});
 				const adapterData = cloneSafeDataObjectWithoutActiveEntityKey(safeData, 'context search index data');
 				if (!isTransactionScopedSearchAdapter(retained)) assertContextSearchIndexSupported(retained);
-				await retained.index(adapterMeta, safeId, adapterData);
+				assertSearchWriteOptionsSupported(retained, safeOptions);
+				await retained.index(adapterMeta, safeId, adapterData, safeOptions);
 			}),
-			delete: (model, id) => this.trackOperation(async () => {
+			delete: (model, id, options) => this.trackOperation(async () => {
 				const retained = this.searchForRetainedHandle(name);
 				const safeModel = snapshotAdapterModel(model, 'context search delete model metadata');
 				const safeId = normalizeContextEntityId(id, 'context search delete id');
+				const safeOptions = normalizeSearchWriteOptions(options, 'context search delete options');
 				const indexKind = searchIndexAdapterKind(retained, name);
 				const adapterMeta = withDatastoreSearchNamespace(
 					withSearchIndexesForAdapter(safeModel, name, indexKind),
 					this.store(safeModel.store).datastoreNamespace
 				);
 				if (!isTransactionScopedSearchAdapter(retained)) assertContextSearchIndexSupported(retained);
+				assertSearchWriteOptionsSupported(retained, safeOptions);
 				searchDocumentIdentity(adapterMeta, safeId, 'context search delete id');
-				await retained.delete(adapterMeta, safeId);
+				await retained.delete(adapterMeta, safeId, safeOptions);
 			}),
 			schema: adapter.schema
 				? {
@@ -4871,7 +4878,7 @@ function createTransactionScopedSearchAdapter(adapter: SearchAdapter, routeName:
 	};
 	const capabilities = Object.freeze(
 		allowSearch
-			? { ...(adapter.capabilities ?? {}), index: false }
+			? { ...(adapter.capabilities ?? {}), index: false, revisionWrites: false }
 			: {
 					...(adapter.capabilities ?? {}),
 					where: false,
@@ -4881,7 +4888,8 @@ function createTransactionScopedSearchAdapter(adapter: SearchAdapter, routeName:
 					nullOperators: false,
 					cursor: false,
 					native: false,
-					index: false
+					index: false,
+					revisionWrites: false
 				}
 	);
 	const scopedSearch: SearchAdapter = {

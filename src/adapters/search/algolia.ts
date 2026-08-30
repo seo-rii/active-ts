@@ -16,6 +16,7 @@ import {
 	markSearchDocumentIdentity,
 	markProjectingSearchAdapter,
 	normalizeSearchAdapterOptions,
+	normalizeSearchWriteOptions,
 	projectSearchDocument,
 	rejectUnsupportedSearchOption,
 	searchDocumentIdentity,
@@ -182,8 +183,10 @@ export async function createAlgoliaSearchAdapter(options: AlgoliaOptions = {}): 
 				total
 			};
 		},
-		async index(model, id: EntityId, data: any) {
+		async index(model, id: EntityId, data: any, writeOptions = {}) {
 			model = snapshotSearchAdapterModel(model, 'Algolia model metadata', 'algolia');
+			writeOptions = normalizeSearchWriteOptions(writeOptions, 'Algolia index options');
+			rejectUnsupportedSearchOption(writeOptions.revision, 'revision-ordered writes', 'Algolia search adapter');
 			assertSafeAlgoliaProjectionField(model.idField, 'Algolia model id field');
 			algoliaSearchFields(model);
 			algoliaProjectionFields(model);
@@ -200,8 +203,10 @@ export async function createAlgoliaSearchAdapter(options: AlgoliaOptions = {}): 
 				}
 			}, 'Algolia index request'));
 		},
-		async delete(model, id: EntityId) {
+		async delete(model, id: EntityId, writeOptions = {}) {
 			model = snapshotSearchAdapterModel(model, 'Algolia model metadata', 'algolia');
+			writeOptions = normalizeSearchWriteOptions(writeOptions, 'Algolia delete options');
+			rejectUnsupportedSearchOption(writeOptions.revision, 'revision-ordered writes', 'Algolia search adapter');
 			assertSafeEntityId(id, `${model.name} search delete id`);
 			const documentIdentity = searchDocumentIdentity(model, id, `${model.name} search delete id`);
 			await client.deleteObject(cloneJsonTransportPayload({

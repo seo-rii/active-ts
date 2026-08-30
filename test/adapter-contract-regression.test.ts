@@ -2823,8 +2823,8 @@ test('search adapter contract accepts omitted result counts like runtime search 
 			const { count: _count, ...result } = await base.search(model, query, options);
 			return result;
 		},
-		index: (model, id, data) => base.index(model, id, data),
-		delete: (model, id) => base.delete(model, id)
+		index: (model, id, data, options) => base.index(model, id, data, options),
+		delete: (model, id, options) => base.delete(model, id, options)
 	};
 
 	await runSearchAdapterContract(adapter);
@@ -3017,15 +3017,15 @@ test('search adapter contract rejects adapters that accept unsafe index payloads
 		kind: 'unsafe-index-search-contract',
 		capabilities: base.capabilities,
 		search: (model, query, options) => base.search(model, query, options),
-		index: async (model, id, data) => {
+		index: async (model, id, data, options) => {
 			const title = searchContractValueAt(data, 'title');
 			if (typeof title === 'string' && title.startsWith('unsafe-contract-')) {
 				await base.index(model, id, { id, title });
 				return;
 			}
-			await base.index(model, id, data);
+			await base.index(model, id, data, options);
 		},
-		delete: (model, id) => base.delete(model, id)
+		delete: (model, id, options) => base.delete(model, id, options)
 	};
 
 	await assert.rejects(

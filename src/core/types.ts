@@ -174,6 +174,7 @@ export type SearchCapabilities = Partial<{
 	cursor: boolean;
 	native: boolean;
 	index: boolean;
+	revisionWrites: boolean;
 }>;
 
 export type StoreAdapter = {
@@ -232,13 +233,18 @@ export type SearchAdapter = {
 	searchIndexKind?: string;
 	capabilities?: SearchCapabilities;
 	search: (model: ResolvedModelMeta, query: string, options: SearchOptions) => Promise<QueryResult>;
-	index: (model: ResolvedModelMeta, id: EntityId, data: any) => Promise<void>;
-	delete: (model: ResolvedModelMeta, id: EntityId) => Promise<void>;
+	index: (model: ResolvedModelMeta, id: EntityId, data: any, options?: SearchWriteOptions) => Promise<void>;
+	delete: (model: ResolvedModelMeta, id: EntityId, options?: SearchWriteOptions) => Promise<void>;
 	schema?: {
 		plan: (models: ResolvedModelMeta[]) => Promise<SchemaPlan>;
 		apply: (models: ResolvedModelMeta[], options: { mode: Exclude<SchemaSyncMode, 'off'> }) => Promise<SchemaPlan>;
 	};
 	syncSchema?: (models: ResolvedModelMeta[]) => Promise<SchemaPlan>;
+};
+
+export type SearchWriteOptions = {
+	/** Monotonic document revision. Adapters with `revisionWrites` ignore older or equal writes. */
+	revision?: number;
 };
 
 export type StoreReadOptions = {

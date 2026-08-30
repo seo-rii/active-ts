@@ -1,4 +1,4 @@
-import type { QueryResult, ResolvedModelMeta, SearchAdapter, SearchOptions } from '../../core/types.js';
+import type { QueryResult, ResolvedModelMeta, SearchAdapter, SearchOptions, SearchWriteOptions } from '../../core/types.js';
 import { assertSafeEntityId, assertSafeSchemaIdentifier, cloneSafeData, defineDataProperty } from '../../core/safe-keys.js';
 import { snapshotSearchAdapterModel } from '../../core/adapter-model.js';
 import { MAP_CLEAR, MAP_DELETE, MAP_ENTRIES, MAP_GET, MAP_SET, MAP_VALUES } from '../../core/collection-intrinsics.js';
@@ -14,6 +14,7 @@ import {
 	searchHitDocumentIdentity,
 	markSearchDocumentIdentity,
 	searchDocumentIdentity,
+	normalizeSearchWriteOptions,
 	searchFieldsForAdapter
 } from '../../core/search-utils.js';
 
@@ -42,9 +43,11 @@ export class MemorySearchAdapter implements SearchAdapter {
 		nullOperators: true,
 		cursor: false,
 		native: false,
-		index: true
+		index: true,
+		revisionWrites: true
 	};
 	private readonly indexes = new Map<string, Map<string, any>>();
+	private readonly revisions = new Map<string, Map<string, number>>();
 	readonly stats = {
 		search: 0,
 		index: 0,
@@ -90,8 +93,9 @@ export class MemorySearchAdapter implements SearchAdapter {
 		};
 	}
 
-	async index(model: ResolvedModelMeta, id: string | number, data: any) {
+	async index(model: ResolvedModelMeta, id: string | number, data: any, options: SearchWriteOptions = {}) {
 		model = snapshotSearchAdapterModel(model, 'memory search model metadata', this.kind);
+		options = normalizeSearchWriteOptions(options, 'memory search index options');
 		const key = searchDocumentIdentity(model, id, `${model.name} search document id`, data, {
 			trustDatastoreEntityKey: false
 		});
@@ -99,22 +103,32 @@ export class MemorySearchAdapter implements SearchAdapter {
 			trustDatastoreEntityKey: false
 		});
 		this.stats.index++;
+		if (!this.acceptRevision(model.name, key, options.revision)) return;
 		MAP_SET.call(this.collectionIndex(model.name), key, document);
 	}
 
-	async delete(model: ResolvedModelMeta, id: string | number) {
+	async delete(model: ResolvedModelMeta, id: string | number, options: SearchWriteOptions = {}) {
 		model = snapshotSearchAdapterModel(model, 'memory search model metadata', this.kind);
 		assertSafeEntityId(id, `${model.name} search delete id`);
+		options = normalizeSearchWriteOptions(options, 'memory search delete options');
+		const key = searchDocumentIdentity(model, id, `${model.name} search delete id`);
 		this.stats.delete++;
+		if (!this.acceptRevision(model.name, key, options.revision)) return;
 		MAP_DELETE.call(
 			this.existingCollectionIndex(model.name),
-			searchDocumentIdentity(model, id, `${model.name} search delete id`)
+			key
 		);
 	}
 
 	clear(modelName?: string) {
-		if (modelName) MAP_DELETE.call(this.indexes, assertSafeSchemaIdentifier(modelName, 'memory search model name'));
-		else MAP_CLEAR.call(this.indexes);
+		if (modelName) {
+			const safeName = assertSafeSchemaIdentifier(modelName, 'memory search model name');
+			MAP_DELETE.call(this.indexes, safeName);
+			MAP_DELETE.call(this.revisions, safeName);
+		} else {
+			MAP_CLEAR.call(this.indexes);
+			MAP_CLEAR.call(this.revisions);
+		}
 		this.resetStats();
 	}
 
@@ -156,6 +170,20 @@ export class MemorySearchAdapter implements SearchAdapter {
 	private existingCollectionIndex(name: string) {
 		const safeName = assertSafeSchemaIdentifier(name, 'memory search model name');
 		return MAP_GET.call(this.indexes, safeName) ?? new Map<string, any>();
+	}
+
+	private acceptRevision(name: string, key: string, revision: number | undefined) {
+		if (revision === undefined) return true;
+		const safeName = assertSafeSchemaIdentifier(name, 'memory search model name');
+		let revisions = MAP_GET.call(this.revisions, safeName);
+		if (!revisions) {
+			revisions = new Map();
+			MAP_SET.call(this.revisions, safeName, revisions);
+		}
+		const current = MAP_GET.call(revisions, key);
+		if (current !== undefined && revision <= current) return false;
+		MAP_SET.call(revisions, key, revision);
+		return true;
 	}
 }
 
