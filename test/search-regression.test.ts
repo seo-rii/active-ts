@@ -1294,8 +1294,13 @@ test('search revision writes reject stale indexes, deletes, and resurrection', a
 		client: {
 			search: async () => ({ hits: { hits: [], total: { value: 0 } } }),
 			index: async () => {
-				const error = new Error('version conflict') as Error & { meta?: { statusCode: number } };
-				error.meta = { statusCode: 409 };
+				const error = new Error('version conflict') as Error & {
+					meta?: { statusCode: number; body: { error: { type: string } } };
+				};
+				error.meta = {
+					statusCode: 409,
+					body: { error: { type: 'version_conflict_engine_exception' } }
+				};
 				throw error;
 			},
 			delete: async () => undefined
@@ -1303,6 +1308,31 @@ test('search revision writes reject stale indexes, deletes, and resurrection', a
 	});
 	await staleElastic.index(meta, 1, { id: 1, title: 'stale revision', body: 'hidden' }, { revision: 19 });
 	await staleElastic.delete(meta, 1, { revision: 19 });
+	const unrelatedConflict = await createElasticsearchSearchAdapter({
+		client: {
+			search: async () => ({ hits: { hits: [], total: { value: 0 } } }),
+			index: async () => {
+				const error = new Error('unrelated conflict') as Error & {
+					meta?: { statusCode: number; body: { error: { type: string } } };
+				};
+				error.meta = {
+					statusCode: 409,
+					body: { error: { type: 'unexpected_conflict_exception' } }
+				};
+				throw error;
+			},
+			delete: async () => undefined
+		}
+	});
+	await assert.rejects(
+		() => unrelatedConflict.index(
+			meta,
+			1,
+			{ id: 1, title: 'unrelated conflict', body: 'hidden' },
+			{ revision: 22 }
+		),
+		/unrelated conflict/
+	);
 
 	const algolia = await createAlgoliaSearchAdapter({
 		client: {
@@ -1316,6 +1346,46 @@ test('search revision writes reject stale indexes, deletes, and resurrection', a
 		/does not support revision-ordered writes/
 	);
 	await assert.rejects(() => algolia.delete(meta, 1, { revision: 1 }), /does not support revision-ordered writes/);
+});
+
+test('elasticsearch can reject writes without revision fences', async () => {
+	const meta = createActiveTs({ stores: { default: new MemoryStoreAdapter() } }).meta(SearchParityRecord);
+	let indexCalls = 0;
+	let deleteCalls = 0;
+	const client = {
+		search: async () => ({ hits: { hits: [], total: { value: 0 } } }),
+		index: async () => {
+			indexCalls++;
+		},
+		delete: async () => {
+			deleteCalls++;
+		}
+	};
+	const elastic = await createElasticsearchSearchAdapter({
+		client,
+		requireRevisionWrites: true
+	});
+
+	await assert.rejects(
+		() => elastic.index(meta, 1, { id: 1, title: 'missing fence', body: 'hidden' }),
+		/Elasticsearch index requires a revision because requireRevisionWrites is enabled/
+	);
+	await assert.rejects(
+		() => elastic.delete(meta, 1),
+		/Elasticsearch delete requires a revision because requireRevisionWrites is enabled/
+	);
+	assert.equal(indexCalls, 0);
+	assert.equal(deleteCalls, 0);
+
+	await elastic.index(meta, 1, { id: 1, title: 'fenced', body: 'hidden' }, { revision: 1 });
+	await elastic.delete(meta, 1, { revision: 2 });
+	assert.equal(indexCalls, 2);
+	assert.equal(deleteCalls, 0);
+
+	await assert.rejects(
+		() => createElasticsearchSearchAdapter({ client, requireRevisionWrites: 'yes' as any }),
+		/Elasticsearch adapter requireRevisionWrites must be a boolean/
+	);
 });
 
 test('algolia search adapter rejects reserved backend projection fields before backend calls', async () => {

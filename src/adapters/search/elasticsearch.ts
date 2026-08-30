@@ -35,8 +35,10 @@ export type ElasticsearchOptions = {
 	client?: any;
 	node?: string;
 	indexPrefix?: string;
+	/** Reject index/delete calls that do not carry a monotonic revision fence. */
+	requireRevisionWrites?: boolean;
 };
-const ELASTICSEARCH_OPTION_KEYS = ['client', 'node', 'indexPrefix'] as const;
+const ELASTICSEARCH_OPTION_KEYS = ['client', 'node', 'indexPrefix', 'requireRevisionWrites'] as const;
 const ELASTICSEARCH_PREFIX_VALIDATION_SUFFIX = 'active_ts_model';
 const ELASTICSEARCH_INDEX_MAX_BYTES = 255;
 const ELASTICSEARCH_ID_MAX_BYTES = 512;
@@ -236,6 +238,7 @@ export async function createElasticsearchSearchAdapter(options: ElasticsearchOpt
 		async index(model, id: EntityId, data: any, writeOptions = {}) {
 			model = snapshotSearchAdapterModel(model, 'Elasticsearch model metadata', 'elasticsearch');
 			writeOptions = normalizeSearchWriteOptions(writeOptions, 'Elasticsearch index options');
+			assertElasticsearchRevisionWrite(options.requireRevisionWrites, writeOptions.revision, 'index');
 			assertSafeElasticsearchProjectionField(model.idField, 'Elasticsearch model id field');
 			elasticsearchSearchFields(model);
 			elasticsearchProjectionFields(model);
@@ -262,6 +265,7 @@ export async function createElasticsearchSearchAdapter(options: ElasticsearchOpt
 		async delete(model, id: EntityId, writeOptions = {}) {
 			model = snapshotSearchAdapterModel(model, 'Elasticsearch model metadata', 'elasticsearch');
 			writeOptions = normalizeSearchWriteOptions(writeOptions, 'Elasticsearch delete options');
+			assertElasticsearchRevisionWrite(options.requireRevisionWrites, writeOptions.revision, 'delete');
 			const documentId = elasticsearchDocumentId(
 				searchDocumentIdentity(model, id, `${model.name} search delete id`),
 				`${model.name} search delete id`
@@ -468,6 +472,11 @@ function validateElasticsearchOptions(options: ElasticsearchOptions) {
 	const node = ownFactoryOptionValue(record, 'node', 'Elasticsearch adapter option');
 	const indexPrefix = ownFactoryOptionValue(record, 'indexPrefix', 'Elasticsearch adapter option');
 	const client = ownFactoryOptionValue(record, 'client', 'Elasticsearch adapter option');
+	const requireRevisionWrites = ownFactoryOptionValue(
+		record,
+		'requireRevisionWrites',
+		'Elasticsearch adapter option'
+	);
 	if (node !== undefined && typeof node !== 'string') {
 		throw new ActiveTsConfigurationError('Elasticsearch adapter node must be a string.');
 	}
@@ -480,12 +489,27 @@ function validateElasticsearchOptions(options: ElasticsearchOptions) {
 	if (client !== undefined && node !== undefined) {
 		throw new ActiveTsConfigurationError('Elasticsearch adapter options cannot combine client and node.');
 	}
+	if (requireRevisionWrites !== undefined && typeof requireRevisionWrites !== 'boolean') {
+		throw new ActiveTsConfigurationError('Elasticsearch adapter requireRevisionWrites must be a boolean.');
+	}
 	if (client !== undefined) {
 		normalizeElasticsearchClient(client);
 	} else if (typeof node !== 'string' || !node) {
 		throw new ActiveTsConfigurationError('Elasticsearch adapter node must be a non-empty string when no client is supplied.');
 	}
-	return { node, indexPrefix, client } as ElasticsearchOptions;
+	return { node, indexPrefix, client, requireRevisionWrites } as ElasticsearchOptions;
+}
+
+function assertElasticsearchRevisionWrite(
+	required: boolean | undefined,
+	revision: number | undefined,
+	operation: 'index' | 'delete'
+) {
+	if (required === true && revision === undefined) {
+		throw new ActiveTsConfigurationError(
+			`Elasticsearch ${operation} requires a revision because requireRevisionWrites is enabled.`
+		);
+	}
 }
 
 function assertSafeElasticsearchIndexName(index: string) {
@@ -618,7 +642,14 @@ function isMissingDocumentError(error: unknown) {
 }
 
 function isVersionConflictError(error: unknown) {
-	return elasticsearchErrorStatus(error) === 409;
+	if (elasticsearchErrorStatus(error) !== 409) return false;
+	const meta = ownErrorValue(error, 'meta');
+	if (!isPlainErrorObject(meta)) return false;
+	const body = ownErrorValue(meta, 'body');
+	if (!isPlainErrorObject(body)) return false;
+	const details = ownErrorValue(body, 'error');
+	if (!isPlainErrorObject(details)) return false;
+	return ownErrorValue(details, 'type') === 'version_conflict_engine_exception';
 }
 
 function elasticsearchErrorStatus(error: unknown) {
