@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { ActiveContext, assertOutsideActiveTransaction, isContextBoundSearchAdapter } from './context.js';
 import {
@@ -64,8 +64,10 @@ import {
 	storeTrustsDatastoreEntityKeyRows
 } from './store-options.js';
 import { storeAdapterSourceChain } from './store-utils.js';
+import { normalizeSchemaModels, normalizeSchemaPlan } from './schema-utils.js';
+import { normalizeStoreSchemaApplyOptions } from './schema-options.js';
 import { MODEL_DATASTORE_WRITE_ANCESTOR } from './model-internal.js';
-import type { ActiveTsPlugin, DatastoreKey, EntityId, ModelConstructor, QueryPlan, ResolvedModelMeta, SearchAdapter, SearchCapabilities, StoreAdapter } from './types.js';
+import type { ActiveTsPlugin, DatastoreKey, EntityId, ModelConstructor, QueryPlan, ResolvedModelMeta, SchemaPlan, SearchAdapter, SearchCapabilities, StoreAdapter } from './types.js';
 
 export type OutboxOperation = 'create' | 'update' | 'delete';
 
@@ -120,6 +122,8 @@ export type OutboxAdapter = {
 	lease?: (options?: OutboxBatchOptions) => Promise<OutboxEvent[]>;
 	supportsExclusiveLease?: () => Promise<boolean> | boolean;
 	isLeaseCurrent?: (event: OutboxEvent) => Promise<boolean>;
+	/** Returns a durable per-document fence, or undefined when the event lease is no longer current. */
+	reserveSearchRevision?: (event: OutboxEvent, documentIdentity?: string) => Promise<number | undefined>;
 	renewLease?: (event: OutboxEvent) => Promise<OutboxEvent | undefined>;
 	release?: (events: OutboxEvent[]) => Promise<void>;
 	ack?: (events: OutboxEvent[]) => Promise<void | boolean>;
@@ -143,9 +147,10 @@ const SEARCH_SYNC_WORKER_OPTION_KEYS = [
 	'retryDelayMs',
 	'deadLetter',
 	'allowUnsafeDrainFallback',
-	'allowUnsafeIdentityOnlyDatastoreDelete'
+	'allowUnsafeIdentityOnlyDatastoreDelete',
+	'allowUnsafeUnfencedSearchWrites'
 ] as const;
-const STORE_OUTBOX_ADAPTER_OPTION_KEYS = ['context', 'store', 'modelName'] as const;
+const STORE_OUTBOX_ADAPTER_OPTION_KEYS = ['context', 'store', 'modelName', 'revisionModelName'] as const;
 const SEARCH_SYNC_CAPABILITY_KEYS: Array<Exclude<keyof SearchCapabilities, 'whereOperators'>> = [
 	'where',
 	'nestedFields',
@@ -196,7 +201,9 @@ const OUTBOX_EVENT_KEYS = [
 	'lastDeliveryError'
 ] as const;
 const DEFAULT_STORE_OUTBOX_MODEL_NAME = 'active_ts_outbox_event';
+const DEFAULT_STORE_OUTBOX_SEARCH_REVISION_MODEL_NAME = 'active_ts_search_revision';
 const STORE_OUTBOX_LEASE_TTL_MS = 5 * 60 * 1000;
+const STORE_OUTBOX_SEARCH_REVISION_TIME_SCALE = 1024;
 const DEFAULT_SEARCH_SYNC_MAX_ATTEMPTS = 5;
 const DEFAULT_SEARCH_SYNC_RETRY_DELAY_MS = 0;
 const MAX_SEARCH_SYNC_RETRY_DELAY_MS = 60_000;
@@ -204,6 +211,7 @@ const STALE_SEARCH_SYNC_LEASE_RELEASE_ERROR = Symbol('active-ts.outbox.stale-sea
 let storeOutboxSequence = 0;
 
 class StoreOutboxEventModel {}
+class StoreOutboxSearchRevisionModel {}
 
 export class MemoryOutboxAdapter implements OutboxAdapter {
 	private readonly events: OutboxEvent[] = [];
@@ -337,17 +345,25 @@ export type StoreOutboxAdapterOptions = {
 	context?: ActiveContext;
 	store?: string;
 	modelName?: string;
+	/** Physical model used for persistent per-search-document fencing counters. */
+	revisionModelName?: string;
+};
+
+export type StoreOutboxSchemaApplyOptions = {
+	mode?: 'safe';
 };
 
 export class StoreOutboxAdapter implements OutboxAdapter {
 	readonly transactionStore!: string;
 	private context?: ActiveContext;
 	private readonly meta: ResolvedModelMeta;
+	private readonly revisionMeta: ResolvedModelMeta;
 
 	constructor(options: StoreOutboxAdapterOptions) {
 		const safeOptions = validateStoreOutboxAdapterOptions(options);
 		this.context = safeOptions.context;
 		this.meta = createStoreOutboxMeta(safeOptions.store, safeOptions.modelName);
+		this.revisionMeta = createStoreOutboxSearchRevisionMeta(safeOptions.store, safeOptions.revisionModelName);
 		defineDataProperty(this, 'transactionStore', this.meta.store, {
 			enumerable: true,
 			configurable: false,
@@ -364,6 +380,39 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 		}
 		contextInternalStore(context, this.meta.store);
 		this.context = context;
+	}
+
+	async schemaPlan(): Promise<SchemaPlan> {
+		assertOutsideActiveTransaction('plan store outbox schema changes');
+		const context = this.activeContext();
+		context.assertOutsideTransaction('plan store outbox schema changes');
+		const store = contextInternalStore(context, this.meta.store);
+		if (!store.schema) {
+			throw new ActiveTsConfigurationError(
+				`Store outbox adapter store "${store.kind}" does not expose schema hooks.`
+			);
+		}
+		return normalizeSchemaPlan(
+			await store.schema.plan(this.schemaModels()),
+			`Store outbox adapter store "${store.kind}" schema plan`
+		);
+	}
+
+	async schemaApply(options: StoreOutboxSchemaApplyOptions = {}): Promise<SchemaPlan> {
+		assertOutsideActiveTransaction('apply store outbox schema changes');
+		const context = this.activeContext();
+		context.assertOutsideTransaction('apply store outbox schema changes');
+		const store = contextInternalStore(context, this.meta.store);
+		if (!store.schema) {
+			throw new ActiveTsConfigurationError(
+				`Store outbox adapter store "${store.kind}" does not expose schema hooks.`
+			);
+		}
+		const applyOptions = normalizeStoreSchemaApplyOptions(options, 'Store outbox adapter schema apply options');
+		return normalizeSchemaPlan(
+			await store.schema.apply(this.schemaModels(), applyOptions),
+			`Store outbox adapter store "${store.kind}" schema apply plan`
+		);
 	}
 
 	async append(event: OutboxEvent): Promise<void | OutboxEvent> {
@@ -483,6 +532,88 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 		return current !== undefined &&
 			isOutboxLeaseCurrent(current, normalized.leaseToken, new Date()) &&
 			isOutboxSnapshotCurrent(current, normalized);
+	}
+
+	async reserveSearchRevision(event: OutboxEvent, documentIdentity?: string) {
+		const normalized = sanitizeOutboxEvent(event, { requireModelId: true });
+		if (normalized.leaseToken === undefined) {
+			throw new ActiveTsConfigurationError('Store outbox reserveSearchRevision requires a leased event.');
+		}
+		const safeDocumentIdentity = documentIdentity === undefined
+			? undefined
+			: assertSafeCacheKey(documentIdentity, 'Store outbox search document identity');
+		const context = this.activeContext();
+		const store = contextInternalStore(context, this.meta.store);
+		const run = async (activeContext: ActiveContext, revalidateLease: boolean) => {
+			const current = await this.currentOutboxEvent(activeContext, normalized.id);
+			if (
+				!current ||
+				!isOutboxSnapshotCurrent(current, normalized) ||
+				!isOutboxLeaseCurrent(current, normalized.leaseToken!, new Date())
+			) {
+				return undefined;
+			}
+			const revisionStore = contextInternalStore(activeContext, this.revisionMeta.store);
+			const revisionId = storeOutboxSearchRevisionId(normalized, safeDocumentIdentity);
+			const rawRevision = await revisionStore.get(this.revisionMeta, revisionId);
+			let revision: number;
+			if (rawRevision === null || rawRevision === undefined) {
+				revision = initialStoreOutboxSearchRevision();
+				await revisionStore.create(this.revisionMeta, revisionId, { id: revisionId, revision, version: 0 });
+			} else {
+				const currentRevision = sanitizeStoreOutboxSearchRevision(rawRevision, revisionId);
+				if (
+					currentRevision.revision >= Number.MAX_SAFE_INTEGER ||
+					currentRevision.version >= Number.MAX_SAFE_INTEGER
+				) {
+					throw new ActiveTsConflictError(
+						`Store outbox search revision is exhausted for event "${normalized.id}".`
+					);
+				}
+				revision = currentRevision.revision + 1;
+				const next = { id: revisionId, revision, version: currentRevision.version + 1 };
+				await revisionStore.update(
+					this.revisionMeta,
+					revisionId,
+					next,
+					store.capabilities?.optimisticLock === true
+						? { expectedVersion: currentRevision.version }
+						: undefined
+				);
+			}
+			if (revalidateLease) {
+				const latest = await this.currentOutboxEvent(activeContext, normalized.id);
+				if (
+					!latest ||
+					!isOutboxSnapshotCurrent(latest, normalized) ||
+					!isOutboxLeaseCurrent(latest, normalized.leaseToken!, new Date())
+				) {
+					return undefined;
+				}
+			}
+			return revision;
+		};
+		try {
+			if (store.capabilities?.optimisticLock === true) return await run(context, true);
+			if (storeSupportsOutboxLeaseTransactions(store)) {
+				return await context.transaction((tx) => run(tx, false), { store: this.meta.store });
+			}
+			throw new ActiveTsConfigurationError(
+				`Store outbox adapter requires store "${store.kind}" to support optimistic locking or conflict-detecting transactions for search revision reservations.`
+			);
+		} catch (error) {
+			if (isStoreOutboxLeaseClaimConflict(store, error)) {
+				if (!(await this.isLeaseCurrent(normalized))) return undefined;
+			}
+			throw error;
+		}
+	}
+
+	private schemaModels() {
+		return normalizeSchemaModels(
+			[this.meta, this.revisionMeta],
+			'Store outbox adapter schema models'
+		);
 	}
 
 	async renewLease(event: OutboxEvent) {
@@ -978,15 +1109,26 @@ function validateStoreOutboxAdapterOptions(options: StoreOutboxAdapterOptions) {
 	const context = ownOptionValue(record, 'context', 'Store outbox adapter options');
 	const store = ownOptionValue(record, 'store', 'Store outbox adapter options');
 	const modelName = ownOptionValue(record, 'modelName', 'Store outbox adapter options');
+	const revisionModelName = ownOptionValue(record, 'revisionModelName', 'Store outbox adapter options');
 	if (context !== undefined && !(context instanceof ActiveContext)) {
 		throw new ActiveTsConfigurationError('Store outbox adapter context must be an ActiveContext.');
+	}
+	const safeModelName = modelName === undefined
+		? DEFAULT_STORE_OUTBOX_MODEL_NAME
+		: assertSafeSchemaIdentifier(modelName, 'Store outbox adapter modelName');
+	const safeRevisionModelName = revisionModelName === undefined
+		? DEFAULT_STORE_OUTBOX_SEARCH_REVISION_MODEL_NAME
+		: assertSafeSchemaIdentifier(revisionModelName, 'Store outbox adapter revisionModelName');
+	if (safeRevisionModelName === safeModelName) {
+		throw new ActiveTsConfigurationError(
+			'Store outbox adapter revisionModelName must differ from modelName.'
+		);
 	}
 	return {
 		context,
 		store: store === undefined ? 'default' : assertSafeSchemaIdentifier(store, 'Store outbox adapter store'),
-		modelName: modelName === undefined
-			? DEFAULT_STORE_OUTBOX_MODEL_NAME
-			: assertSafeSchemaIdentifier(modelName, 'Store outbox adapter modelName')
+		modelName: safeModelName,
+		revisionModelName: safeRevisionModelName
 	};
 }
 
@@ -1017,22 +1159,100 @@ function createStoreOutboxMeta(store: string, modelName: string): ResolvedModelM
 	};
 }
 
+function createStoreOutboxSearchRevisionMeta(store: string, modelName: string): ResolvedModelMeta {
+	return {
+		model: StoreOutboxSearchRevisionModel,
+		name: modelName,
+		store,
+		idField: 'id',
+		readValidation: 'off',
+		indexes: [],
+		searchIndexes: [],
+		relations: new Map(),
+		hooks: {},
+		views: new Map(),
+		policies: new Map(),
+		scopes: new Map(),
+		fieldCodecs: new Map(),
+		fieldTypes: new Map([
+			['revision', 'number'],
+			['version', 'number']
+		])
+	};
+}
+
 function sanitizeStoreOutboxEvent(event: OutboxEvent, options: { requireModelId: boolean }) {
 	return sanitizeOutboxEvent(stripStoreOutboxEntityKey(event), options);
 }
 
-function stripStoreOutboxEntityKey(event: OutboxEvent) {
-	if (!event || typeof event !== 'object' || Array.isArray(event)) return event;
-	const symbols = OBJECT_GET_OWN_PROPERTY_SYMBOLS(event);
-	if (symbols.length !== 1 || symbols[0] !== ACTIVE_TS_ENTITY_KEY) return event;
-	const clone = Object.create(OBJECT_GET_PROTOTYPE_OF(event));
-	for (const key of OBJECT_GET_OWN_PROPERTY_NAMES(event)) {
-		const descriptor = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(event, key);
+function sanitizeStoreOutboxSearchRevision(value: unknown, expectedId: string) {
+	value = stripStoreOutboxEntityKey(value);
+	if (!value || typeof value !== 'object' || Array.isArray(value)) {
+		throw new ActiveTsValidationError('Store outbox search revision row must be a plain object.');
+	}
+	assertPlainOptions(value, 'Store outbox search revision row');
+	const record = value as Record<string, unknown>;
+	assertNoSymbolOptions(record, 'Store outbox search revision row');
+	assertKnownOptions(record, ['id', 'revision', 'version'], 'Store outbox search revision row');
+	const id = assertSafeCacheKey(ownOptionValue(record, 'id', 'Store outbox search revision row'), 'Store outbox search revision id');
+	if (id !== expectedId) {
+		throw new ActiveTsValidationError(
+			`Store outbox search revision id "${id}" does not match requested id "${expectedId}".`
+		);
+	}
+	return {
+		id,
+		revision: assertPositiveSafeInteger(
+			ownOptionValue(record, 'revision', 'Store outbox search revision row'),
+			'Store outbox search revision'
+		),
+		version: assertNonNegativeSafeInteger(
+			ownOptionValue(record, 'version', 'Store outbox search revision row'),
+			'Store outbox search revision version'
+		)
+	};
+}
+
+function stripStoreOutboxEntityKey<T>(value: T): T {
+	if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+	const symbols = OBJECT_GET_OWN_PROPERTY_SYMBOLS(value);
+	if (symbols.length !== 1 || symbols[0] !== ACTIVE_TS_ENTITY_KEY) return value;
+	const clone = Object.create(OBJECT_GET_PROTOTYPE_OF(value));
+	for (const key of OBJECT_GET_OWN_PROPERTY_NAMES(value)) {
+		const descriptor = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(value, key);
 		if (descriptor) {
 			Object.defineProperty(clone, key, descriptor);
 		}
 	}
-	return clone;
+	return clone as T;
+}
+
+function storeOutboxSearchRevisionId(event: OutboxEvent, documentIdentity: string | undefined) {
+	if (
+		documentIdentity !== undefined &&
+		event.modelIdentity !== undefined &&
+		documentIdentity !== event.modelIdentity
+	) {
+		throw new ActiveTsValidationError(
+			`Store outbox search document identity does not match event "${event.id}".`
+		);
+	}
+	const identity = documentIdentity ?? event.modelIdentity ?? (
+		event.modelDatastoreAncestor === undefined
+			? entityIdKey(event.modelId!)
+			: datastoreSearchDocumentIdentity({ name: event.model }, event.modelId!, event.modelDatastoreAncestor)
+	);
+	return createHash('sha256')
+		.update(JSON.stringify([event.model, identity]))
+		.digest('hex');
+}
+
+function initialStoreOutboxSearchRevision() {
+	const revision = dateTime(new Date()) * STORE_OUTBOX_SEARCH_REVISION_TIME_SCALE;
+	if (!Number.isSafeInteger(revision) || revision <= 0) {
+		throw new ActiveTsConflictError('Store outbox search revision clock is outside the supported range.');
+	}
+	return revision;
 }
 
 function storeSupportsOutboxManagementTransactions(store: StoreAdapter) {
@@ -1643,6 +1863,7 @@ type SearchSyncWorkerSharedOptions = {
 	deadLetter?: (failures: OutboxDeliveryFailure[]) => Promise<void>;
 	allowUnsafeDrainFallback?: boolean;
 	allowUnsafeIdentityOnlyDatastoreDelete?: boolean;
+	allowUnsafeUnfencedSearchWrites?: boolean;
 };
 
 type SearchSyncWorkerContextOption<TOutbox extends OutboxAdapter> =
@@ -1693,6 +1914,29 @@ export async function runSearchSyncWorker<TOutbox extends OutboxAdapter = Outbox
 			throw new ActiveTsConfigurationError(
 				'Outbox search sync requires a context when using leases so stale external search mutations can be reconciled from the authoritative store.'
 			);
+		}
+		if (activeOptions.allowUnsafeUnfencedSearchWrites !== true) {
+			if (!activeOptions.outbox.reserveSearchRevision) {
+				throw new ActiveTsConfigurationError(
+					'Outbox search sync leased delivery requires outbox.reserveSearchRevision(). Pass allowUnsafeUnfencedSearchWrites: true to acknowledge stale external write risk.'
+				);
+			}
+			for (const model of activeOptions.models) {
+				const meta = activeOptions.context.meta(model);
+				const routes = resolveSearchSyncAdapterRoutes(
+					activeOptions.context,
+					meta,
+					activeOptions.adapter,
+					activeOptions.search,
+					activeOptions.searchSource
+				);
+				for (const route of routes) {
+					if (route.adapter.capabilities?.revisionWrites === true) continue;
+					throw new ActiveTsConfigurationError(
+						`Outbox search sync adapter "${route.name}" does not support revision-ordered writes. Pass allowUnsafeUnfencedSearchWrites: true to acknowledge stale external write risk.`
+					);
+				}
+			}
 		}
 		drained = await leaseOutboxEvents(batchOptions);
 	} else {
@@ -1775,6 +2019,7 @@ export async function runSearchSyncWorker<TOutbox extends OutboxAdapter = Outbox
 		let event: OutboxEvent | undefined;
 		let identitySnapshot = snapshotOutboxDeliveryIdentity(rawEvent, index);
 		let repair: Awaited<ReturnType<typeof enqueueSearchSyncRepair>> | undefined;
+		let searchRevision: number | undefined;
 		let preserveRepair = false;
 		if (outboxEntityOrderKeysBlocked(blockedEntityKeys, identitySnapshot.orderCheckKeys)) {
 			deferredEvents[deferredEvents.length] = { index, value: rawEvent, identity: identitySnapshot };
@@ -1817,11 +2062,30 @@ export async function runSearchSyncWorker<TOutbox extends OutboxAdapter = Outbox
 				activeOptions.allowUnsafeIdentityOnlyDatastoreDelete,
 				event.reconcileFromStore === true
 			);
+			if (usesLease && activeOptions.outbox.reserveSearchRevision) {
+				const reserved = await activeOptions.outbox.reserveSearchRevision(event, mutation.identity);
+				if (reserved === undefined) {
+					if (await ensureSearchSyncLeaseCurrent(activeOptions.outbox, event, true)) {
+						throw new ActiveTsConflictError(
+							`Outbox event "${event.id}" could not reserve a search revision while its lease remained current.`
+						);
+					}
+					blockOutboxEntityOrderKeys(blockedEntityKeys, outboxEntityOrderBlockKeys(event));
+					continue;
+				}
+				searchRevision = assertPositiveSafeInteger(
+					reserved,
+					`Outbox event "${event.id}" reserved search revision`
+				);
+			}
 			repair = usesLease && searchRoutes.length
 				? await enqueueSearchSyncRepair(activeOptions.outbox, event)
 				: undefined;
 			for (let routeIndex = 0; routeIndex < searchRoutes.length; routeIndex++) {
 				const searchRoute = searchRoutes[routeIndex];
+				const routeRevision = searchRoute.adapter.capabilities?.revisionWrites === true
+					? searchRevision
+					: undefined;
 				const searchEventMeta = searchSyncEventMeta(activeOptions.context, meta, searchRoute, mutation.identity);
 				const hookOperation = mutation.operation === 'index' ? 'index' : 'index-delete';
 				const hookData = mutation.operation === 'index' ? mutation.data : undefined;
@@ -1840,22 +2104,42 @@ export async function runSearchSyncWorker<TOutbox extends OutboxAdapter = Outbox
 					activeOptions.outbox,
 					event,
 					usesLease,
-					() => executeSearchSyncMutation(searchRoute.adapter, searchEventMeta, event!, mutation)
+					() => executeSearchSyncMutation(
+						searchRoute.adapter,
+						searchEventMeta,
+						event!,
+						mutation,
+						routeRevision
+					)
 				);
 				event = mutationResult.event;
 				events[index] = event;
 				if (mutationResult.mutationFailed) throw mutationResult.mutationError;
 				if (!mutationResult.current) {
 					preserveRepair = true;
-					await reconcileStaleSearchSyncMutation(
-						activeOptions.context!,
-						model,
-						meta,
-						repair!.event,
-						searchRoute,
-						activeOptions.searchSource,
-						activeOptions.allowUnsafeIdentityOnlyDatastoreDelete
-					);
+					if (routeRevision === undefined) {
+						const repairMutation = await resolveSearchSyncMutation(
+							activeOptions.context!,
+							model,
+							meta,
+							repair!.event,
+							activeOptions.searchSource,
+							activeOptions.allowUnsafeIdentityOnlyDatastoreDelete,
+							true
+						);
+						const repairMeta = searchSyncEventMeta(
+							activeOptions.context,
+							meta,
+							searchRoute,
+							repairMutation.identity
+						);
+						await executeSearchSyncMutation(
+							searchRoute.adapter,
+							repairMeta,
+							repair!.event,
+							repairMutation
+						);
+					}
 					blockOutboxEntityOrderKeys(blockedEntityKeys, outboxEntityOrderBlockKeys(event));
 					if (mutationResult.renewalError !== undefined) throw mutationResult.renewalError;
 					continue eventLoop;
@@ -2219,13 +2503,14 @@ async function executeSearchSyncMutation(
 	search: SearchAdapter,
 	meta: ResolvedModelMeta,
 	event: OutboxEvent,
-	mutation: SearchSyncMutation
+	mutation: SearchSyncMutation,
+	revision?: number
 ) {
 	if (mutation.operation === 'delete') {
-		await search.delete(meta, event.modelId!);
+		await search.delete(meta, event.modelId!, revision === undefined ? undefined : { revision });
 		return;
 	}
-	await search.index(meta, event.modelId!, mutation.data);
+	await search.index(meta, event.modelId!, mutation.data, revision === undefined ? undefined : { revision });
 }
 
 async function enqueueSearchSyncRepair(outbox: OutboxAdapter, event: OutboxEvent) {
@@ -2259,28 +2544,6 @@ async function enqueueSearchSyncRepair(outbox: OutboxAdapter, event: OutboxEvent
 		);
 	}
 	return { event: repairEvent, ackSnapshot };
-}
-
-async function reconcileStaleSearchSyncMutation(
-	context: ActiveContext,
-	model: ModelConstructor,
-	meta: ResolvedModelMeta,
-	event: OutboxEvent,
-	route: SearchSyncAdapterRoute,
-	searchSource: SearchAdapter,
-	allowUnsafeIdentityOnlyDatastoreDelete: boolean | undefined
-) {
-	const mutation = await resolveSearchSyncMutation(
-		context,
-		model,
-		meta,
-		event,
-		searchSource,
-		allowUnsafeIdentityOnlyDatastoreDelete,
-		true
-	);
-	const repairMeta = searchSyncEventMeta(context, meta, route, mutation.identity);
-	await executeSearchSyncMutation(route.adapter, repairMeta, event, mutation);
 }
 
 async function runSearchSyncMutationWithLease(
@@ -3015,6 +3278,11 @@ function validateSearchSyncWorkerOptions(options: SearchSyncWorkerOptions): Sear
 		'allowUnsafeIdentityOnlyDatastoreDelete',
 		'Outbox search sync options'
 	);
+	const allowUnsafeUnfencedSearchWrites = ownOptionValue(
+		record,
+		'allowUnsafeUnfencedSearchWrites',
+		'Outbox search sync options'
+	);
 	const normalizedOutbox = normalizeOutboxAdapter(outbox, 'Outbox search sync outbox', true);
 	const normalizedSearch = normalizeSearchSyncAdapter(search);
 	if (!Array.isArray(models)) {
@@ -3056,6 +3324,11 @@ function validateSearchSyncWorkerOptions(options: SearchSyncWorkerOptions): Sear
 			'Outbox search sync allowUnsafeIdentityOnlyDatastoreDelete must be a boolean.'
 		);
 	}
+	if (allowUnsafeUnfencedSearchWrites !== undefined && typeof allowUnsafeUnfencedSearchWrites !== 'boolean') {
+		throw new ActiveTsConfigurationError(
+			'Outbox search sync allowUnsafeUnfencedSearchWrites must be a boolean.'
+		);
+	}
 	return {
 		outbox: normalizedOutbox,
 		search: normalizedSearch,
@@ -3068,7 +3341,8 @@ function validateSearchSyncWorkerOptions(options: SearchSyncWorkerOptions): Sear
 		retryDelayMs: retryDelayMs as SearchSyncWorkerOptions['retryDelayMs'],
 		deadLetter: deadLetter as SearchSyncWorkerOptions['deadLetter'],
 		allowUnsafeDrainFallback: allowUnsafeDrainFallback as boolean | undefined,
-		allowUnsafeIdentityOnlyDatastoreDelete: allowUnsafeIdentityOnlyDatastoreDelete as boolean | undefined
+		allowUnsafeIdentityOnlyDatastoreDelete: allowUnsafeIdentityOnlyDatastoreDelete as boolean | undefined,
+		allowUnsafeUnfencedSearchWrites: allowUnsafeUnfencedSearchWrites as boolean | undefined
 	} as SearchSyncWorkerOptions & {
 		outbox: OutboxAdapter;
 		searchSource: SearchAdapter;
@@ -3311,6 +3585,7 @@ function normalizeOutboxAdapter(value: unknown, context: string, requireDrain: b
 	const lease = adapterMember(value, 'lease');
 	const supportsExclusiveLease = adapterMember(value, 'supportsExclusiveLease');
 	const isLeaseCurrent = adapterMember(value, 'isLeaseCurrent');
+	const reserveSearchRevision = adapterMember(value, 'reserveSearchRevision');
 	const renewLease = adapterMember(value, 'renewLease');
 	const release = adapterMember(value, 'release');
 	const ack = adapterMember(value, 'ack');
@@ -3344,6 +3619,9 @@ function normalizeOutboxAdapter(value: unknown, context: string, requireDrain: b
 	}
 	if (isLeaseCurrent !== undefined && typeof isLeaseCurrent !== 'function') {
 		throw new ActiveTsConfigurationError(`${context}.isLeaseCurrent must be a function.`);
+	}
+	if (reserveSearchRevision !== undefined && typeof reserveSearchRevision !== 'function') {
+		throw new ActiveTsConfigurationError(`${context}.reserveSearchRevision must be a function.`);
 	}
 	if (renewLease !== undefined && typeof renewLease !== 'function') {
 		throw new ActiveTsConfigurationError(`${context}.renewLease must be a function.`);
@@ -3405,6 +3683,9 @@ function normalizeOutboxAdapter(value: unknown, context: string, requireDrain: b
 		lease: typeof lease === 'function' ? lease.bind(value) : undefined,
 		supportsExclusiveLease: typeof supportsExclusiveLease === 'function' ? supportsExclusiveLease.bind(value) : undefined,
 		isLeaseCurrent: typeof isLeaseCurrent === 'function' ? isLeaseCurrent.bind(value) : undefined,
+		reserveSearchRevision: typeof reserveSearchRevision === 'function'
+			? reserveSearchRevision.bind(value)
+			: undefined,
 		renewLease: typeof renewLease === 'function' ? renewLease.bind(value) : undefined,
 		release: typeof release === 'function' ? release.bind(value) : undefined,
 		ack: typeof ack === 'function' ? ack.bind(value) : undefined,

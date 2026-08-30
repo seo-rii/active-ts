@@ -204,6 +204,28 @@ if (targets.has('postgres')) {
 		const context = createActiveTs({ stores: { default: adapter } });
 		const meta = context.meta(IntegrationPostgresNativeRecord);
 		await adapter.schema.apply([meta], { mode: 'safe' });
+		const postgresOutboxModelName = `integration_postgres_outbox_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
+		const postgresRevisionModelName = `integration_postgres_revision_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
+		const postgresOutbox = new StoreOutboxAdapter({
+			context,
+			modelName: postgresOutboxModelName,
+			revisionModelName: postgresRevisionModelName
+		});
+		const postgresOutboxPlan = await postgresOutbox.schemaPlan();
+		assert.deepEqual(
+			postgresOutboxPlan.changes
+				.filter((change) => change.type === 'create-collection')
+				.map((change) => change.target),
+			[postgresOutboxModelName, postgresRevisionModelName]
+		);
+		await postgresOutbox.schemaApply({ mode: 'safe' });
+		const provisionedOutboxTables = await pool.query(
+			'select table_name from information_schema.tables where table_schema = $1 and table_name = any($2::text[])',
+			[postgresSchemaName, [postgresOutboxModelName, postgresRevisionModelName]]
+		);
+		assert.equal(provisionedOutboxTables.rows.length, 2);
+		assert.ok(provisionedOutboxTables.rows.some((row) => row.table_name === postgresOutboxModelName));
+		assert.ok(provisionedOutboxTables.rows.some((row) => row.table_name === postgresRevisionModelName));
 		await adapter.create(meta, 1, { id: 1, handle: 'native-one', score: 11 });
 		const native = await adapter.query(meta, {
 			where: [],
@@ -1025,6 +1047,7 @@ if (targets.has('datastore') && targets.has('elasticsearch')) {
 	const parentKind = 'integration_datastore_outbox_search_parent';
 	const modelName = `integration_datastore_outbox_search_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
 	const outboxModelName = `integration_datastore_outbox_event_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
+	const revisionModelName = `integration_datastore_search_revision_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
 	class IntegrationDatastoreOutboxSearchRecord extends Model {}
 	defineModel({ name: modelName, search: 'elasticsearch' })
 		.id('id')
@@ -1043,7 +1066,11 @@ if (targets.has('datastore') && targets.has('elasticsearch')) {
 		});
 		const search = await createElasticsearchSearchAdapter({ client: elasticsearchClient, indexPrefix });
 		let eventId = 0;
-		const outbox = new StoreOutboxAdapter({ store: 'default', modelName: outboxModelName });
+		const outbox = new StoreOutboxAdapter({
+			store: 'default',
+			modelName: outboxModelName,
+			revisionModelName
+		});
 		const context = createActiveTs({
 			stores: { default: datastore },
 			search: { elasticsearch: search },
@@ -1089,6 +1116,10 @@ if (targets.has('datastore') && targets.has('elasticsearch')) {
 			context,
 			allowUnsafeDrainFallback: true
 		}), 2);
+		const [createdRevisionRows] = await client.runQuery(client.createQuery(namespace, revisionModelName));
+		assert.equal(createdRevisionRows.length, 2);
+		const createdRevisionTotal = createdRevisionRows.reduce((total, row) => total + row.revision, 0);
+		assert.ok(Number.isSafeInteger(createdRevisionTotal) && createdRevisionTotal > 0);
 		const indexName = `${indexPrefix}${meta.name}`.toLowerCase();
 		await elasticsearchClient.indices.refresh({ index: indexName });
 		const indexed = await search.search(meta, 'needle', { limit: 10 });
@@ -1124,6 +1155,12 @@ if (targets.has('datastore') && targets.has('elasticsearch')) {
 			context,
 			allowUnsafeDrainFallback: true
 		}), 1);
+		const [deletedRevisionRows] = await client.runQuery(client.createQuery(namespace, revisionModelName));
+		assert.equal(deletedRevisionRows.length, 2);
+		assert.equal(
+			deletedRevisionRows.reduce((total, row) => total + row.revision, 0),
+			createdRevisionTotal + 1
+		);
 		await elasticsearchClient.indices.refresh({ index: indexName });
 		const afterDelete = await search.search(meta, 'needle', { limit: 10 });
 		assert.deepEqual(

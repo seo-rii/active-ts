@@ -695,10 +695,10 @@ const redisWithCodec = await createRedisValkeyCacheAdapter({
 
 | Adapter | Package import | Peer dependency | Notes |
 | --- | --- | --- | --- |
-| Memory | `active-ts/adapters/search/memory` | none | searches declared search-index string fields and string-array elements for tests |
+| Memory | `active-ts/adapters/search/memory` | none | searches declared fields and supports process-local revision writes for tests |
 | Native | `active-ts/adapters/search/native` | none | maps search fields to store `textContains` queries |
-| Algolia | `active-ts/adapters/search/algolia` | `algoliasearch` | validates index names, limits, and indexed documents |
-| Elasticsearch | `active-ts/adapters/search/elasticsearch` | `@elastic/elasticsearch` | validates index names, limits, search fields, and indexed documents |
+| Algolia | `active-ts/adapters/search/algolia` | `algoliasearch` | validates writes; revision-ordered writes are unsupported |
+| Elasticsearch | `active-ts/adapters/search/elasticsearch` | `@elastic/elasticsearch` | supports persistent revision writes and delete tombstones |
 
 Supported peer ranges:
 
@@ -719,6 +719,35 @@ Built-in search adapters keep the projected document's id field as the logical
 model id. For ancestor-backed Datastore search sync they may use a separate
 bounded backend document key, so remote `objectID`/`_id` values are not required
 to decode to the same logical id when the stored document includes the id field.
+
+Search adapters can advertise `capabilities.revisionWrites: true` and accept a
+monotonic write fence:
+
+```ts doc-test=typecheck
+import type { ResolvedModelMeta, SearchAdapter } from 'active-ts';
+
+declare const search: SearchAdapter;
+declare const meta: ResolvedModelMeta;
+
+await search.index(meta, 1, { id: 1, name: 'Ada' }, { revision: 42 });
+await search.delete(meta, 1, { revision: 43 });
+```
+
+For a given physical document identity, only a revision strictly greater than
+the retained revision may change state. Older and equal writes resolve as
+successful no-ops. A revisioned delete must retain its revision indefinitely so
+a delayed lower-revision index cannot recreate the document. Elasticsearch
+implements this with external versions and hidden tombstone documents; normal
+search results exclude those tombstones. Memory retains revisions until
+`clear()`. Adapters without the capability reject revision options instead of
+silently weakening the contract. Elasticsearch indexes with strict mappings
+must allow the reserved `active_ts_deleted` boolean field. Index replacement
+must preserve tombstones, or stop search writers and replay authoritative rows
+with newer revisions before accepting delayed traffic; deleting the target
+index also deletes its retained fences. `requireRevisionWrites: true` rejects
+direct index and delete calls without a revision. Enable it only after stopping
+or draining older workers, and keep it enabled once all writers share the same
+durable revision allocator.
 
 ## Registering Adapters
 

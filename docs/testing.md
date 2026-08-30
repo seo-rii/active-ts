@@ -230,7 +230,9 @@ expiry, deletes, and invalid-write atomicity. The search contract verifies
 declared-field projection, typed id isolation, Datastore ancestor document
 identity markers, delete behavior, result shape, exact total metadata when
 deterministic fixtures provide it, unsafe indexing input rejection, eventual
-visibility when configured, and unsupported option fail-fast behavior. Search
+visibility when configured, and unsupported option fail-fast behavior. Adapters
+that advertise `revisionWrites` are also checked for stale/equal index no-ops,
+delete fences, and resistance to lower-revision document resurrection. Search
 adapters that advertise backend-specific native payload support must pass
 `nativeProbe`, because the shared contract cannot infer adapter-specific native
 semantics. Because it writes and deletes index documents,

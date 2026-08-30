@@ -17,6 +17,7 @@ import {
 	setDefaultContext,
 	applyModelMeta,
 	type OutboxAdapter,
+	type OutboxDeliveryFailure,
 	type SearchAdapter,
 	type StoreAdapter
 } from '../src/index.js';
@@ -260,7 +261,8 @@ test('outbox adapters and search sync worker ignore patched Array map and filter
 			outbox: leaseOutbox,
 			search,
 			models: [OutboxSearchDoc],
-			context
+			context,
+			allowUnsafeUnfencedSearchWrites: true
 		});
 	} finally {
 		Object.defineProperty(Array.prototype, 'map', map);
@@ -1081,7 +1083,13 @@ test('search sync dataful deletes can derive datastore identity from preserved e
 	};
 	await context.searchAdapter('memory').index(meta, 1, { id: 1, parentId: 11, title: 'dataful delete entity key' });
 
-	assert.equal(await runSearchSyncWorker({ outbox, search, models: [AncestorOutboxSearchDoc], context }), 1);
+	assert.equal(await runSearchSyncWorker({
+		outbox,
+		search,
+		models: [AncestorOutboxSearchDoc],
+		context,
+		allowUnsafeUnfencedSearchWrites: true
+	}), 1);
 	assert.deepEqual((await search.search(meta, 'dataful', {})).list, []);
 });
 
@@ -2259,7 +2267,14 @@ test('search sync adapter source matching uses captured Set intrinsics', async (
 	});
 	try {
 		await assert.rejects(
-			() => runSearchSyncWorker({ outbox, search: memory, models: [OutboxSearchDoc], context, adapter: 'algolia' }),
+			() => runSearchSyncWorker({
+				outbox,
+				search: memory,
+				models: [OutboxSearchDoc],
+				context,
+				adapter: 'algolia',
+				allowUnsafeUnfencedSearchWrites: true
+			}),
 			/Outbox search sync adapter "algolia" does not match/
 		);
 			assert.deepEqual(calls, { add: 0, has: 0 });
@@ -2546,7 +2561,14 @@ test('search sync batchSize releases overflow when custom lease adapters ignore 
 		}
 	};
 
-	assert.equal(await runSearchSyncWorker({ outbox, search, models: [OutboxSearchDoc], context, batchSize: 1 }), 1);
+	assert.equal(await runSearchSyncWorker({
+		outbox,
+		search,
+		models: [OutboxSearchDoc],
+		context,
+		batchSize: 1,
+		allowUnsafeUnfencedSearchWrites: true
+	}), 1);
 	assert.deepEqual(leaseOptions, [{ limit: 1 }]);
 	assert.deepEqual(released, [['batch-lease-302', 'batch-lease-303']]);
 	assert.equal(appended.length, 1);
@@ -2842,6 +2864,173 @@ test('search sync validates stored outbox payloads before indexing', async () =>
 	assert.deepEqual((await outbox.list()).map((event) => event.id), ['invalid-stored-payload']);
 });
 
+test('search sync leased delivery requires revision reservation before leasing', async () => {
+	const { context, search } = setupOutboxSearch();
+	let leaseCalls = 0;
+	const outbox: OutboxAdapter = {
+		append: async () => undefined,
+		lease: async () => {
+			leaseCalls++;
+			return [];
+		},
+		isLeaseCurrent: async () => true,
+		release: async () => undefined,
+		retry: async () => undefined,
+		ack: async () => undefined
+	};
+
+	await assert.rejects(
+		() => runSearchSyncWorker({ outbox, search, models: [OutboxSearchDoc], context }),
+		/requires outbox\.reserveSearchRevision\(\)/
+	);
+	assert.equal(leaseCalls, 0);
+});
+
+test('search sync leased delivery requires revision writes on the resolved route before leasing', async () => {
+	let leaseCalls = 0;
+	let reserveCalls = 0;
+	const search: SearchAdapter = {
+		kind: 'unfenced-search',
+		capabilities: { index: true, revisionWrites: false },
+		search: async () => ({ list: [], more: false }),
+		index: async () => undefined,
+		delete: async () => undefined
+	};
+	const context = createActiveTs({
+		stores: { default: new MemoryStoreAdapter() },
+		search: { memory: search },
+		defaultSearch: 'memory'
+	});
+	const outbox: OutboxAdapter = {
+		append: async () => undefined,
+		lease: async () => {
+			leaseCalls++;
+			return [];
+		},
+		reserveSearchRevision: async () => {
+			reserveCalls++;
+			return 1;
+		},
+		isLeaseCurrent: async () => true,
+		release: async () => undefined,
+		retry: async () => undefined,
+		ack: async () => undefined
+	};
+
+	await assert.rejects(
+		() => runSearchSyncWorker({ outbox, search, models: [OutboxSearchDoc], context }),
+		/adapter "memory" does not support revision-ordered writes/
+	);
+	assert.equal(leaseCalls, 0);
+	assert.equal(reserveCalls, 0);
+});
+
+test('search sync validates allowUnsafeUnfencedSearchWrites', async () => {
+	const { context, outbox, search } = setupOutboxSearch();
+
+	await assert.rejects(
+		() => runSearchSyncWorker({
+			outbox,
+			search,
+			models: [OutboxSearchDoc],
+			context,
+			allowUnsafeUnfencedSearchWrites: 'yes' as any
+		}),
+		/allowUnsafeUnfencedSearchWrites must be a boolean/
+	);
+});
+
+test('search sync retries revision reservation loss while the lease remains current', async () => {
+	const { context, search } = setupOutboxSearch();
+	const retries: OutboxDeliveryFailure[][] = [];
+	const event = {
+		id: 'current-lease-revision-loss',
+		model: 'outbox_search_regression_doc',
+		modelId: 80,
+		operation: 'update' as const,
+		data: { id: 80, title: 'retry reservation' },
+		createdAt: '2026-05-13T00:00:00.000Z',
+		leaseToken: 'current-revision-token',
+		leaseExpiresAt: '2999-01-01T00:00:00.000Z'
+	};
+	const outbox: OutboxAdapter = {
+		append: async () => undefined,
+		lease: async () => [event],
+		reserveSearchRevision: async () => undefined,
+		isLeaseCurrent: async () => true,
+		release: async () => undefined,
+		retry: async (failures) => {
+			retries.push(failures);
+		},
+		ack: async () => undefined
+	};
+
+	await assert.rejects(
+		() => runSearchSyncWorker({ outbox, search, models: [OutboxSearchDoc], context }),
+		/could not reserve a search revision while its lease remained current/
+	);
+	assert.equal(retries.length, 1);
+	assert.equal(retries[0][0].event?.id, event.id);
+	assert.equal(retries[0][0].attempt, 1);
+});
+
+test('search sync forwards reserved revisions to leased index and delete writes', async () => {
+	const writes: Array<{ operation: 'index' | 'delete'; id: unknown; revision: number | undefined }> = [];
+	const search: SearchAdapter = {
+		kind: 'revision-search',
+		capabilities: { index: true, revisionWrites: true },
+		search: async () => ({ list: [], more: false }),
+		index: async (_model, id, _data, options) => {
+			writes.push({ operation: 'index', id, revision: options?.revision });
+		},
+		delete: async (_model, id, options) => {
+			writes.push({ operation: 'delete', id, revision: options?.revision });
+		}
+	};
+	const context = createActiveTs({
+		stores: { default: new MemoryStoreAdapter() },
+		search: { memory: search },
+		defaultSearch: 'memory'
+	});
+	const events = [
+		{
+			id: 'revision-index-event',
+			model: 'outbox_search_regression_doc',
+			modelId: 81,
+			operation: 'create' as const,
+			data: { id: 81, title: 'revision index' },
+			createdAt: '2026-05-13T00:00:00.000Z',
+			leaseToken: 'revision-index-token',
+			leaseExpiresAt: '2999-01-01T00:00:00.000Z'
+		},
+		{
+			id: 'revision-delete-event',
+			model: 'outbox_search_regression_doc',
+			modelId: 82,
+			operation: 'delete' as const,
+			createdAt: '2026-05-13T00:00:01.000Z',
+			leaseToken: 'revision-delete-token',
+			leaseExpiresAt: '2999-01-01T00:00:00.000Z'
+		}
+	];
+	let revision = 100;
+	const outbox: OutboxAdapter = {
+		append: async (event) => event,
+		lease: async () => events,
+		reserveSearchRevision: async () => ++revision,
+		isLeaseCurrent: async () => true,
+		release: async () => undefined,
+		retry: async () => undefined,
+		ack: async () => undefined
+	};
+
+	assert.equal(await runSearchSyncWorker({ outbox, search, models: [OutboxSearchDoc], context }), 2);
+	assert.deepEqual(writes, [
+		{ operation: 'index', id: 81, revision: 101 },
+		{ operation: 'delete', id: 82, revision: 102 }
+	]);
+});
+
 test('search sync rejects duplicate model names before draining events', async () => {
 	const { context, outbox, search } = setupOutboxSearch();
 	await outbox.append({
@@ -2990,7 +3179,8 @@ test('search sync releases leased events from malformed lease arrays', async () 
 				},
 				search,
 				models: [OutboxSearchDoc],
-				context
+				context,
+				allowUnsafeUnfencedSearchWrites: true
 			}),
 		/Outbox drain result cannot contain symbol fields/
 	);
@@ -3040,7 +3230,8 @@ test('search sync propagates stale lease release failures', async () => {
 				},
 				search,
 				models: [OutboxSearchDoc],
-				context
+				context,
+				allowUnsafeUnfencedSearchWrites: true
 			}),
 		(error: unknown) => {
 			assert.ok(error instanceof AggregateError);
@@ -3125,7 +3316,8 @@ test('search sync snapshots malformed getter leases for retry and dead letter wi
 				search,
 				models: [OutboxSearchDoc],
 				context,
-				maxAttempts: disposition === 'dead-letter' ? 1 : 2
+				maxAttempts: disposition === 'dead-letter' ? 1 : 2,
+				allowUnsafeUnfencedSearchWrites: true
 			}),
 			/Outbox event "operation" must be a data property/
 		);
@@ -3191,7 +3383,13 @@ test('search sync treats ack false as an uncommitted delivery result', async () 
 		}
 	};
 
-	assert.equal(await runSearchSyncWorker({ outbox, search, models: [OutboxSearchDoc], context }), 0);
+	assert.equal(await runSearchSyncWorker({
+		outbox,
+		search,
+		models: [OutboxSearchDoc],
+		context,
+		allowUnsafeUnfencedSearchWrites: true
+	}), 0);
 	assert.equal(repairs.length, 1);
 	assert.equal(acknowledged.length, 1);
 	assert.deepEqual(acknowledged[0].map((item) => item.id), [event.id, repairs[0].id]);
@@ -3253,7 +3451,13 @@ test('search sync renewal errors retry the source lease exactly once', async () 
 	};
 
 	await assert.rejects(
-		() => runSearchSyncWorker({ outbox, search, models: [OutboxSearchDoc], context }),
+		() => runSearchSyncWorker({
+			outbox,
+			search,
+			models: [OutboxSearchDoc],
+			context,
+			allowUnsafeUnfencedSearchWrites: true
+		}),
 		/lease renewal unavailable/
 	);
 	assert.equal(renewals, 1);
@@ -3353,7 +3557,13 @@ test('search sync retries the latest renewed snapshot when a mutation rejects', 
 	}) as typeof setInterval;
 	try {
 		await assert.rejects(
-			() => runSearchSyncWorker({ outbox, search, models: [OutboxSearchDoc], context }),
+			() => runSearchSyncWorker({
+				outbox,
+				search,
+				models: [OutboxSearchDoc],
+				context,
+				allowUnsafeUnfencedSearchWrites: true
+			}),
 			/mutation rejected after renewal/
 		);
 	} finally {
@@ -3413,7 +3623,8 @@ test('search sync processes unrelated valid leases when a leased event is invali
 				},
 				search,
 				models: [OutboxSearchDoc],
-				context
+				context,
+				allowUnsafeUnfencedSearchWrites: true
 			}),
 		/Outbox event "invalid-leased-event" has unsupported operation "publish"/
 	);

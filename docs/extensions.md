@@ -434,6 +434,11 @@ deferred post-commit appends unless the outbox adapter implements
 unknown. Pass
 `allowUnsafeTransactionDeferredAppend: true` only for low-level integrations that
 explicitly accept the risk of missing outbox events after commit-unknown errors.
+The adapter also persists search fencing counters in
+`active_ts_search_revision`; use `revisionModelName` when the backing store needs
+a different physical table or collection name. All queues targeting the same
+search documents must share that model, and changing or restoring it requires
+migrating the existing counter rows before workers resume.
 
 Search sync can deliver outbox events into a search adapter:
 
@@ -468,22 +473,28 @@ migrating old queues.
 
 `runSearchSyncWorker()` supports two outbox delivery contracts:
 
-- `lease()/ack()/isLeaseCurrent()` is preferred for durable adapters. `lease()`
+- `lease()/ack()/isLeaseCurrent()/reserveSearchRevision()` is preferred for
+  durable adapters. `lease()`
   returns visible events without deleting them, `isLeaseCurrent(event)` confirms
-  the worker still owns the lease before delivery, and `ack(events)` removes
-  only events that were indexed successfully. `StoreOutboxAdapter` implements
-  this contract, so failed deliveries remain queued for retry. Its built-in
-  lease path requires the backing store to support optimistic locking so
-  concurrent workers cannot claim the same rows. When the backing store is
-  transactional but does not support optimistic locking, such as Datastore, the
-  search worker fails closed by default. Pass `allowUnsafeDrainFallback: true`
-  only when the deployment accepts the crash-loss risk of using the adapter's
-  `drain()/requeue()` path.
+  the worker still owns the lease, `reserveSearchRevision(event,
+  documentIdentity)` durably allocates a monotonic per-document fence, and
+  `ack(events)` removes only events that were indexed successfully.
+  `StoreOutboxAdapter` implements this contract with optimistic locking or
+  conflict-detecting transactions, including Datastore transactions. Failed
+  deliveries remain queued for retry.
 - `drain()/requeue()` is supported for legacy/custom adapters. If indexing
   fails after a drain, the worker calls `requeue(events)` with the failed and
   undelivered events so a later run can retry them in order. Search sync rejects
   drain-only adapters because appending failed events at the tail can reorder
   older writes behind newer events.
+
+Each search route used with leased delivery must advertise
+`capabilities.revisionWrites: true` and atomically ignore writes whose revision
+is older than or equal to the retained document revision. Deletes must retain
+the fence as a tombstone. The worker validates route support before leasing any
+events. `allowUnsafeUnfencedSearchWrites: true` is a migration escape hatch for
+custom adapters that only implement the older lease/repair contract; it does not
+protect against backend work that finishes after a rejected request.
 
 Search indexing should still be implemented idempotently because a backend
 failure can happen after a partial remote write. Custom `drain()`

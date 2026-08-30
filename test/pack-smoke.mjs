@@ -319,6 +319,7 @@ import {
 	runSearchSyncWorker,
 	type SearchAdapter,
 	type SearchMiddleware,
+	type SearchWriteOptions,
 	type SearchSyncWorkerOptions,
 	type ResolvedModelMeta,
 	type SchemaPlan,
@@ -328,6 +329,7 @@ import {
 	StoreOutboxAdapter,
 	type StoreMiddleware,
 	type StoreOutboxAdapterOptions,
+	type StoreOutboxSchemaApplyOptions,
 	type Validator
 } from 'active-ts';
 import {
@@ -514,7 +516,7 @@ const markedSearchHit = markSearchDocumentIdentity(
 );
 const customSearchAdapter: SearchAdapter = {
 	kind: 'packed-custom-search',
-	capabilities: { where: false, cursor: false, native: false, index: true },
+	capabilities: { where: false, cursor: false, native: false, index: true, revisionWrites: true },
 	search: async () => ({ list: [markedSearchHit] }),
 	index: async () => undefined,
 	delete: async () => undefined
@@ -558,16 +560,25 @@ const outboxOptions: OutboxPluginOptions = {
 	allowUnsafeTransactionDeferredAppend: false
 };
 const outboxPlugin: ActiveTsPlugin = createOutboxPlugin(outboxOptions);
-const storeOutboxOptions: StoreOutboxAdapterOptions = { context };
+const storeOutboxOptions: StoreOutboxAdapterOptions = {
+	context,
+	revisionModelName: 'packed_search_revision'
+};
 const storeOutboxInstance = new StoreOutboxAdapter(storeOutboxOptions);
 const storeOutboxTransactionStore: string = storeOutboxInstance.transactionStore;
 const storeOutbox: OutboxAdapter = storeOutboxInstance;
+const storeOutboxSchemaApplyOptions: StoreOutboxSchemaApplyOptions = { mode: 'safe' };
+const storeOutboxSchemaPlan: Promise<SchemaPlan> = storeOutboxInstance.schemaPlan();
+const storeOutboxSchemaApply: Promise<SchemaPlan> = storeOutboxInstance.schemaApply(storeOutboxSchemaApplyOptions);
+const searchWriteOptions: SearchWriteOptions = { revision: 1 };
+const reserveSearchRevision: OutboxAdapter['reserveSearchRevision'] = storeOutbox.reserveSearchRevision;
 const searchSyncWorker: typeof runSearchSyncWorker = runSearchSyncWorker;
 const searchSyncOptions: SearchSyncWorkerOptions = {
 	outbox: outboxAdapter,
 	search: customSearchAdapter,
 	models: [PackedUser],
-	allowUnsafeDrainFallback: false
+	allowUnsafeDrainFallback: false,
+	allowUnsafeUnfencedSearchWrites: false
 };
 const broadLeaseSearchSyncOptions: SearchSyncWorkerOptions = {
 	outbox: storeOutbox,
@@ -772,7 +783,10 @@ const firestoreOptions = {
 const firestoreTransactionNative = { maxAttempts: 3 } satisfies FirestoreTransactionNativeOptions;
 const redisOptions = { prefix: 'active-ts' } satisfies RedisValkeyOptions;
 const algoliaOptions = { indexPrefix: 'active_ts' } satisfies AlgoliaOptions;
-const elasticsearchOptions = { indexPrefix: 'active_ts' } satisfies ElasticsearchOptions;
+const elasticsearchOptions = {
+	indexPrefix: 'active_ts',
+	requireRevisionWrites: true
+} satisfies ElasticsearchOptions;
 const noInternalTracker: 'trackTransactionModelInstance' extends keyof ActiveContext ? never : true = true;
 const noInternalStore: 'internalStore' extends keyof ActiveContext ? never : true = true;
 const noInternalCache: 'internalCache' extends keyof ActiveContext ? never : true = true;
@@ -837,6 +851,8 @@ void outboxOptions;
 void outboxPlugin;
 void storeOutboxOptions;
 void storeOutbox;
+void searchWriteOptions;
+void reserveSearchRevision;
 void searchSyncWorker;
 void searchSyncOptions;
 void softDeleteOptions;

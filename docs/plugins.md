@@ -158,7 +158,8 @@ collection and have workers drain it for search indexing, webhooks, or pub/sub.
 For Datastore-backed transactions, use an adapter with `appendTransactional()`
 such as `StoreOutboxAdapter`; deferred non-transactional appends are rejected by
 default because commit failures can leave the transaction outcome unknown.
-For `runSearchSyncWorker()`, prefer `lease()/ack()/isLeaseCurrent()`. Custom
+For `runSearchSyncWorker()`, prefer
+`lease()/ack()/isLeaseCurrent()/reserveSearchRevision()`. Custom
 `drain()` adapters must also implement ordered `requeue(events)` so failed
 deliveries return ahead of newer events. Pass `batchSize` to bound each worker
 run; custom `lease()` and `drain()` adapters should honor the `{ limit }` option
@@ -209,6 +210,49 @@ types enforce that requirement; broad `OutboxAdapter` references are validated
 at runtime for compatibility. Adapters must keep same-entity ordering and make
 `retry()`, `deadLetter()`, and lease release durable so poison events cannot
 indefinitely block unrelated entities.
+
+Lease delivery is revision-fenced by default. Before each remote attempt, the
+worker calls `reserveSearchRevision(event, documentIdentity)` and passes the
+returned positive safe integer to every search write as `{ revision }`. It
+validates every actual model route before calling `lease()` and rejects routes
+without `capabilities.revisionWrites: true`. Older or equal index/delete writes
+must be successful no-ops, and a revisioned delete must retain a tombstone so a
+late index cannot recreate the document. Memory and Elasticsearch implement
+this contract; Algolia and native search do not.
+
+`StoreOutboxAdapter` stores per-document counters in a separate durable model,
+`active_ts_search_revision` by default. Configure its physical name with
+`revisionModelName`. Its schema helpers include both the queue and revision
+models, so schemaful stores can provision them through their normal tooling:
+
+```ts doc-test=typecheck
+import { StoreOutboxAdapter, type ActiveContext } from 'active-ts';
+
+declare const context: ActiveContext;
+
+const outbox = new StoreOutboxAdapter({ context });
+const plan = await outbox.schemaPlan();
+await outbox.schemaApply({ mode: 'safe' });
+```
+
+Use `schemaPlan()` for migration review or `schemaApply()` for stores whose
+adapter supports safe schema application. Every queue that can write the same
+search documents must use the same revision model. Treat its name and rows as
+durable fencing state: changing the name requires copying all counter rows
+first, and losing or deleting rows can make later writes no-op behind higher
+revisions already retained by the search backend. The adapter verifies the
+current lease while reserving through either optimistic locking or a
+conflict-detecting transaction. Custom leased outboxes must provide equivalent
+persistent monotonic allocation.
+
+Fencing is valid only when every writer for a physical search document uses the
+same revision domain. Stop and drain older workers and direct index writers
+before enabling fenced delivery, then deploy writers that always pass revisions.
+For Elasticsearch, enable `requireRevisionWrites: true` after that cutover to
+reject accidental unfenced writes. During a staged legacy migration,
+`allowUnsafeUnfencedSearchWrites: true` restores the older repair-only behavior,
+but a request that reaches the backend after its Promise settles can still
+overwrite newer state in that mode.
 
 ## Function Cache
 

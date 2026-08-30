@@ -22,8 +22,11 @@ import {
 	type OutboxEvent,
 	type ResolvedModelMeta,
 	type SearchAdapter,
+	type SearchOptions,
+	type SearchWriteOptions,
 	type StoreAdapter,
-	type StoreReadOptions
+	type StoreReadOptions,
+	type StoreWriteOptions
 } from '../src/index.js';
 
 type OutboxAccountData = {
@@ -666,7 +669,7 @@ test('store outbox search sync uses transaction-backed leases without optimistic
 
 	assert.equal(leaseChecks, 1);
 	assert.equal(leaseCalls, 1);
-	assert.equal(transactionCalls, 3);
+	assert.equal(transactionCalls, 4);
 	assert.deepEqual(await outbox.list(), []);
 	assert.deepEqual(
 		(await search.search(context.meta(OutboxAccount), 'drained', {})).list.map((row) => row.id),
@@ -884,6 +887,57 @@ test('store outbox schema index matches sequence-based list ordering', async () 
 
 	assert.deepEqual(observedSortFields, ['createdAt', 'sequence', 'id']);
 	assert.deepEqual(observedIndexFields, observedSortFields);
+});
+
+test('store outbox schema helpers plan and apply queue and revision models together', async () => {
+	const store = createKindMemoryStore('outbox-schema-observer');
+	const observedModels: string[][] = [];
+	const observedModes: string[] = [];
+	store.schema = {
+		plan: async (models) => {
+			observedModels.push(models.map((model) => model.name));
+			return {
+				adapter: 'outbox-schema-observer',
+				changes: models.map((model) => ({ type: 'create-collection' as const, target: model.name }))
+			};
+		},
+		apply: async (models, options) => {
+			observedModels.push(models.map((model) => model.name));
+			observedModes.push(options.mode);
+			return {
+				adapter: 'outbox-schema-observer',
+				status: 'applied',
+				changes: models.map((model) => ({ type: 'create-collection' as const, target: model.name }))
+			};
+		}
+	};
+	const context = createActiveTs({ stores: { default: store } });
+	const outbox = new StoreOutboxAdapter({
+		context,
+		modelName: 'custom_outbox_event',
+		revisionModelName: 'custom_search_revision'
+	});
+
+	assert.deepEqual((await outbox.schemaPlan()).changes, [
+		{ type: 'create-collection', target: 'custom_outbox_event' },
+		{ type: 'create-collection', target: 'custom_search_revision' }
+	]);
+	await assert.rejects(
+		() => outbox.schemaApply({ mode: 'off' } as any),
+		/Store outbox adapter schema apply options\.mode must be "safe"/
+	);
+	assert.equal(observedModels.length, 1);
+	assert.equal((await outbox.schemaApply()).status, 'applied');
+	assert.deepEqual(observedModels, [
+		['custom_outbox_event', 'custom_search_revision'],
+		['custom_outbox_event', 'custom_search_revision']
+	]);
+	assert.deepEqual(observedModes, ['safe']);
+	await assert.rejects(
+		() => context.transaction(() => outbox.schemaApply()),
+		/Cannot apply store outbox schema changes inside a transaction/
+	);
+	assert.equal(observedModels.length, 2);
 });
 
 test('store outbox batch operations push limits into paged store queries', async () => {
@@ -1248,6 +1302,246 @@ test('store outbox lease keeps events visible until ack', async () => {
 	await outbox.ack!([leased[0]]);
 
 	assert.deepEqual(await outbox.list(), []);
+});
+
+test('store outbox reserves persistent monotonic search revisions for the leased entity', async () => {
+	const context = createActiveTs({ stores: { default: new MemoryStoreAdapter() } });
+	const outbox = new StoreOutboxAdapter({ context });
+	await outbox.append({
+		id: 'revision-source-one',
+		model: 'outbox_transaction_account',
+		modelId: 41,
+		operation: 'update',
+		data: { id: 41, handle: 'first' },
+		createdAt: '2026-05-13T00:00:00.000Z'
+	});
+
+	const [firstLease] = await outbox.lease!();
+	const firstRevision = await outbox.reserveSearchRevision!(firstLease);
+	const retryRevision = await outbox.reserveSearchRevision!(firstLease);
+	assert.ok(firstRevision !== undefined && Number.isSafeInteger(firstRevision));
+	assert.equal(retryRevision, firstRevision + 1);
+
+	await outbox.release!([firstLease]);
+	assert.equal(await outbox.reserveSearchRevision!(firstLease), undefined);
+	const [replacementLease] = await outbox.lease!();
+	const replacementRevision = await outbox.reserveSearchRevision!(replacementLease);
+	assert.equal(replacementRevision, retryRevision! + 1);
+	await outbox.ack!([replacementLease]);
+
+	await outbox.append({
+		id: 'revision-source-two',
+		model: 'outbox_transaction_account',
+		modelId: 41,
+		operation: 'create',
+		data: { id: 41, handle: 'recreated' },
+		createdAt: '2026-05-13T00:00:01.000Z'
+	});
+	const [recreatedLease] = await outbox.lease!();
+	assert.equal(await outbox.reserveSearchRevision!(recreatedLease), replacementRevision! + 1);
+	await outbox.ack!([recreatedLease]);
+});
+
+test('store outbox search revisions share one fencing domain across queue models', async () => {
+	const context = createActiveTs({ stores: { default: new MemoryStoreAdapter() } });
+	const firstOutbox = new StoreOutboxAdapter({ context, modelName: 'first_outbox_queue' });
+	const secondOutbox = new StoreOutboxAdapter({ context, modelName: 'second_outbox_queue' });
+	await firstOutbox.append({
+		id: 'first-queue-event',
+		model: 'outbox_transaction_account',
+		modelId: 45,
+		operation: 'update',
+		data: { id: 45, handle: 'first queue' },
+		createdAt: '2026-05-13T00:00:00.000Z'
+	});
+	await secondOutbox.append({
+		id: 'second-queue-event',
+		model: 'outbox_transaction_account',
+		modelId: 45,
+		operation: 'update',
+		data: { id: 45, handle: 'second queue' },
+		createdAt: '2026-05-13T00:00:01.000Z'
+	});
+
+	const [firstLease] = await firstOutbox.lease!();
+	const [secondLease] = await secondOutbox.lease!();
+	const firstRevision = await firstOutbox.reserveSearchRevision!(firstLease);
+	const secondRevision = await secondOutbox.reserveSearchRevision!(secondLease);
+	assert.equal(secondRevision, firstRevision! + 1);
+	await firstOutbox.ack!([firstLease]);
+	await secondOutbox.ack!([secondLease]);
+});
+
+test('store outbox rejects a stale search revision reservation that loses a create race', async () => {
+	let resumeFirstRevisionCreate!: () => void;
+	let markFirstRevisionCreateStarted!: () => void;
+	const firstRevisionCreateStarted = new Promise<void>((resolve) => {
+		markFirstRevisionCreateStarted = resolve;
+	});
+	const firstRevisionCreateRelease = new Promise<void>((resolve) => {
+		resumeFirstRevisionCreate = resolve;
+	});
+	let revisionCreates = 0;
+	class PausedRevisionStore extends MemoryStoreAdapter {
+		override async create(model: ResolvedModelMeta, id: EntityId, data: any, options?: StoreWriteOptions) {
+			if (model.name === 'active_ts_search_revision' && ++revisionCreates === 1) {
+				markFirstRevisionCreateStarted();
+				await firstRevisionCreateRelease;
+			}
+			await super.create(model, id, data, options);
+		}
+	}
+	const context = createActiveTs({ stores: { default: new PausedRevisionStore() } });
+	const outbox = new StoreOutboxAdapter({ context });
+	await outbox.append({
+		id: 'stale-revision-create-race',
+		model: 'outbox_transaction_account',
+		modelId: 43,
+		operation: 'update',
+		data: { id: 43, handle: 'racing' },
+		createdAt: '2026-05-13T00:00:00.000Z'
+	});
+
+	const [staleLease] = await outbox.lease!();
+	const staleReservation = outbox.reserveSearchRevision!(staleLease);
+	await firstRevisionCreateStarted;
+	await outbox.release!([staleLease]);
+	const [freshLease] = await outbox.lease!();
+	const freshRevision = await outbox.reserveSearchRevision!(freshLease);
+	resumeFirstRevisionCreate();
+
+	assert.ok(freshRevision !== undefined && freshRevision > 0);
+	assert.equal(await staleReservation, undefined);
+	await outbox.ack!([freshLease]);
+});
+
+test('store outbox surfaces search revision contention while its lease remains current', async () => {
+	let resumeFirstRevisionCreate!: () => void;
+	let markFirstRevisionCreateStarted!: () => void;
+	const firstRevisionCreateStarted = new Promise<void>((resolve) => {
+		markFirstRevisionCreateStarted = resolve;
+	});
+	const firstRevisionCreateRelease = new Promise<void>((resolve) => {
+		resumeFirstRevisionCreate = resolve;
+	});
+	let revisionCreates = 0;
+	class PausedRevisionStore extends MemoryStoreAdapter {
+		override async create(model: ResolvedModelMeta, id: EntityId, data: any, options?: StoreWriteOptions) {
+			if (model.name === 'active_ts_search_revision' && ++revisionCreates === 1) {
+				markFirstRevisionCreateStarted();
+				await firstRevisionCreateRelease;
+			}
+			await super.create(model, id, data, options);
+		}
+	}
+	const context = createActiveTs({ stores: { default: new PausedRevisionStore() } });
+	const outbox = new StoreOutboxAdapter({ context });
+	await outbox.append({
+		id: 'current-revision-create-race',
+		model: 'outbox_transaction_account',
+		modelId: 46,
+		operation: 'update',
+		data: { id: 46, handle: 'contended' },
+		createdAt: '2026-05-13T00:00:00.000Z'
+	});
+
+	const [lease] = await outbox.lease!();
+	const contendedReservation = outbox.reserveSearchRevision!(lease);
+	await firstRevisionCreateStarted;
+	const winningRevision = await outbox.reserveSearchRevision!(lease);
+	resumeFirstRevisionCreate();
+
+	assert.ok(winningRevision !== undefined && winningRevision > 0);
+	await assert.rejects(contendedReservation, /already exists/);
+	await outbox.ack!([lease]);
+});
+
+test('store outbox keeps event and search revision models distinct', () => {
+	assert.throws(
+		() => new StoreOutboxAdapter({ modelName: 'shared_outbox_model', revisionModelName: 'shared_outbox_model' }),
+		/revisionModelName must differ from modelName/
+	);
+});
+
+test('store outbox search sync forwards increasing revisions to index and delete writes', async () => {
+	const context = createActiveTs({ stores: { default: new MemoryStoreAdapter() } });
+	const outbox = new StoreOutboxAdapter({ context, revisionModelName: 'custom_search_revision' });
+	const backend = new MemorySearchAdapter();
+	const revisions: number[] = [];
+	const search = {
+		kind: 'memory',
+		capabilities: backend.capabilities,
+		search: (model: ResolvedModelMeta, query: string, options: SearchOptions) => backend.search(model, query, options),
+		index: async (
+			model: ResolvedModelMeta,
+			id: EntityId,
+			data: OutboxAccountData,
+			options?: SearchWriteOptions
+		) => {
+			revisions.push(options!.revision!);
+			await backend.index(model, id, data, options);
+		},
+		delete: async (model: ResolvedModelMeta, id: EntityId, options?: SearchWriteOptions) => {
+			revisions.push(options!.revision!);
+			await backend.delete(model, id, options);
+		}
+	} satisfies SearchAdapter;
+	await outbox.append({
+		id: 'revision-index-source',
+		model: 'outbox_transaction_account',
+		modelId: 42,
+		operation: 'create',
+		data: { id: 42, handle: 'indexed' },
+		createdAt: '2026-05-13T00:00:00.000Z'
+	});
+	assert.equal(await runSearchSyncWorker({ outbox, search, models: [OutboxAccount], context }), 1);
+
+	await outbox.append({
+		id: 'revision-delete-source',
+		model: 'outbox_transaction_account',
+		modelId: 42,
+		operation: 'delete',
+		createdAt: '2026-05-13T00:00:01.000Z'
+	});
+	assert.equal(await runSearchSyncWorker({ outbox, search, models: [OutboxAccount], context }), 1);
+
+	assert.equal(revisions.length, 2);
+	assert.ok(Number.isSafeInteger(revisions[0]) && revisions[0] > 0);
+	assert.equal(revisions[1], revisions[0] + 1);
+	assert.deepEqual(await outbox.list(), []);
+});
+
+test('store outbox search revision reservations use canonical Datastore document identities', async () => {
+	let reservedIdentity: string | undefined;
+	class ObservedRevisionOutbox extends StoreOutboxAdapter {
+		override async reserveSearchRevision(event: OutboxEvent, documentIdentity?: string) {
+			reservedIdentity = documentIdentity;
+			return await super.reserveSearchRevision(event, documentIdentity);
+		}
+	}
+	const context = createActiveTs({ stores: { default: new MemoryStoreAdapter() } });
+	const outbox = new ObservedRevisionOutbox({ context });
+	const ancestor = datastoreKey('outbox_datastore_parent', 7);
+	await outbox.append({
+		id: 'datastore-search-revision-identity',
+		model: 'outbox_datastore_account',
+		modelId: 44,
+		modelDatastoreAncestor: ancestor,
+		operation: 'create',
+		data: { id: 44, parentId: 7, handle: 'canonical' },
+		createdAt: '2026-05-13T00:00:00.000Z'
+	});
+
+	assert.equal(await runSearchSyncWorker({
+		outbox,
+		search: new MemorySearchAdapter(),
+		models: [OutboxDatastoreAccount],
+		context
+	}), 1);
+	assert.equal(
+		reservedIdentity,
+		datastoreSearchDocumentIdentity(context.meta(OutboxDatastoreAccount), 44, ancestor)
+	);
 });
 
 test('store outbox renews an owned lease without accepting the stale snapshot', async () => {
@@ -2501,7 +2795,13 @@ test('store outbox search sync preserves repair after an index applies then reje
 	});
 
 	await assert.rejects(
-		() => runSearchSyncWorker({ outbox, search, models: [OutboxAccount], context }),
+		() => runSearchSyncWorker({
+			outbox,
+			search,
+			models: [OutboxAccount],
+			context,
+			allowUnsafeUnfencedSearchWrites: true
+		}),
 		/index unavailable/
 	);
 
@@ -2525,12 +2825,24 @@ test('store outbox search sync preserves repair after an index applies then reje
 		delete: async () => undefined
 	} satisfies SearchAdapter;
 
-	assert.equal(await runSearchSyncWorker({ outbox, search: recoveredSearch, models: [OutboxAccount], context }), 1);
+	assert.equal(await runSearchSyncWorker({
+		outbox,
+		search: recoveredSearch,
+		models: [OutboxAccount],
+		context,
+		allowUnsafeUnfencedSearchWrites: true
+	}), 1);
 	assert.deepEqual(indexed, ['first', 'second', 'second']);
 	const [durableRepair] = await outbox.list();
 	assert.equal(durableRepair.reconcileFromStore, true);
 	assert.equal(durableRepair.modelId, 2);
-	assert.equal(await runSearchSyncWorker({ outbox, search: recoveredSearch, models: [OutboxAccount], context }), 1);
+	assert.equal(await runSearchSyncWorker({
+		outbox,
+		search: recoveredSearch,
+		models: [OutboxAccount],
+		context,
+		allowUnsafeUnfencedSearchWrites: true
+	}), 1);
 	assert.deepEqual(await outbox.list(), []);
 });
 
@@ -2566,7 +2878,13 @@ test('store outbox search sync preserves repair after a delete applies then reje
 	});
 
 	await assert.rejects(
-		() => runSearchSyncWorker({ outbox, search, models: [OutboxAccount], context }),
+		() => runSearchSyncWorker({
+			outbox,
+			search,
+			models: [OutboxAccount],
+			context,
+			allowUnsafeUnfencedSearchWrites: true
+		}),
 		/delete response lost/
 	);
 	assert.equal(indexedHandle, undefined);
@@ -2575,10 +2893,22 @@ test('store outbox search sync preserves repair after a delete applies then reje
 	assert.equal(failedPending[0].id, 'delete-applied-before-reject');
 	assert.equal(failedPending[1].reconcileFromStore, true);
 
-	assert.equal(await runSearchSyncWorker({ outbox, search, models: [OutboxAccount], context }), 1);
+	assert.equal(await runSearchSyncWorker({
+		outbox,
+		search,
+		models: [OutboxAccount],
+		context,
+		allowUnsafeUnfencedSearchWrites: true
+	}), 1);
 	assert.equal(indexedHandle, undefined);
 	assert.equal((await outbox.list())[0].reconcileFromStore, true);
-	assert.equal(await runSearchSyncWorker({ outbox, search, models: [OutboxAccount], context }), 1);
+	assert.equal(await runSearchSyncWorker({
+		outbox,
+		search,
+		models: [OutboxAccount],
+		context,
+		allowUnsafeUnfencedSearchWrites: true
+	}), 1);
 	assert.equal(indexedHandle, 'authoritative');
 	assert.deepEqual(await outbox.list(), []);
 });
@@ -2618,7 +2948,13 @@ test('store outbox search sync skips stale leased events before indexing', async
 		ack: (events: any) => outbox.ack!(events)
 	};
 
-	assert.equal(await runSearchSyncWorker({ outbox: staleOutbox, search, models: [OutboxAccount], context }), 0);
+	assert.equal(await runSearchSyncWorker({
+		outbox: staleOutbox,
+		search,
+		models: [OutboxAccount],
+		context,
+		allowUnsafeUnfencedSearchWrites: true
+	}), 0);
 	assert.equal(indexed, 0);
 });
 
@@ -2654,7 +2990,13 @@ test('store outbox search sync rechecks leased events immediately before indexin
 		ack: (events: any) => outbox.ack!(events)
 	};
 
-	assert.equal(await runSearchSyncWorker({ outbox: racingOutbox, search, models: [OutboxAccount], context }), 0);
+	assert.equal(await runSearchSyncWorker({
+		outbox: racingOutbox,
+		search,
+		models: [OutboxAccount],
+		context,
+		allowUnsafeUnfencedSearchWrites: true
+	}), 0);
 	assert.equal(indexed, 0);
 	const [remaining] = await outbox.list();
 	assert.equal(remaining.id, 'lease-stale-before-index');
@@ -2708,7 +3050,13 @@ test('store outbox search sync rechecks leases before index hooks', async () => 
 		ack: (events: any) => outbox.ack!(events)
 	};
 
-	assert.equal(await runSearchSyncWorker({ outbox: racingOutbox, search, models: [OutboxAccount], context }), 0);
+	assert.equal(await runSearchSyncWorker({
+		outbox: racingOutbox,
+		search,
+		models: [OutboxAccount],
+		context,
+		allowUnsafeUnfencedSearchWrites: true
+	}), 0);
 	assert.deepEqual(hookEvents, []);
 	assert.equal(indexed, 0);
 	const [remaining] = await outbox.list();
@@ -2767,7 +3115,13 @@ test('store outbox search sync rechecks leased events after indexing before hook
 		}
 	};
 
-	assert.equal(await runSearchSyncWorker({ outbox: racingOutbox, search, models: [OutboxAccount], context }), 0);
+	assert.equal(await runSearchSyncWorker({
+		outbox: racingOutbox,
+		search,
+		models: [OutboxAccount],
+		context,
+		allowUnsafeUnfencedSearchWrites: true
+	}), 0);
 	assert.equal(indexed, 1);
 	assert.equal(acked, 0);
 	assert.deepEqual(hookEvents, ['beforeIndex']);
@@ -2776,7 +3130,7 @@ test('store outbox search sync rechecks leased events after indexing before hook
 	assert.equal(remaining.leaseToken, undefined);
 });
 
-test('search sync repairs a delayed stale write after another worker indexes newer state', async () => {
+test('search sync revisions fence a delayed stale write after another worker indexes newer state', async () => {
 	let releaseOldIndex!: () => void;
 	let markOldIndexStarted!: () => void;
 	const oldIndexStarted = new Promise<void>((resolve) => {
@@ -2785,23 +3139,30 @@ test('search sync repairs a delayed stale write after another worker indexes new
 	const oldIndexRelease = new Promise<void>((resolve) => {
 		releaseOldIndex = resolve;
 	});
-	let indexedHandle: string | undefined;
 	let oldIndexBlocked = false;
+	const revisions: number[] = [];
+	const searchBackend = new MemorySearchAdapter();
 	const search = {
 		kind: 'memory',
-		capabilities: { index: true },
-		search: async () => ({ list: [], more: false }),
-		index: async (_model: ResolvedModelMeta, _id: EntityId, data: OutboxAccountData) => {
+		capabilities: searchBackend.capabilities,
+		search: (model: ResolvedModelMeta, query: string, options: SearchOptions) =>
+			searchBackend.search(model, query, options),
+		index: async (
+			model: ResolvedModelMeta,
+			id: EntityId,
+			data: OutboxAccountData,
+			options?: SearchWriteOptions
+		) => {
+			revisions.push(options!.revision!);
 			if (data.handle === 'old-before-lease-expiry' && !oldIndexBlocked) {
 				oldIndexBlocked = true;
 				markOldIndexStarted();
 				await oldIndexRelease;
 			}
-			indexedHandle = data.handle;
+			await searchBackend.index(model, id, data, options);
 		},
-		delete: async () => {
-			indexedHandle = undefined;
-		}
+		delete: (model: ResolvedModelMeta, id: EntityId, options?: SearchWriteOptions) =>
+			searchBackend.delete(model, id, options)
 	} satisfies SearchAdapter;
 	const context = createActiveTs({
 		stores: { default: new MemoryStoreAdapter() },
@@ -2835,6 +3196,7 @@ test('search sync repairs a delayed stale write after another worker indexes new
 		leaseExpiresAt: new Date(Date.now() + 60_000).toISOString()
 	};
 	let leaseCalls = 0;
+	let revision = 0;
 	let activeLeaseToken: string | undefined = oldEvent.leaseToken;
 	const repairEvents: OutboxEvent[] = [];
 	const pendingRepairIds = new Set<string>();
@@ -2848,6 +3210,13 @@ test('search sync repairs a delayed stale write after another worker indexes new
 		lease: async () => ++leaseCalls === 1 ? [oldEvent] : [newEvent],
 		isLeaseCurrent: async (event: OutboxEvent) =>
 			event.leaseToken === activeLeaseToken && Date.parse(event.leaseExpiresAt!) > Date.now(),
+		reserveSearchRevision: async (event: OutboxEvent) => {
+			if (event.leaseToken !== activeLeaseToken || Date.parse(event.leaseExpiresAt!) <= Date.now()) {
+				return undefined;
+			}
+			revision++;
+			return revision;
+		},
 		release: async () => undefined,
 		retry: async () => undefined,
 		ack: async (events: OutboxEvent[]) => {
@@ -2865,11 +3234,14 @@ test('search sync repairs a delayed stale write after another worker indexes new
 	activeLeaseToken = newEvent.leaseToken;
 
 	assert.equal(await runSearchSyncWorker({ outbox, search, models: [OutboxAccount], context }), 1);
-	assert.equal(indexedHandle, 'new-final-store');
 	releaseOldIndex();
 	assert.equal(await oldWorker, 0);
 
-	assert.equal(indexedHandle, 'new-final-store');
+	assert.deepEqual(revisions, [1, 2]);
+	assert.deepEqual(
+		(await searchBackend.search(context.meta(OutboxAccount), 'new-final-store', {})).list.map((row) => row.handle),
+		['new-final-store']
+	);
 	assert.equal(repairEvents.length, 2);
 	for (const repair of repairEvents) {
 		assert.equal(repair.model, 'outbox_transaction_account');
@@ -2877,6 +3249,120 @@ test('search sync repairs a delayed stale write after another worker indexes new
 		assert.equal(repair.data, undefined);
 	}
 	assert.deepEqual([...pendingRepairIds], [repairEvents[0].id]);
+});
+
+test('search sync revisions fence rejected writes whose remote side effects arrive later', async () => {
+	const scenarios = [
+		{ name: 'stale-index-after-delete', oldOperation: 'update', newOperation: 'delete' },
+		{ name: 'stale-delete-after-index', oldOperation: 'delete', newOperation: 'update' }
+	] as const;
+
+	for (const scenario of scenarios) {
+		let releaseDelayedWrite!: () => void;
+		const delayedWriteGate = new Promise<void>((resolve) => {
+			releaseDelayedWrite = resolve;
+		});
+		let delayedWrite: Promise<void> | undefined;
+		let rejectNextWrite = true;
+		const revisions: number[] = [];
+		const searchBackend = new MemorySearchAdapter();
+		const applySearchWrite = async (
+			operation: 'index' | 'delete',
+			revision: number | undefined,
+			apply: () => Promise<void>
+		) => {
+			assert.equal(typeof revision, 'number');
+			revisions.push(revision!);
+			const isOldOperation = scenario.oldOperation === 'delete'
+				? operation === 'delete'
+				: operation === 'index';
+			if (rejectNextWrite && isOldOperation) {
+				rejectNextWrite = false;
+				delayedWrite = delayedWriteGate.then(apply);
+				throw new Error(`${scenario.name} transport timeout`);
+			}
+			await apply();
+		};
+		const search = {
+			kind: 'memory',
+			capabilities: searchBackend.capabilities,
+			search: (model: ResolvedModelMeta, query: string, options: SearchOptions) =>
+				searchBackend.search(model, query, options),
+			index: (
+				model: ResolvedModelMeta,
+				id: EntityId,
+				data: OutboxAccountData,
+				options?: SearchWriteOptions
+			) => applySearchWrite('index', options?.revision, () => searchBackend.index(model, id, data, options)),
+			delete: (model: ResolvedModelMeta, id: EntityId, options?: SearchWriteOptions) =>
+				applySearchWrite('delete', options?.revision, () => searchBackend.delete(model, id, options))
+		} satisfies SearchAdapter;
+		const context = createActiveTs({
+			stores: { default: new MemoryStoreAdapter() },
+			search: { memory: search },
+			defaultSearch: 'memory'
+		});
+		const meta = context.meta(OutboxAccount);
+		if (scenario.oldOperation === 'delete') {
+			await searchBackend.index(meta, 92, { id: 92, handle: 'initial-state' });
+		}
+
+		const oldEvent: OutboxEvent = {
+			id: `${scenario.name}-old`,
+			model: 'outbox_transaction_account',
+			modelId: 92,
+			operation: scenario.oldOperation,
+			...(scenario.oldOperation === 'delete'
+				? {}
+				: { data: { id: 92, handle: 'stale-state' } }),
+			createdAt: '2026-05-13T00:00:00.000Z',
+			leaseToken: `${scenario.name}-old-lease`,
+			leaseExpiresAt: new Date(Date.now() + 60_000).toISOString()
+		};
+		const newEvent: OutboxEvent = {
+			id: `${scenario.name}-new`,
+			model: 'outbox_transaction_account',
+			modelId: 92,
+			operation: scenario.newOperation,
+			...(scenario.newOperation === 'delete'
+				? {}
+				: { data: { id: 92, handle: 'new-final-state' } }),
+			createdAt: '2026-05-13T00:00:01.000Z',
+			leaseToken: `${scenario.name}-new-lease`,
+			leaseExpiresAt: new Date(Date.now() + 60_000).toISOString()
+		};
+		let currentEvent = oldEvent;
+		let nextRevision = 0;
+		const outbox = {
+			transactionStore: 'default',
+			append: async (event: OutboxEvent) => event,
+			lease: async () => [currentEvent],
+			isLeaseCurrent: async (event: OutboxEvent) => event.leaseToken === currentEvent.leaseToken,
+			reserveSearchRevision: async () => ++nextRevision,
+			release: async () => undefined,
+			retry: async () => undefined,
+			ack: async () => true
+		};
+
+		await assert.rejects(
+			() => runSearchSyncWorker({ outbox, search, models: [OutboxAccount], context }),
+			new RegExp(`${scenario.name} transport timeout`)
+		);
+		currentEvent = newEvent;
+		assert.equal(await runSearchSyncWorker({ outbox, search, models: [OutboxAccount], context }), 1);
+		releaseDelayedWrite();
+		await delayedWrite;
+
+		assert.deepEqual(revisions, [1, 2]);
+		if (scenario.newOperation === 'delete') {
+			assert.deepEqual(searchBackend.snapshot(meta.name), []);
+		} else {
+			assert.deepEqual(
+				(await searchBackend.search(meta, 'new-final-state', {})).list.map((row) => row.handle),
+				['new-final-state']
+			);
+		}
+	}
 });
 
 test('store outbox search sync rechecks leased events immediately before deletes', async () => {
@@ -2910,7 +3396,13 @@ test('store outbox search sync rechecks leased events immediately before deletes
 		ack: (events: any) => outbox.ack!(events)
 	};
 
-	assert.equal(await runSearchSyncWorker({ outbox: racingOutbox, search, models: [OutboxAccount], context }), 0);
+	assert.equal(await runSearchSyncWorker({
+		outbox: racingOutbox,
+		search,
+		models: [OutboxAccount],
+		context,
+		allowUnsafeUnfencedSearchWrites: true
+	}), 0);
 	assert.equal(deleted, 0);
 	const [remaining] = await outbox.list();
 	assert.equal(remaining.id, 'lease-stale-before-delete');
@@ -2963,7 +3455,13 @@ test('store outbox search sync rechecks leases before delete hooks', async () =>
 		ack: (events: any) => outbox.ack!(events)
 	};
 
-	assert.equal(await runSearchSyncWorker({ outbox: racingOutbox, search, models: [OutboxAccount], context }), 0);
+	assert.equal(await runSearchSyncWorker({
+		outbox: racingOutbox,
+		search,
+		models: [OutboxAccount],
+		context,
+		allowUnsafeUnfencedSearchWrites: true
+	}), 0);
 	assert.deepEqual(hookEvents, []);
 	assert.equal(deleted, 0);
 	const [remaining] = await outbox.list();
@@ -3021,7 +3519,13 @@ test('store outbox search sync rechecks leased delete events after deletion befo
 		}
 	};
 
-	assert.equal(await runSearchSyncWorker({ outbox: racingOutbox, search, models: [OutboxAccount], context }), 0);
+	assert.equal(await runSearchSyncWorker({
+		outbox: racingOutbox,
+		search,
+		models: [OutboxAccount],
+		context,
+		allowUnsafeUnfencedSearchWrites: true
+	}), 0);
 	assert.equal(deleted, 2);
 	assert.equal(acked, 0);
 	assert.deepEqual(hookEvents, ['beforeIndex']);
@@ -3081,7 +3585,13 @@ test('store outbox search sync rechecks payload-free stale updates after search 
 		}
 	};
 
-	assert.equal(await runSearchSyncWorker({ outbox: racingOutbox, search, models: [OutboxAccount], context }), 0);
+	assert.equal(await runSearchSyncWorker({
+		outbox: racingOutbox,
+		search,
+		models: [OutboxAccount],
+		context,
+		allowUnsafeUnfencedSearchWrites: true
+	}), 0);
 	assert.equal(deleted, 2);
 	assert.equal(acked, 0);
 	assert.deepEqual(hookEvents, ['beforeIndex']);
