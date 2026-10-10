@@ -84,7 +84,8 @@
 		"README.md",
 		"LICENSE",
 		"CONTRIBUTING.md",
-		"SECURITY.md"
+		"SECURITY.md",
+		"docs/typed-views.md"
 	],
 	"scripts": {
 		"prepack": "pnpm build",
