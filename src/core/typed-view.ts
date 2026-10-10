@@ -1,5 +1,9 @@
 import { ActiveTsConfigurationError } from './errors.js';
-import { assertPlainDataObject, assertSafeFieldPath } from './safe-keys.js';
+import { assertSafeFieldPath } from './safe-keys.js';
+import {
+	OBJECT_GET_OWN_PROPERTY_DESCRIPTOR, OBJECT_GET_OWN_PROPERTY_NAMES,
+	OBJECT_GET_OWN_PROPERTY_SYMBOLS, OBJECT_GET_PROTOTYPE_OF
+} from './object-intrinsics.js';
 import type { Model } from './model.js';
 import type { MaybePromise, ViewInput, ViewResolver } from './types.js';
 
@@ -16,7 +20,6 @@ interface ViewDetails {
 	readonly name: string;
 	readonly resolver: ViewResolver;
 }
-
 const contracts = new WeakMap<object, ViewDetails>();
 
 /** Internal: reject forged descriptors and retain the exact registered resolver identity. */
@@ -29,10 +32,41 @@ export function typedViewDetails(value: unknown): ViewDetails {
 	return details;
 }
 
+// Configuration intentionally contains callbacks: a stored-data validator must not
+// inspect it recursively. Inspect own data descriptors without invoking getters.
+function readOptions(value: unknown) {
+	if (!value || typeof value !== 'object' || Array.isArray(value)) {
+		throw new ActiveTsConfigurationError('Typed view options must be a plain object.');
+	}
+	const prototype = OBJECT_GET_PROTOTYPE_OF(value);
+	if (prototype !== Object.prototype && prototype !== null) {
+		throw new ActiveTsConfigurationError('Typed view options must be a plain object.');
+	}
+	if (OBJECT_GET_OWN_PROPERTY_SYMBOLS(value).length) {
+		throw new ActiveTsConfigurationError('Typed view options cannot contain symbols.');
+	}
+	for (const key of OBJECT_GET_OWN_PROPERTY_NAMES(value)) {
+		if (key !== 'name' && key !== 'resolve' && key !== 'parse') {
+			throw new ActiveTsConfigurationError('Unknown typed view option.');
+		}
+		const descriptor = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(value, key);
+		if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) {
+			throw new ActiveTsConfigurationError('Typed view options must be enumerable data properties.');
+		}
+	}
+	const name = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(value, 'name')?.value;
+	const resolve = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(value, 'resolve')?.value;
+	const parse = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(value, 'parse')?.value;
+	if (typeof name !== 'string' || typeof resolve !== 'function' || typeof parse !== 'function') {
+		throw new ActiveTsConfigurationError('Typed views require a name, resolver and output parser.');
+	}
+	return { name: assertSafeFieldPath(name, 'view name'), resolve, parse };
+}
+
 /**
  * Define once, register with defineModel().view(contract), and read with model.view(contract).
- * Calling by the legacy string name still validates output. This is not authorization,
- * a DTO transport codec, or a way to promote partial models to full models.
+ * Legacy string reads also validate output. This does not authorize data access,
+ * implement a transport codec, or promote partial models into full models.
  */
 export function defineTypedView<Data extends Record<string, any>>() {
 	return function<Output>(options: {
@@ -40,16 +74,11 @@ export function defineTypedView<Data extends Record<string, any>>() {
 		readonly resolve: (input: ViewInput<Model<Data>, Data>) => MaybePromise<unknown>;
 		readonly parse: (value: unknown) => MaybePromise<Output>;
 	}): TypedView<Data, Output> {
-		assertPlainDataObject(options, 'typed view options');
-		const { name, resolve, parse } = options;
-		const safeName = assertSafeFieldPath(name, 'view name');
-		if (typeof resolve !== 'function' || typeof parse !== 'function') {
-			throw new ActiveTsConfigurationError('Typed views require a resolver and an output parser.');
-		}
-		// Both callbacks run inside Model.view()'s tracked transaction operation.
+		const { name, resolve, parse } = readOptions(options);
+		// Both captured callbacks run inside Model.view()'s tracked operation.
 		const resolver: ViewResolver<Data> = async (input) => parse(await resolve(input));
-		const contract = Object.freeze({ name: safeName, parse }) as TypedView<Data, Output>;
-		contracts.set(contract, Object.freeze({ name: safeName, resolver }));
+		const contract = Object.freeze({ name, parse }) as TypedView<Data, Output>;
+		contracts.set(contract, Object.freeze({ name, resolver }));
 		return contract;
 	};
 }
