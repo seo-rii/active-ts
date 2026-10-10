@@ -1,0 +1,61 @@
+name: Prepare View Compatibility
+on:
+  push:
+    branches: [codex/typed-view-contracts]
+    paths: ['.github/workflows/prepare-view-compat.yml']
+permissions:
+  contents: write
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Prepare only reviewed source blobs; never update a branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import base64, hashlib, json, os, pathlib, urllib.request
+          repo = os.environ['GITHUB_REPOSITORY']
+          assert repo == 'seo-rii/active-ts'
+          expected = {
+              'src/core/model.ts': '40c853417710c2c2b7bdfccff33edb02525a4dee',
+              'src/core/define-model.ts': 'b7c974695e6caacb14e95e0ae78d069de4a2cf9d',
+              'test/package-ci-regression.test.ts': '9b3efe33a3a59bac4aac78582be8f6c0728ad65e'
+          }
+          paths = [*expected, 'src/core/typed-view.ts', 'test/typed-view-regression.test.ts']
+          def blob_sha(data):
+              return hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
+          text = {p: pathlib.Path(p).read_text() for p in paths}
+          for p, sha in expected.items():
+              assert blob_sha(text[p].encode()) == sha, 'Source changed: '+p
+          def replace(p, old, new):
+              assert text[p].count(old) == 1, 'Unexpected patch occurrence: '+p
+              text[p] = text[p].replace(old, new)
+          replace('src/core/model.ts', 'import { typedViewDetails, type TypedView }', 'import { findTypedViewDetails, type TypedView }')
+          replace('src/core/model.ts', "const contract = typeof name === 'string' ? undefined : typedViewDetails(name);", "// Unknown objects remain invalid legacy view names; do not coerce or inspect them.\n\t\t\t\tconst contract = findTypedViewDetails(name);")
+          replace('src/core/define-model.ts', "'View resolver must be a function.'", "'view resolver must be a function.'")
+          for before, after in [(r'1\.14\.4$',r'1\.14\.5$'),(r'2\.1\.4$',r'2\.1\.7$'),(r'7\.29\.0$',r'7\.29\.1$')]:
+              replace('test/package-ci-regression.test.ts', before, after)
+          p = 'src/core/typed-view.ts'
+          old = "/** Internal: reject forged descriptors and retain the exact registered resolver identity. */\nexport function typedViewDetails(value: unknown): ViewDetails {\n\tif (!value || typeof value !== 'object') {\n\t\tthrow new ActiveTsConfigurationError('Expected a registered typed view contract.');\n\t}\n\tconst details = contracts.get(value);\n\tif (!details) throw new ActiveTsConfigurationError('Expected a registered typed view contract.');\n\treturn details;\n}\n"
+          new = "/** Internal: recognize only contracts owned by this module, without inspecting user objects. */\nexport function findTypedViewDetails(value: unknown): ViewDetails | undefined {\n\treturn value !== null && typeof value === 'object' ? contracts.get(value) : undefined;\n}\n\n/** Internal: strict descriptor registration rejects forged definitions. */\nexport function typedViewDetails(value: unknown): ViewDetails {\n\tconst details = findTypedViewDetails(value);\n\tif (!details) throw new ActiveTsConfigurationError('Expected a registered typed view contract.');\n\treturn details;\n}\n"
+          replace(p, old, new)
+          p = 'test/typed-view-regression.test.ts'
+          replace(p, 'MemoryStoreAdapter, MemoryCacheAdapter, ActiveTsConfigurationError', 'MemoryStoreAdapter, MemoryCacheAdapter, ActiveTsConfigurationError, ActiveTsValidationError')
+          replace(p, "await assert.rejects(account.view({ name: 'summary', parse: parseSummary } as any), ActiveTsConfigurationError);", "const forged = { name: 'summary', parse: parseSummary };\n\tawait assert.rejects(account.view(forged as any), ActiveTsValidationError);\n\tassert.throws(() => defineModel<Row>('forged_view').view(forged as any), ActiveTsConfigurationError);")
+          text[p] += "\n\ntest('invalid legacy names preserve validation errors without coercion or proxy inspection', async () => {\n\tconst { Bound } = fixture();\n\tconst item = await Bound.create({ id: 1, name: 'public', secret: 'hidden' });\n\tlet calls = 0;\n\tconst hostile = new Proxy({}, {\n\t\tget() { calls++; throw new Error('must not inspect a view name'); },\n\t\tgetOwnPropertyDescriptor() { calls++; throw new Error('must not inspect a view name'); },\n\t\tgetPrototypeOf() { calls++; throw new Error('must not inspect a view name'); }\n\t});\n\tfor (const value of [null, 42, true, Symbol('name'), () => 'name', [], {}, hostile]) {\n\t\tawait assert.rejects(item.view(value as any), (error: unknown) =>\n\t\t\terror instanceof ActiveTsValidationError && /view name must be a string/.test(error.message));\n\t}\n\tassert.equal(calls, 0);\n});\n"
+          entries = []
+          for p in paths:
+              data = text[p].encode()
+              request = urllib.request.Request('https://api.github.com/repos/'+repo+'/git/blobs', data=json.dumps({'encoding':'base64','content':base64.b64encode(data).decode()}).encode(), headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','Content-Type':'application/json'}, method='POST')
+              with urllib.request.urlopen(request) as response:
+                  result = json.load(response)
+              assert result['sha'] == blob_sha(data)
+              entries.append({'path':p,'mode':'100644','type':'blob','sha':result['sha']})
+          print('PREPARED_BLOBS='+json.dumps(entries))
+          PY
