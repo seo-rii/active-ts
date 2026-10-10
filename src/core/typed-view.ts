@@ -23,12 +23,14 @@ interface ViewDetails {
 }
 const contracts = new WeakMap<object, ViewDetails>();
 
-/** Internal: reject forged descriptors and retain the exact registered resolver identity. */
+/** Internal: recognize only contracts owned by this module, without inspecting user objects. */
+export function findTypedViewDetails(value: unknown): ViewDetails | undefined {
+	return value !== null && typeof value === 'object' ? contracts.get(value) : undefined;
+}
+
+/** Internal: strict descriptor registration rejects forged definitions. */
 export function typedViewDetails(value: unknown): ViewDetails {
-	if (!value || typeof value !== 'object') {
-		throw new ActiveTsConfigurationError('Expected a registered typed view contract.');
-	}
-	const details = contracts.get(value);
+	const details = findTypedViewDetails(value);
 	if (!details) throw new ActiveTsConfigurationError('Expected a registered typed view contract.');
 	return details;
 }

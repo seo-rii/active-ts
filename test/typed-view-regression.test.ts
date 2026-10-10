@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
 	Model, createActiveTs, defineModel, defineTypedView,
-	MemoryStoreAdapter, MemoryCacheAdapter, ActiveTsConfigurationError
+	MemoryStoreAdapter, MemoryCacheAdapter, ActiveTsConfigurationError, ActiveTsValidationError
 } from '../src/index.js';
 
 type Row = { id: number; name: string; secret: string };
@@ -66,7 +66,9 @@ test('an unregistered same-name typed descriptor cannot select a different contr
 	const account = await Bound.create({ id: 1, name: 'public', secret: 'hidden' });
 	const impostor = defineTypedView<Row>()({ name: 'summary', resolve: () => 'wrong', parse: () => 42 });
 	await assert.rejects(account.view(impostor), ActiveTsConfigurationError);
-	await assert.rejects(account.view({ name: 'summary', parse: parseSummary } as any), ActiveTsConfigurationError);
+	const forged = { name: 'summary', parse: parseSummary };
+	await assert.rejects(account.view(forged as any), ActiveTsValidationError);
+	assert.throws(() => defineModel<Row>('forged_view').view(forged as any), ActiveTsConfigurationError);
 });
 
 test('typed descriptor identity remains enforced after metadata replacement', async () => {
@@ -147,4 +149,21 @@ test('definitions capture callbacks and reject unsafe names or missing parsers',
 	assert.deepEqual(await summary.parse({ id: 1, name: 'public', secret: 'hidden' }), { id: 1, name: 'public' });
 	assert.throws(() => defineTypedView<Row>()({ ...options, name: '__proto__' }));
 	assert.throws(() => defineTypedView<Row>()({ ...options, parse: undefined } as any));
+});
+
+
+test('invalid legacy names preserve validation errors without coercion or proxy inspection', async () => {
+	const { Bound } = fixture();
+	const item = await Bound.create({ id: 1, name: 'public', secret: 'hidden' });
+	let calls = 0;
+	const hostile = new Proxy({}, {
+		get() { calls++; throw new Error('must not inspect a view name'); },
+		getOwnPropertyDescriptor() { calls++; throw new Error('must not inspect a view name'); },
+		getPrototypeOf() { calls++; throw new Error('must not inspect a view name'); }
+	});
+	for (const value of [null, 42, true, Symbol('name'), () => 'name', [], {}, hostile]) {
+		await assert.rejects(item.view(value as any), (error: unknown) =>
+			error instanceof ActiveTsValidationError && /view name must be a string/.test(error.message));
+	}
+	assert.equal(calls, 0);
 });

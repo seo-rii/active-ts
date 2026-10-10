@@ -4,7 +4,7 @@ import { ActiveContext, getDefaultContext } from './context.js';
 import { ActiveTsCommittedWriteError, ActiveTsConfigurationError, ActiveTsValidationError, safeErrorMessage } from './errors.js';
 import { LazyRef } from './lazy-ref.js';
 import { isPartialModel } from './partial-model.js';
-import { typedViewDetails, type TypedView } from './typed-view.js';
+import { findTypedViewDetails, type TypedView } from './typed-view.js';
 import { entityIdKey, valueFor } from './query-utils.js';
 import {
 	snapshotRelationOwnerLocalKey,
@@ -432,7 +432,8 @@ export abstract class Model<TData extends Record<string, any> = Record<string, a
 			async (context) => {
 				this.assertFullModel('resolve views');
 				const meta = context.meta(this.constructor as ModelConstructor);
-				const contract = typeof name === 'string' ? undefined : typedViewDetails(name);
+				// Unknown objects remain invalid legacy view names; do not coerce or inspect them.
+				const contract = findTypedViewDetails(name);
 				const safeName = assertSafeFieldPath(contract?.name ?? name, 'view name');
 				const resolver = mapGet(meta.views, safeName);
 				if (!resolver) throw new ActiveTsConfigurationError(`View "${safeName}" is not registered on ${meta.name}.`);

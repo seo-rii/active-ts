@@ -141,7 +141,7 @@ export class ModelBuilder<TData extends Record<string, any>> {
 	view(name: string | TypedView<TData, unknown>, resolver?: ViewResolver<TData>): this {
 		const contract = typeof name === 'string' ? undefined : typedViewDetails(name);
 		const selected = contract?.resolver ?? resolver;
-		if (typeof selected !== 'function') throw new ActiveTsConfigurationError('View resolver must be a function.');
+		if (typeof selected !== 'function') throw new ActiveTsConfigurationError('view resolver must be a function.');
 		mapSet(this.meta.views!, assertSafeFieldPath(contract?.name ?? name, 'view name'), selected);
 		return this;
 	}
