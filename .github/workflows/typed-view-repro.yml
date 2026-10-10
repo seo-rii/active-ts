@@ -1,0 +1,64 @@
+name: Typed View Reproduction
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/typed-view-repro.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  reproduce:
+    if: github.head_ref == 'codex/typed-view-contracts'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271
+        with:
+          version: 11.13.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - name: Run unchanged full suite and retain concise failures
+        shell: bash
+        run: |
+          set +e
+          pnpm test > "$RUNNER_TEMP/full-suite.log" 2>&1
+          status=$?
+          set -e
+          python3 - <<'PY'
+          import os, pathlib
+          lines = pathlib.Path(os.environ['RUNNER_TEMP'], 'full-suite.log').read_text().splitlines()
+          indices = set(range(max(0, len(lines) - 20), len(lines)))
+          for i, line in enumerate(lines):
+              if 'not ok ' in line or 'Missing expected exception' in line:
+                  indices.update(range(max(0, i - 3), min(len(lines), i + 42)))
+          for i in sorted(indices):
+              print(lines[i])
+          PY
+          exit "$status"
+      - name: Export credential-free local reproduction
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p .repro
+          cp "$(command -v node)" .repro/node
+          cp "$RUNNER_TEMP/full-suite.log" .repro/full-suite.log
+          git rev-parse HEAD > .repro/commit.txt
+          tar --exclude='./.git' --exclude='./.npmrc' -czf "$RUNNER_TEMP/active-ts-repro.tgz" .
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: active-ts-repro
+          path: ${{ runner.temp }}/active-ts-repro.tgz
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
