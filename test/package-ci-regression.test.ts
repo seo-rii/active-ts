@@ -743,6 +743,7 @@ test('package root export keeps internal helpers out of the public surface', asy
 		'defaultAggregateResult',
 		'defaultAggregateValue',
 		'defineModel',
+		'defineTypedView',
 		'encodeCursor',
 		'entity',
 		'field',

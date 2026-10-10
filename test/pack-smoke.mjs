@@ -67,6 +67,7 @@ const PUBLIC_ROOT_RUNTIME_EXPORTS = [
 	'defaultAggregateResult',
 	'defaultAggregateValue',
 	'defineModel',
+	'defineTypedView',
 	'encodeCursor',
 	'entity',
 	'field',

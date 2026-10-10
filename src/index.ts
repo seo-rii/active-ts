@@ -9,6 +9,7 @@ export {
 export * from './core/cursor.js';
 export { applyModelMeta, getModelMeta } from './core/metadata.js';
 export * from './core/define-model.js';
+export { defineTypedView, type TypedView } from './core/typed-view.js';
 export * from './core/decorators.js';
 export * from './core/context.js';
 export * from './core/model.js';
