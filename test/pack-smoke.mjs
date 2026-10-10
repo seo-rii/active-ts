@@ -1413,7 +1413,8 @@ function isAllowedPackedPath(file) {
 			'docs/plugins.md',
 			'docs/quickstart.md',
 			'docs/security.md',
-			'docs/testing.md'
+			'docs/testing.md',
+			'docs/typed-views.md'
 		].includes(file)
 	);
 }
