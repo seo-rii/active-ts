@@ -2,12 +2,13 @@ import { ActiveTsConfigurationError } from './errors.js';
 import { assertSafeFieldPath } from './safe-keys.js';
 import {
 	OBJECT_GET_OWN_PROPERTY_DESCRIPTOR, OBJECT_GET_OWN_PROPERTY_NAMES,
-	OBJECT_GET_OWN_PROPERTY_SYMBOLS, OBJECT_GET_PROTOTYPE_OF
+	OBJECT_GET_OWN_PROPERTY_SYMBOLS, OBJECT_GET_PROTOTYPE_OF, OBJECT_HAS_OWN
 } from './object-intrinsics.js';
 import type { Model } from './model.js';
 import type { MaybePromise, ViewInput, ViewResolver } from './types.js';
 
 const typeBrand: unique symbol = Symbol('active-ts typed view');
+const plainObjectPrototype = Object.prototype;
 
 /** A server-owned view contract. The parser, not a caller assertion, defines Output. */
 export interface TypedView<Data, Output> {
@@ -39,24 +40,29 @@ function readOptions(value: unknown) {
 		throw new ActiveTsConfigurationError('Typed view options must be a plain object.');
 	}
 	const prototype = OBJECT_GET_PROTOTYPE_OF(value);
-	if (prototype !== Object.prototype && prototype !== null) {
+	if (prototype !== plainObjectPrototype && prototype !== null) {
 		throw new ActiveTsConfigurationError('Typed view options must be a plain object.');
 	}
 	if (OBJECT_GET_OWN_PROPERTY_SYMBOLS(value).length) {
 		throw new ActiveTsConfigurationError('Typed view options cannot contain symbols.');
 	}
-	for (const key of OBJECT_GET_OWN_PROPERTY_NAMES(value)) {
-		if (key !== 'name' && key !== 'resolve' && key !== 'parse') {
-			throw new ActiveTsConfigurationError('Unknown typed view option.');
+	const required = ['name', 'resolve', 'parse'] as const;
+	const keys = OBJECT_GET_OWN_PROPERTY_NAMES(value);
+	if (keys.length !== required.length) {
+		throw new ActiveTsConfigurationError('Typed views require exactly name, resolve and parse.');
+	}
+	for (const key of required) {
+		if (!OBJECT_HAS_OWN(value, key)) {
+			throw new ActiveTsConfigurationError('Typed view options must declare their own required properties.');
 		}
 		const descriptor = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(value, key);
-		if (!descriptor || !descriptor.enumerable || !('value' in descriptor)) {
+		if (!descriptor || !descriptor.enumerable || !OBJECT_HAS_OWN(descriptor, 'value')) {
 			throw new ActiveTsConfigurationError('Typed view options must be enumerable data properties.');
 		}
 	}
-	const name = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(value, 'name')?.value;
-	const resolve = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(value, 'resolve')?.value;
-	const parse = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(value, 'parse')?.value;
+	const name = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(value, 'name')!.value;
+	const resolve = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(value, 'resolve')!.value;
+	const parse = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(value, 'parse')!.value;
 	if (typeof name !== 'string' || typeof resolve !== 'function' || typeof parse !== 'function') {
 		throw new ActiveTsConfigurationError('Typed views require a name, resolver and output parser.');
 	}
