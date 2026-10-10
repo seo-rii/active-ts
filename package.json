@@ -142,7 +142,7 @@
 	"engines": {
 		"node": ">=22"
 	},
-	"packageManager": "pnpm@11.13.0",
+	"packageManager": "pnpm@11.28.2",
 	"dependencies": {
 		"escape-string-regexp": "^5.0.0",
 		"pg-format": "^1.0.4"
