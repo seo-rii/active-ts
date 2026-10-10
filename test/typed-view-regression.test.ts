@@ -12,13 +12,19 @@ function parseSummary(value: unknown): { id: number; name: string } {
 	if (typeof row.id !== 'number' || typeof row.name !== 'string') throw new TypeError('Invalid summary');
 	return { id: row.id, name: row.name };
 }
+function parseRow(value: unknown): Row {
+	const summary = parseSummary(value);
+	const secret = (value as Record<string, unknown>).secret;
+	if (typeof secret !== 'string') throw new TypeError('Invalid row');
+	return { ...summary, secret };
+}
 function fixture() {
 	class Account extends Model<Row> {
 		static category = 'account' as const;
 		label() { return this.data.name.toUpperCase(); }
 	}
 	const summary = defineTypedView<Row>()({ name: 'summary', resolve: ({ data }) => data, parse: parseSummary });
-	defineModel<Row>({ name: 'typed_account', cache: { ttl: 60 } }).id('id').view(summary).attach(Account);
+	defineModel<Row>({ name: 'typed_account', cache: { ttl: 60 } }).id('id').validate(parseRow).view(summary).attach(Account);
 	const context = createActiveTs({ stores: { default: new MemoryStoreAdapter() }, caches: { default: new MemoryCacheAdapter() } });
 	return { Account, Bound: Account.use(context), context, summary };
 }
@@ -50,7 +56,7 @@ test('typed and legacy string reads both execute the registered output parser', 
 
 test('typed views keep legacy arbitrary named views source-compatible', async () => {
 	const { Account, Bound } = fixture();
-	defineModel<Row>({ name: 'typed_account' }).id('id').view('default', ({ data }) => data.name).attach(Account);
+	defineModel<Row>({ name: 'typed_account' }).id('id').validate(parseRow).view('default', ({ data }) => data.name).attach(Account);
 	const account = await Bound.create({ id: 1, name: 'legacy', secret: 'hidden' });
 	assert.equal(await account.view<string>(), 'legacy');
 });
@@ -66,7 +72,7 @@ test('an unregistered same-name typed descriptor cannot select a different contr
 test('typed descriptor identity remains enforced after metadata replacement', async () => {
 	const { Account, Bound, summary } = fixture();
 	const account = await Bound.create({ id: 1, name: 'public', secret: 'hidden' });
-	defineModel<Row>({ name: 'typed_account' }).id('id').view('summary', () => 123).attach(Account);
+	defineModel<Row>({ name: 'typed_account' }).id('id').validate(parseRow).view('summary', () => 123).attach(Account);
 	await assert.rejects(account.view(summary), ActiveTsConfigurationError);
 	assert.equal(await account.view('summary'), 123);
 });
@@ -74,7 +80,7 @@ test('typed descriptor identity remains enforced after metadata replacement', as
 test('invalid resolver output rejects both typed and string reads', async () => {
 	const { Account, Bound } = fixture();
 	const bad = defineTypedView<Row>()({ name: 'bad', resolve: () => ({ id: 'not a number' }), parse: parseSummary });
-	defineModel<Row>({ name: 'typed_account' }).id('id').view(bad).attach(Account);
+	defineModel<Row>({ name: 'typed_account' }).id('id').validate(parseRow).view(bad).attach(Account);
 	const account = await Bound.create({ id: 1, name: 'public', secret: 'hidden' });
 	await assert.rejects(account.view(bad), /Invalid summary/);
 	await assert.rejects(account.view('bad'), /Invalid summary/);
@@ -94,7 +100,7 @@ test('async parsers stay inside the view operation and preserve per-read viewers
 		name: 'viewer', resolve: ({ viewer }) => viewer,
 		parse: async (value) => { await Promise.resolve(); if (typeof value !== 'string') throw new TypeError('viewer'); return { viewer: value }; }
 	});
-	defineModel<Row>({ name: 'typed_account' }).id('id').view(view).attach(Account);
+	defineModel<Row>({ name: 'typed_account' }).id('id').validate(parseRow).view(view).attach(Account);
 	const account = await Bound.create({ id: 1, name: 'public', secret: 'hidden' });
 	assert.deepEqual(await Promise.all([account.view(view, 'a'), account.view(view, 'b')]), [{ viewer: 'a' }, { viewer: 'b' }]);
 });
