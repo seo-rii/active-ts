@@ -105,7 +105,7 @@ test('async parsers stay inside the view operation and preserve per-read viewers
 	assert.deepEqual(await Promise.all([account.view(view, 'a'), account.view(view, 'b')]), [{ viewer: 'a' }, { viewer: 'b' }]);
 });
 
-test('typed views do not bypass an ended transaction context', async () => {
+test('typed views preserve the existing root-context rebinding after commit', async () => {
 	const { Bound, context, summary } = fixture();
 	await Bound.create({ id: 1, name: 'public', secret: 'hidden' });
 	const account = await context.transaction(async tx => {
@@ -114,7 +114,29 @@ test('typed views do not bypass an ended transaction context', async () => {
 		assert.deepEqual(await item.view(summary), { id: 1, name: 'public' });
 		return item;
 	});
-	await assert.rejects(account.view(summary));
+	// Committed models intentionally return to the root context; they are not expired handles.
+	assert.deepEqual(await account.view(summary), { id: 1, name: 'public' });
+	account.data.name = 'after commit';
+	await account.save();
+	assert.equal((await Bound.find(1).load())?.data.name, 'after commit');
+});
+
+test('async typed view validation failures roll back surrounding writes', async () => {
+	const { Account, Bound, context } = fixture();
+	const invalid = defineTypedView<Row>()({
+		name: 'invalid', resolve: ({ data }) => data,
+		parse: async () => { await Promise.resolve(); throw new Error('Rejected output'); }
+	});
+	defineModel<Row>({ name: 'typed_account' }).id('id').validate(parseRow).view(invalid).attach(Account);
+	await Bound.create({ id: 1, name: 'original', secret: 'hidden' });
+	await assert.rejects(context.transaction(async tx => {
+		const item = await Bound.use(tx).find(1).load();
+		assert.ok(item);
+		item.data.name = 'must roll back';
+		await item.save();
+		await item.view(invalid);
+	}), /Rejected output/);
+	assert.equal((await Bound.find(1).load())?.data.name, 'original');
 });
 
 test('definitions capture callbacks and reject unsafe names or missing parsers', async () => {
