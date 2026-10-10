@@ -1,0 +1,38 @@
+name: Verify reviewed package pins
+on:
+  push:
+    branches: [codex/typed-view-contracts]
+    paths: ['.codex-pack/**']
+permissions:
+  contents: write
+jobs:
+  verify:
+    if: github.repository == 'seo-rii/active-ts' && github.ref == 'refs/heads/codex/typed-view-contracts'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: codex/typed-view-contracts
+      - name: Confirm source provenance and synchronize reviewed package expectations
+        run: |
+          node .codex-pack/verify-pins.mjs
+          git rm .codex-pack/verify-pins.mjs .github/workflows/codex-check-pack-pins.yml
+          git add test/pack-smoke.mjs
+          git diff --cached --check
+          git diff --cached --stat
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'test: synchronize reviewed dependency expectations and remove preparation files'
+          git push origin HEAD:refs/heads/codex/typed-view-contracts
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271
+        with:
+          version: 11.13.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run audit
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm pack:smoke
