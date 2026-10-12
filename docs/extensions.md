@@ -284,7 +284,8 @@ PostgreSQL unknown outcomes use `ActiveTsUnknownTransactionOutcomeError` with
 `phase: 'commit'` and retains the original driver/protocol error in `cause`.
 A failed final ROLLBACK has `phase: 'abort'`; its `cause` is an `AggregateError`
 containing the original failure followed by the rollback failure. Both paths
-discard the client and suppress commit and rollback hooks. A release failure
+discard the client and suppress `afterCommit` and `afterRollback` tasks, including
+deferred outbox work. A release failure
 on either path is attached as `releaseError` without replacing the primary
 outcome. This replaces PostgreSQL's previous configuration-error/aggregate-error
 outer types; callers should migrate those catches to the public unknown type.
@@ -296,6 +297,25 @@ outer types; callers should migrate those catches to the public unknown type.
 | Callback fails and ROLLBACK succeeds | Original callback error | `afterRollback` |
 | COMMIT acknowledgement is lost or malformed | Unknown, `phase: 'commit'` | Neither |
 | Final ROLLBACK fails | Unknown, `phase: 'abort'` | Neither |
+
+When the adapter reports an unconfirmed outcome, the context closes the attempt
+as failed and makes its tracked, retained models stale for further writes. It
+attempts only the cache invalidations scheduled by that attempt, including
+invalidations retained from unconfirmed savepoint recovery. Unrelated cache
+entries are left alone. This uses the normal cache policy, including
+`beforeCacheInvalidate` and `afterCacheInvalidate`; other internal commit work,
+`afterCommit`, `afterRollback`, and deferred outbox work do not run.
+If cache cleanup fails, active-ts continues attempting the other scheduled keys
+and preserves the original unknown error and its phase. The failures are attached
+as an `AggregateError` in `cacheInvalidationError` when the original thrown object
+accepts diagnostic metadata; frozen errors remain unchanged. Failed invalidations
+retain the normal failed-key protection for subsequent reads through the same
+cache adapter.
+
+This eviction removes potentially stale cache entries; it does not determine the
+final result of an in-flight commit or authorize an automatic retry. A new read
+can still race that commit. Resolve the operation through an authoritative,
+uncached reconciliation path and an application-owned durable operation receipt.
 
 This table describes the transaction runner's evidence, not a classifier for
 arbitrary caught errors. A callback may itself throw an instance of a public

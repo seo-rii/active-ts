@@ -146,7 +146,8 @@ function createMalformedMemorySavepointStore(
 async function createPostgresOutcomeStore(
 	outcome: 'commit' | 'commit-unknown' | 'abort-unknown',
 	initialRows: TransactionIsolationData[],
-	freezeOutcome = false
+	freezeOutcome = false,
+	failSavepointRollback = false
 ) {
 	let committed = new Map(initialRows.map((row) => [`number:${row.id}`, structuredClone(row)]));
 	const calls: string[] = [];
@@ -181,6 +182,7 @@ async function createPostgresOutcomeStore(
 		query: async (text: string, values: any[]) => queryRows(committed, text, values, 'root'),
 		connect: async () => {
 			let pending = structuredClone(committed);
+			const savepoints = new Map<string, typeof pending>();
 			return {
 				query: async (text: string, values: any[]) => {
 					if (text === 'begin') {
@@ -198,6 +200,24 @@ async function createPostgresOutcomeStore(
 						calls.push('rollback');
 						if (outcome === 'abort-unknown') throw fault;
 						return { rows: [], rowCount: 0, command: 'ROLLBACK' };
+					}
+					if (text.startsWith('savepoint ')) {
+						calls.push('savepoint');
+						savepoints.set(text.slice('savepoint '.length), structuredClone(pending));
+						return { rows: [], rowCount: 0, command: 'SAVEPOINT' };
+					}
+					if (text.startsWith('rollback to savepoint ')) {
+						calls.push('rollback-to');
+						if (failSavepointRollback) throw fault;
+						const snapshot = savepoints.get(text.slice('rollback to savepoint '.length));
+						assert.ok(snapshot);
+						pending = structuredClone(snapshot);
+						return { rows: [], rowCount: 0, command: 'ROLLBACK' };
+					}
+					if (text.startsWith('release savepoint ')) {
+						calls.push('release-savepoint');
+						savepoints.delete(text.slice('release savepoint '.length));
+						return { rows: [], rowCount: 0, command: 'RELEASE' };
 					}
 					return queryRows(pending, text, values, 'transaction');
 				},
@@ -2314,6 +2334,178 @@ test('transaction cache invalidation failures reject after the store commits', a
 	assert.match(warnings[0], /afterCommit task failed.*cache unavailable/);
 	assert.deepEqual(store.dump('transaction_cache_record'), [{ id: 12, value: 'after' }]);
 });
+
+for (const outcome of ['commit-unknown', 'abort-unknown'] as const) {
+	for (const freezeOutcome of [false, true]) {
+		test(`unknown PostgreSQL ${outcome} invalidates only dirty cache entries with ${freezeOutcome ? 'frozen' : 'mutable'} errors`, async () => {
+			const fixture = await createPostgresOutcomeStore(outcome, [
+				{ id: 1, value: 'before' },
+				{ id: 3, value: 'before-delete' },
+				{ id: 4, value: 'untouched' }
+			], freezeOutcome);
+			const cache = new MemoryCacheAdapter();
+			const outbox = new MemoryOutboxAdapter();
+			const tasks: string[] = [];
+			const invalidations: string[] = [];
+			const context = createActiveTs({
+				stores: { default: fixture.store },
+				caches: { default: cache },
+				plugins: [createOutboxPlugin({ outbox, includeData: true }), {
+					name: 'unknown-cache-hooks',
+					hooks: {
+						beforeCacheInvalidate: ({ id }) => { invalidations.push(`before:${id}`); },
+						afterCacheInvalidate: ({ id }) => { invalidations.push(`after:${id}`); }
+					}
+				}]
+			});
+			const Record = TransactionCacheRecord.use(context);
+			for (const id of [1, 2, 3, 4]) await Record.find(id).load();
+			const untouchedKey = 'transaction_cache_record:number:4';
+			const untouchedEntry = cache.snapshot()[untouchedKey];
+			const callbackError = new Error('request rollback');
+			await assert.rejects(() => context.transaction(async (tx) => {
+				await tx.afterCommit(() => { tasks.push('commit'); });
+				await tx.afterRollback(() => { tasks.push('rollback'); });
+				await tx.afterCommitInternal(() => { tasks.push('internal'); });
+				const TxRecord = TransactionCacheRecord.use(tx);
+				await TxRecord.update(1, { value: 'after' });
+				await TxRecord.update(1, { value: 'after' });
+				await TxRecord.create({ id: 2, value: 'created' });
+				await TxRecord.delete(3);
+				assert.equal(cache.stats.deleteMany, 0);
+				assert.deepEqual(invalidations, []);
+				if (outcome === 'abort-unknown') throw callbackError;
+			}), (error: unknown) => {
+				assert.ok(error instanceof ActiveTsUnknownTransactionOutcomeError);
+				assert.equal(error, fixture.released[0]);
+				assert.equal(error.phase, outcome === 'commit-unknown' ? 'commit' : 'abort');
+				assert.equal(Object.isFrozen(error), freezeOutcome);
+				assert.equal(Object.hasOwn(error, 'cacheInvalidationError'), false);
+				return true;
+			});
+			assert.equal(cache.stats.deleteMany, 3);
+			assert.deepEqual(invalidations, ['before:1', 'after:1', 'before:2', 'after:2', 'before:3', 'after:3']);
+			assert.deepEqual(cache.snapshot(), { [untouchedKey]: untouchedEntry });
+			assert.deepEqual(tasks, []);
+			assert.deepEqual(await outbox.list(), []);
+			const fresh = createActiveTs({ stores: { default: fixture.store }, caches: { default: cache } });
+			const FreshRecord = TransactionCacheRecord.use(fresh);
+			const reads = fixture.calls.filter((call) => call === 'root:select').length;
+			assert.equal((await FreshRecord.find(4).load())?.data.value, 'untouched');
+			assert.equal(fixture.calls.filter((call) => call === 'root:select').length, reads);
+			assert.equal((await FreshRecord.find(1).load())?.data.value, outcome === 'commit-unknown' ? 'after' : 'before');
+			assert.equal((await FreshRecord.find(2).load())?.data.value, outcome === 'commit-unknown' ? 'created' : undefined);
+			assert.equal((await FreshRecord.find(3).load())?.data.value, outcome === 'commit-unknown' ? undefined : 'before-delete');
+			assert.equal(fixture.calls.filter((call) => call === 'root:select').length, reads + 3);
+		});
+	}
+}
+
+for (const freezeOutcome of [false, true]) {
+	test(`unknown PostgreSQL cache cleanup preserves ${freezeOutcome ? 'frozen' : 'mutable'} errors and poisons failed invalidations`, async () => {
+		const fixture = await createPostgresOutcomeStore('commit-unknown', [1, 2, 3, 4, 5].map((id) => ({ id, value: 'before' })), freezeOutcome);
+		const beforeError = new Error('before invalidation failed');
+		const deleteError = new Error('cache delete failed');
+		const afterError = new Error('after invalidation failed');
+		const attempts: string[] = [];
+		class FailingCache extends MemoryCacheAdapter {
+			override async deleteMany(keys: string[]) {
+				attempts.push(...keys);
+				if (keys.includes('transaction_cache_record:number:2')) throw deleteError;
+				await super.deleteMany(keys);
+			}
+		}
+		const cache = new FailingCache();
+		const tasks: string[] = [];
+		const context = createActiveTs({
+			stores: { default: fixture.store },
+			caches: { default: cache },
+			plugins: [{
+				name: 'unknown-failing-cache-hooks',
+				hooks: {
+					beforeCacheInvalidate: ({ id }) => { if (id === 1) throw beforeError; },
+					afterCacheInvalidate: ({ id }) => { if (id === 3) throw afterError; }
+				}
+			}]
+		});
+		const Record = TransactionCacheRecord.use(context);
+		for (const id of [1, 2, 3, 4, 5]) await Record.find(id).load();
+		await assert.rejects(() => context.transaction(async (tx) => {
+			await tx.afterCommit(() => { tasks.push('commit'); });
+			await tx.afterRollback(() => { tasks.push('rollback'); });
+			await tx.afterCommitInternal(() => { tasks.push('internal'); });
+			for (const id of [1, 2, 3, 4]) await TransactionCacheRecord.use(tx).update(id, { value: 'after' });
+		}), (error: unknown) => {
+			assert.ok(error instanceof ActiveTsUnknownTransactionOutcomeError);
+			assert.equal(error, fixture.released[0]);
+			assert.equal(error.phase, 'commit');
+			assert.equal(error.cause, fixture.fault);
+			assert.equal(Object.isFrozen(error), freezeOutcome);
+			assert.equal(Object.hasOwn(error, 'afterRollbackError'), false);
+			const diagnostic = Object.getOwnPropertyDescriptor(error, 'cacheInvalidationError');
+			if (freezeOutcome) assert.equal(diagnostic, undefined);
+			else {
+				assert.ok(diagnostic?.value instanceof AggregateError);
+				assert.deepEqual(diagnostic.value.errors, [beforeError, deleteError, afterError]);
+			}
+			return true;
+		});
+		assert.deepEqual(tasks, []);
+		assert.deepEqual(attempts, [2, 3, 4].map((id) => `transaction_cache_record:number:${id}`));
+		assert.deepEqual(Object.keys(cache.snapshot()).sort(), [1, 2, 5].map((id) => `transaction_cache_record:number:${id}`));
+		const fresh = createActiveTs({ stores: { default: fixture.store }, caches: { default: cache } });
+		const FreshRecord = TransactionCacheRecord.use(fresh);
+		const reads = fixture.calls.filter((call) => call === 'root:select').length;
+		assert.equal((await FreshRecord.find(5).load())?.data.value, 'before');
+		assert.equal(fixture.calls.filter((call) => call === 'root:select').length, reads);
+		for (const id of [1, 2, 3, 4]) assert.equal((await FreshRecord.find(id).load())?.data.value, 'after');
+		assert.equal(fixture.calls.filter((call) => call === 'root:select').length, reads + 4);
+	});
+}
+
+for (const outcome of ['commit', 'abort-unknown'] as const) {
+	test(`unconfirmed PostgreSQL savepoints retain cache invalidations for ${outcome === 'commit' ? 'confirmed' : 'unknown'} root abort`, async () => {
+		const fixture = await createPostgresOutcomeStore(outcome, [1, 2, 3].map((id) => ({ id, value: 'before' })), false, true);
+		const cache = new MemoryCacheAdapter();
+		const outbox = new MemoryOutboxAdapter();
+		const context = createActiveTs({
+			stores: { default: fixture.store },
+			caches: { default: cache },
+			plugins: [createOutboxPlugin({ outbox, includeData: true })]
+		});
+		const Record = TransactionCacheRecord.use(context);
+		for (const id of [1, 2, 3]) await Record.find(id).load();
+		const tasks: string[] = [];
+		await assert.rejects(() => context.transaction(async (tx) => {
+			await tx.afterCommit(() => { tasks.push('root-commit'); });
+			await tx.afterRollback(() => { tasks.push('root-rollback'); });
+			await TransactionCacheRecord.use(tx).update(1, { value: 'root-attempt' });
+			await tx.transaction(async (child) => {
+				await child.afterRollback(() => { tasks.push('child-rollback'); });
+				await child.transaction(async (grandchild) => {
+					await grandchild.afterCommit(() => { tasks.push('grandchild-commit'); });
+					await grandchild.afterRollback(() => { tasks.push('grandchild-rollback'); });
+					await grandchild.afterCommitInternal(() => { tasks.push('grandchild-internal'); });
+					await TransactionCacheRecord.use(grandchild).update(1, { value: 'child-overwrite' });
+					await TransactionCacheRecord.use(grandchild).update(2, { value: 'child-attempt' });
+					throw new Error('request savepoint rollback');
+				}, { join: 'savepoint' });
+			}, { join: 'savepoint' });
+		}), (error: unknown) => {
+			if (outcome === 'abort-unknown') {
+				assert.ok(error instanceof ActiveTsUnknownTransactionOutcomeError);
+				assert.equal(error, fixture.released[0]);
+				assert.equal(error.phase, 'abort');
+			} else assert.ok(error instanceof AggregateError);
+			return true;
+		});
+		assert.equal(fixture.calls.filter((call) => call === 'rollback-to').length, 2);
+		assert.equal(cache.stats.deleteMany, outcome === 'abort-unknown' ? 2 : 0);
+		assert.deepEqual(Object.keys(cache.snapshot()).sort(), (outcome === 'abort-unknown' ? [3] : [1, 2, 3]).map((id) => `transaction_cache_record:number:${id}`));
+		assert.deepEqual(tasks, outcome === 'abort-unknown' ? [] : ['root-rollback', 'child-rollback', 'grandchild-rollback']);
+		assert.deepEqual(await outbox.list(), []);
+	});
+}
 
 test('transaction write hook failures are not reported as committed side effects', async () => {
 	const store = new MemoryStoreAdapter();

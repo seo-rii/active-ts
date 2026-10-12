@@ -2908,14 +2908,25 @@ export class ActiveContext {
 								SET_FOR_EACH.call(state.modelInstances, (value: object) => {
 									SET_ADD.call(parentState.modelInstances, value);
 								});
+								// Preserve uncertain writes for root-outcome cache cleanup, without commit tasks.
+								MAP_FOR_EACH.call(
+									state.cacheInvalidations,
+									(invalidation: { meta: ResolvedModelMeta; id: EntityId; task: DeferredTask }, key: string) => {
+										if (!mapHas(parentState.cacheInvalidations, key)) mapSet(parentState.cacheInvalidations, key, invalidation);
+									}
+								);
+								SET_FOR_EACH.call(state.dirtyCacheKeys, (key: string) => {
+									SET_ADD.call(parentState.dirtyCacheKeys, key);
+								});
 							} else {
 								state.closed = 'rolled back';
 								markClosedTransactionModelInstances(state);
-								attachRollbackTaskErrors(
+								attachTransactionTaskErrors(
 									error,
 									await runDeferredTasks('afterRollback', state.afterRollback, {
 										throwOnError: false
-									})
+									}),
+									'afterRollback'
 								);
 							}
 						}
@@ -3031,9 +3042,23 @@ export class ActiveContext {
 						if (transactionRollbackSkipped(error) && !rollbackObservation.confirmed) {
 							if (!attemptState.closed) attemptState.closed = 'failed';
 							markClosedTransactionModelInstances(attemptState);
+							const invalidationErrors: unknown[] = [];
+							const invalidations: DeferredTask[] = [];
+							MAP_FOR_EACH.call(attemptState.cacheInvalidations, (invalidation: { task: DeferredTask }) => {
+								invalidations.push(invalidation.task);
+							});
+							// Eviction does not establish a commit or authorize other deferred side effects.
+							for (const invalidate of invalidations) {
+								try {
+									await invalidate();
+								} catch (invalidationError) {
+									invalidationErrors.push(invalidationError);
+								}
+							}
+							attachTransactionTaskErrors(error, invalidationErrors, 'cacheInvalidation');
 							throw error;
 						}
-						attachRollbackTaskErrors(error, await rollbackAttempt(attemptState, { staleTrackedModels: true }));
+						attachTransactionTaskErrors(error, await rollbackAttempt(attemptState, { staleTrackedModels: true }), 'afterRollback');
 					}
 					throw error;
 				} finally {
@@ -5729,36 +5754,43 @@ async function runAfterCommitTasks(state: TransactionState) {
 	}
 }
 
-function attachRollbackTaskErrors(primaryError: unknown, rollbackErrors: unknown[]) {
-	if (!rollbackErrors.length) return;
+function attachTransactionTaskErrors(
+	primaryError: unknown,
+	taskErrors: unknown[],
+	kind: 'afterRollback' | 'cacheInvalidation'
+) {
+	if (!taskErrors.length) return;
 	if (!primaryError || (typeof primaryError !== 'object' && typeof primaryError !== 'function')) {
 		return;
 	}
 	try {
+		const property = `${kind}Error`;
 		const combined: unknown[] = [];
-		const previous = Object.getOwnPropertyDescriptor(primaryError, 'afterRollbackError');
+		const previous = Object.getOwnPropertyDescriptor(primaryError, property);
 		if (previous && 'value' in previous && previous.value !== undefined) {
 			const previousErrors = previous.value instanceof AggregateError
 				? Object.getOwnPropertyDescriptor(previous.value, 'errors')
 				: undefined;
 			if (previousErrors && 'value' in previousErrors && Array.isArray(previousErrors.value)) {
-				const snapshot = snapshotArrayInput<unknown>(previousErrors.value, 'afterRollback errors');
+				const snapshot = snapshotArrayInput<unknown>(previousErrors.value, `${kind} errors`);
 				for (let index = 0; index < snapshot.length; index++) combined.push(snapshot[index]);
 			} else {
 				combined.push(previous.value);
 			}
 		}
-		for (let index = 0; index < rollbackErrors.length; index++) combined.push(rollbackErrors[index]);
+		for (let index = 0; index < taskErrors.length; index++) combined.push(taskErrors[index]);
 		const aggregate = new AggregateError(
 			combined,
-			'active-ts afterRollback task failed after transaction rollback.'
+			kind === 'afterRollback'
+				? 'active-ts afterRollback task failed after transaction rollback.'
+				: 'active-ts cache invalidation failed after an unknown transaction outcome.'
 		);
-		defineDataProperty(primaryError, 'afterRollbackError', aggregate, {
+		defineDataProperty(primaryError, property, aggregate, {
 			enumerable: false,
 			configurable: true
 		});
 	} catch {
-		// Preserve the original rollback reason even when the thrown value is not extensible.
+		// Preserve the original transaction failure even when the thrown value is not extensible.
 	}
 }
 
