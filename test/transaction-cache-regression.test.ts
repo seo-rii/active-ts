@@ -6,6 +6,7 @@ import {
 	ActiveTsCommittedTransactionError,
 	ActiveTsCommittedWriteError,
 	ActiveTsNotFoundError,
+	ActiveTsUnknownTransactionOutcomeError,
 	MemoryCacheAdapter,
 	MemoryOutboxAdapter,
 	MemorySearchAdapter,
@@ -36,6 +37,7 @@ import {
 	trackStoreTransactionWork
 } from '../src/index.js';
 import { createNativeSearchAdapter } from '../src/adapters/search/native.js';
+import { createPostgresStoreAdapter } from '../src/adapters/store/postgresql.js';
 import {
 	datastoreSearchDocumentIdentity,
 	searchHitDocumentIdentity
@@ -139,6 +141,75 @@ function createMalformedMemorySavepointStore(
 		}
 	};
 	return { backing, store };
+}
+
+async function createPostgresOutcomeStore(
+	outcome: 'commit' | 'commit-unknown' | 'abort-unknown',
+	initialRows: TransactionIsolationData[],
+	freezeOutcome = false
+) {
+	let committed = new Map(initialRows.map((row) => [`number:${row.id}`, structuredClone(row)]));
+	const calls: string[] = [];
+	const released: unknown[] = [];
+	const fault = Object.freeze(new Error(`${outcome} acknowledgement lost`));
+	const queryRows = (
+		rows: Map<string, TransactionIsolationData>,
+		text: string,
+		values: any[],
+		scope: 'root' | 'transaction'
+	) => {
+		calls.push(`${scope}:${text.split(' ')[0]}`);
+		if (text.startsWith('select')) {
+			const ids: string[] = Array.isArray(values[0]) ? values[0] : [values[0]];
+			const selected = ids.flatMap((id) => rows.has(id) ? [{ id, data: structuredClone(rows.get(id)) }] : []);
+			return { rows: selected, rowCount: selected.length, command: 'SELECT' };
+		}
+		if (text.startsWith('insert')) {
+			assert.equal(rows.has(values[0]), false);
+			rows.set(values[0], structuredClone(values[1]));
+			return { rows: [], rowCount: 1, command: 'INSERT' };
+		}
+		if (text.startsWith('update')) {
+			assert.ok(rows.has(values[0]));
+			rows.set(values[0], structuredClone(values[1]));
+			return { rows: [], rowCount: 1, command: 'UPDATE' };
+		}
+		assert.ok(text.startsWith('delete'), `Unexpected PostgreSQL fixture query: ${text}`);
+		return { rows: [], rowCount: Number(rows.delete(values[0])), command: 'DELETE' };
+	};
+	const store = await createPostgresStoreAdapter({ pool: {
+		query: async (text: string, values: any[]) => queryRows(committed, text, values, 'root'),
+		connect: async () => {
+			let pending = structuredClone(committed);
+			return {
+				query: async (text: string, values: any[]) => {
+					if (text === 'begin') {
+						calls.push('begin');
+						pending = structuredClone(committed);
+						return { rows: [], rowCount: 0, command: 'BEGIN' };
+					}
+					if (text === 'commit') {
+						calls.push('commit');
+						committed = pending;
+						if (outcome === 'commit-unknown') throw fault;
+						return { rows: [], rowCount: 0, command: 'COMMIT' };
+					}
+					if (text === 'rollback') {
+						calls.push('rollback');
+						if (outcome === 'abort-unknown') throw fault;
+						return { rows: [], rowCount: 0, command: 'ROLLBACK' };
+					}
+					return queryRows(pending, text, values, 'transaction');
+				},
+				release: (error?: unknown) => {
+					calls.push('release');
+					released.push(error);
+					if (freezeOutcome && error instanceof Error) Object.freeze(error);
+				}
+			};
+		}
+	} });
+	return { store, calls, released, fault };
 }
 
 let transactionReadOnlyHookEvents: string[] = [];
@@ -2452,6 +2523,70 @@ test('rolled-back transactions stale retained root instances deleted in the tran
 		/closed transaction context after it rolled back/
 	);
 	assert.equal((await Record.find(51).load())?.data.value, 'before-delete');
+});
+
+for (const outcome of ['commit-unknown', 'abort-unknown'] as const) {
+	for (const freezeOutcome of [false, true]) {
+		for (const operation of ['save', 'delete'] as const) {
+			test(`unknown PostgreSQL ${outcome} closes retained models after ${operation} with ${freezeOutcome ? 'frozen' : 'mutable'} errors`, async () => {
+				const fixture = await createPostgresOutcomeStore(outcome, [{ id: 1, value: 'before' }], freezeOutcome);
+				const outbox = new MemoryOutboxAdapter();
+				const context = createActiveTs({
+					stores: { default: fixture.store },
+					plugins: [createOutboxPlugin({ outbox, includeData: true })]
+				});
+				const Record = TransactionIsolationRecord.use(context);
+				const retained = await Record.find(1).load();
+				assert.ok(retained);
+				let transactionBound: TransactionIsolationRecord | null = null;
+				const hooks: string[] = [];
+				const callbackError = new Error('request rollback');
+				await assert.rejects(() => context.transaction(async (tx) => {
+					transactionBound = await TransactionIsolationRecord.use(tx).find(1).load();
+					await tx.afterCommit(() => { hooks.push('commit'); });
+					await tx.afterRollback(() => { hooks.push('rollback'); });
+					retained.data.value = 'attempted';
+					await retained[operation]();
+					if (outcome === 'abort-unknown') throw callbackError;
+				}), (error: unknown) => {
+					assert.ok(error instanceof ActiveTsUnknownTransactionOutcomeError);
+					assert.equal(error, fixture.released[0]);
+					assert.equal(error.phase, outcome === 'commit-unknown' ? 'commit' : 'abort');
+					assert.equal(Object.isFrozen(error), freezeOutcome);
+					if (outcome === 'commit-unknown') assert.equal(error.cause, fixture.fault);
+					else {
+						assert.ok(error.cause instanceof AggregateError);
+						assert.deepEqual(error.cause.errors, [callbackError, fixture.fault]);
+					}
+					return true;
+				});
+				const finishedCalls = [...fixture.calls];
+				assert.ok(transactionBound);
+				for (const item of [retained, transactionBound]) {
+					await assert.rejects(() => item.save(), /closed transaction context after it failed/);
+					await assert.rejects(() => item.delete(), /closed transaction context after it failed/);
+				}
+				assert.deepEqual(fixture.calls, finishedCalls);
+				assert.deepEqual(hooks, []);
+				assert.deepEqual(await outbox.list(), []);
+			});
+		}
+	}
+}
+
+test('confirmed PostgreSQL commits keep retained root models usable', async () => {
+	const fixture = await createPostgresOutcomeStore('commit', [{ id: 1, value: 'before' }]);
+	const context = createActiveTs({ stores: { default: fixture.store } });
+	const Record = TransactionIsolationRecord.use(context);
+	const retained = await Record.find(1).load();
+	assert.ok(retained);
+	await context.transaction(async () => {
+		retained.data.value = 'committed';
+		await retained.save();
+	});
+	retained.data.value = 'after-commit';
+	await retained.save();
+	assert.equal((await Record.find(1).load())?.data.value, 'after-commit');
 });
 
 test('transaction retries do not stale retained root instances from retried attempts', async () => {

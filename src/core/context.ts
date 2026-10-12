@@ -2910,7 +2910,7 @@ export class ActiveContext {
 								});
 							} else {
 								state.closed = 'rolled back';
-								markRolledBackTransactionModelInstances(state);
+								markClosedTransactionModelInstances(state);
 								attachRollbackTaskErrors(
 									error,
 									await runDeferredTasks('afterRollback', state.afterRollback, {
@@ -2964,7 +2964,7 @@ export class ActiveContext {
 				const rollbackAttempt = async (state: TransactionState, options: { staleTrackedModels: boolean }) => {
 					if (state.closed) return [];
 					state.closed = 'rolled back';
-					if (options.staleTrackedModels) markRolledBackTransactionModelInstances(state);
+					if (options.staleTrackedModels) markClosedTransactionModelInstances(state);
 					return await runDeferredTasks('afterRollback', state.afterRollback, { throwOnError: false });
 				};
 				let attemptState: TransactionState | undefined;
@@ -3030,6 +3030,7 @@ export class ActiveContext {
 					if (attemptState) {
 						if (transactionRollbackSkipped(error) && !rollbackObservation.confirmed) {
 							if (!attemptState.closed) attemptState.closed = 'failed';
+							markClosedTransactionModelInstances(attemptState);
 							throw error;
 						}
 						attachRollbackTaskErrors(error, await rollbackAttempt(attemptState, { staleTrackedModels: true }));
@@ -5761,7 +5762,7 @@ function attachRollbackTaskErrors(primaryError: unknown, rollbackErrors: unknown
 	}
 }
 
-function markRolledBackTransactionModelInstances(state: TransactionState) {
+function markClosedTransactionModelInstances(state: TransactionState) {
 	const txContext = state.context;
 	if (!txContext) return;
 	SET_FOR_EACH.call(state.modelInstances, (value: object) => {
@@ -5770,7 +5771,7 @@ function markRolledBackTransactionModelInstances(state: TransactionState) {
 			defineDataProperty(value, 'context', txContext, { enumerable: true, configurable: true, writable: true });
 			clearModelRelationState(value);
 		} catch {
-			// A rollback reason must remain authoritative even if stale marking cannot touch an unusual object.
+			// The transaction failure must remain authoritative even if stale marking cannot touch an unusual object.
 		}
 	});
 }
