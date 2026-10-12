@@ -279,6 +279,37 @@ PostgreSQL client is discarded rather than returned to the connection pool.
 Await each `query()` result when later callback code depends on it or needs to
 handle its error locally.
 
+PostgreSQL defaults to the server's isolation setting unless `isolation` is
+specified. With `readCommitted`, two callbacks can read the same value and both
+successfully save an unversioned replacement, losing one increment. This is why
+the adapter advertises `transactionConflictDetection: false`. A numeric model
+`version` enables atomic optimistic writes: a competing save with the old
+version fails with `ActiveTsConflictError`. Under `repeatableRead` or
+`serializable`, a stale concurrent update can instead fail with PostgreSQL's
+SQLSTATE `40001`. The adapter does not rerun application callbacks; an application
+must decide whether a new attempt is safe.
+
+Two reads in a `readCommitted` transaction may see a commit from another
+connection between statements; `repeatableRead` retains its initial snapshot.
+Transaction reads bypass ordinary entity caches. Trusted native SQL can use
+`SELECT ... FOR UPDATE` when the application needs row locks. `timeoutMs` maps
+to PostgreSQL's statement timeout and can bound a lock wait; it is not a deadline
+or cancellation mechanism for arbitrary callback code. These guarantees concern
+the selected PostgreSQL transaction, not all adapters or unrelated external
+effects. See the [PostgreSQL 16 isolation documentation](https://www.postgresql.org/docs/16/transaction-iso.html).
+
+Uncommitted writes are not visible through an independent database connection.
+After commit, returned models are rebound to the root context and can be used
+again; the captured transaction context remains closed. Models retained from a
+rollback or unknown outcome keep a closed transaction context and cannot save.
+Contexts using separate PostgreSQL adapter instances can share an entity cache
+when their explicit `cacheScope` identifies the same physical store. Use
+different scopes for different schemas/tenants. Model transactions invalidate
+that shared cache after commit. Raw SQL and low-level store writes bypass the
+model lifecycle; call `context.invalidateModelExternal(Model, id)` after a
+confirmed external write. Separate contexts or separate caches alone do not
+provide a cross-process cache-coherence protocol.
+
 PostgreSQL unknown outcomes use `ActiveTsUnknownTransactionOutcomeError` with
 `outcome: 'unknown'`. A failed or malformed COMMIT acknowledgement has
 `phase: 'commit'` and retains the original driver/protocol error in `cause`.
