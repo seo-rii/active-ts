@@ -3520,17 +3520,27 @@ export class ActiveContext {
 				);
 			}
 			const versionedEntries = [] as Array<[string, any, string]>;
+			const attemptedKeys: string[] = [];
 			for (let index = 0; index < writeEntries.length; index++) {
 				const [key, value] = writeEntries[index];
 				const version = mapGet(expectedVersions, key);
 				if (version === undefined) continue;
 				versionedEntries[versionedEntries.length] = [key, value, version];
+				attemptedKeys[attemptedKeys.length] = key;
 			}
-			const results = normalizeCacheVersionedSetResult(
-				await cache.setManyVersioned(versionedEntries, { ttl }),
-				versionedEntries.length,
-				`Cache adapter "${cache.kind}" setManyVersioned result`
-			);
+			let results: boolean[];
+			try {
+				results = normalizeCacheVersionedSetResult(
+					await cache.setManyVersioned(versionedEntries, { ttl }),
+					versionedEntries.length,
+					`Cache adapter "${cache.kind}" setManyVersioned result`
+				);
+			} catch (error) {
+				await this.poisonCommittedCacheSet(
+					cache, meta, attemptedKeys, error, 'Entity cache write failed and cleanup failed.'
+				);
+				throw error;
+			}
 			committedEntries = [];
 			committedIds = [];
 			let versionedIndex = 0;
@@ -3544,7 +3554,15 @@ export class ActiveContext {
 				versionedIndex++;
 			}
 		} else {
-			await cache.setMany(writeEntries, { ttl });
+			const attemptedKeys = cacheEntryKeys(writeEntries);
+			try {
+				await cache.setMany(writeEntries, { ttl });
+			} catch (error) {
+				await this.poisonCommittedCacheSet(
+					cache, meta, attemptedKeys, error, 'Entity cache write failed and cleanup failed.'
+				);
+				throw error;
+			}
 		}
 		const staleKeys: string[] = [];
 		if (expectedEpochs) {
@@ -3582,7 +3600,7 @@ export class ActiveContext {
 				meta: { keys: cacheEntryKeys(stableEntries) }
 			});
 		} catch (error) {
-			await this.poisonCommittedCacheSet(cache, meta, stableEntries, error);
+			await this.poisonCommittedCacheSet(cache, meta, cacheEntryKeys(stableEntries), error);
 			throw error;
 		}
 	}
@@ -3590,10 +3608,11 @@ export class ActiveContext {
 	private async poisonCommittedCacheSet(
 		cache: CacheAdapter,
 		meta: ResolvedModelMeta,
-		entries: Array<[string, any]>,
-		cause: unknown
+		keys: string[],
+		cause: unknown,
+		cleanupMessage = 'Entity cache set hook failed and cleanup failed.'
 	) {
-		const keys = cacheEntryKeys(entries);
+		if (!keys.length) return;
 		for (const key of keys) this.bumpCacheEpoch(cache, key);
 		try {
 			if (meta.cache?.consistency === 'distributed' && cacheSupportsVersioning(cache)) {
@@ -3604,7 +3623,7 @@ export class ActiveContext {
 			for (const key of keys) this.clearCacheInvalidationFailure(cache, key);
 		} catch (error) {
 			for (const key of keys) this.markCacheInvalidationFailure(cache, key);
-			throw new AggregateError([cause, error], 'Entity cache set hook failed and cleanup failed.');
+			throw new AggregateError([cause, error], cleanupMessage);
 		}
 	}
 
