@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
 	ActiveTsValidationError,
 	ActiveTsNotFoundError,
+	ActiveTsUnknownTransactionOutcomeError,
 	Model,
 	ACTIVE_TS_ENTITY_KEY,
 	clearDefaultContext,
@@ -3478,10 +3479,13 @@ test('postgres rollback failure preserves the original transaction error', async
 				throw new Error('work failed');
 			}),
 		(error: unknown) => {
-			assert.ok(error instanceof AggregateError);
+			assert.ok(error instanceof ActiveTsUnknownTransactionOutcomeError);
+			assert.equal(error.outcome, 'unknown');
+			assert.equal(error.phase, 'abort');
+			assert.ok(error.cause instanceof AggregateError);
 			assert.match(error.message, /work failed/);
 			assert.deepEqual(
-				error.errors.map((item: Error) => item.message),
+				error.cause.errors.map((item: Error) => item.message),
 				['work failed', 'rollback failed']
 			);
 			return true;
