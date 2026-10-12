@@ -8,6 +8,7 @@ import {
 	ActiveTsUnknownTransactionOutcomeError,
 	ActiveTsValidationError,
 	createActiveTs,
+	createStoreMiddlewareAdapter,
 	type AggregatePlan,
 	type QueryPlan,
 	type QueryResult,
@@ -2975,6 +2976,145 @@ test('PostgreSQL unknown commit outcomes retain frozen causes and later release 
 	});
 });
 
+for (const frozen of [false, true]) {
+	test(`PostgreSQL confirmed rollbacks preserve reused ${frozen ? 'frozen' : 'mutable'} unknown errors`, async () => {
+		const calls: string[] = [];
+		const deferred: string[] = [];
+		const rollbackError = new Error('rollback response lost');
+		const releaseError = new Error('release failed');
+		let rollbackFails = false;
+		let releaseFails = false;
+		const adapter = await createPostgresStoreAdapter({ pool: {
+			query: async () => ({ rows: [], rowCount: 0 }),
+			connect: async () => ({
+				query: async (text: string) => {
+					calls.push(text);
+					if (text === 'commit') throw new Error('commit response lost');
+					if (text === 'rollback' && rollbackFails) throw rollbackError;
+					return { rows: [], rowCount: 0, command: text.toUpperCase() };
+				},
+				release: () => {
+					calls.push('release');
+					if (releaseFails) throw releaseError;
+				}
+			})
+		} });
+		const context = createActiveTs({ stores: { default: adapter } });
+		let priorError: unknown;
+		await assert.rejects(() => context.transaction(async () => 'unknown'), (error: unknown) => {
+			assert.ok(error instanceof ActiveTsUnknownTransactionOutcomeError);
+			priorError = error;
+			return true;
+		});
+		if (frozen) Object.freeze(priorError);
+		releaseFails = true;
+
+		for (const currentRollbackFails of [false, true]) {
+			rollbackFails = currentRollbackFails;
+			calls.length = 0;
+			deferred.length = 0;
+			await assert.rejects(() => context.transaction(async (tx) => {
+				await tx.afterCommit(() => { deferred.push('commit'); });
+				await tx.afterRollback(() => { deferred.push('rollback'); });
+				throw priorError;
+			}), (error: unknown) => {
+				if (currentRollbackFails) {
+					assert.ok(error instanceof ActiveTsUnknownTransactionOutcomeError);
+					assert.notEqual(error, priorError);
+					assert.equal(error.phase, 'abort');
+					assert.ok(error.cause instanceof AggregateError);
+					assert.deepEqual(error.cause.errors, [priorError, rollbackError]);
+					assert.equal(Object.getOwnPropertyDescriptor(error, 'releaseError')?.value, releaseError);
+				} else {
+					assert.equal(error, priorError);
+				}
+				return true;
+			});
+			assert.deepEqual(calls, ['begin', 'rollback', 'release']);
+			assert.deepEqual(deferred, currentRollbackFails ? [] : ['rollback']);
+		}
+	});
+}
+
+for (const wrapping of ['nested middleware', 'context handle with middleware']) {
+	test(`PostgreSQL confirmed rollback survives ${wrapping} callback wrappers`, async () => {
+		const calls: string[] = [];
+		const deferred: string[] = [];
+		const adapter = await createPostgresStoreAdapter({ pool: {
+			query: async () => ({ rows: [], rowCount: 0 }),
+			connect: async () => ({
+				query: async (text: string) => {
+					calls.push(text);
+					if (text === 'commit') throw new Error('commit response lost');
+					return { rows: [], rowCount: 0, command: text.toUpperCase() };
+				},
+				release: () => { calls.push('release'); }
+			})
+		} });
+		let priorError: unknown;
+		await assert.rejects(() => adapter.transaction!(async () => 'unknown'), (error: unknown) => {
+			assert.ok(error instanceof ActiveTsUnknownTransactionOutcomeError);
+			priorError = Object.freeze(error);
+			return true;
+		});
+		calls.length = 0;
+		const middleware = createStoreMiddlewareAdapter(adapter, []);
+		const wrapped = wrapping === 'nested middleware'
+			? createStoreMiddlewareAdapter(middleware, [])
+			: createActiveTs({ stores: { default: middleware } }).store('default');
+		const context = createActiveTs({ stores: { default: wrapped } });
+		await assert.rejects(() => context.transaction(async (tx) => {
+			await tx.afterCommit(() => { deferred.push('commit'); });
+			await tx.afterRollback(() => { deferred.push('rollback'); });
+			throw priorError;
+		}), (error: unknown) => error === priorError);
+		assert.deepEqual(calls, ['begin', 'rollback', 'release']);
+		assert.deepEqual(deferred, ['rollback']);
+	});
+}
+
+test('PostgreSQL rollback evidence does not carry into a retried context callback', async () => {
+	const deferred: string[] = [];
+	const calls: string[] = [];
+	const adapter = await createPostgresStoreAdapter({ pool: {
+		query: async () => ({ rows: [], rowCount: 0 }),
+		connect: async () => ({
+			query: async (text: string) => {
+				calls.push(text);
+				if (text === 'commit') throw new Error('retry commit response lost');
+				return { rows: [], rowCount: 0, command: text.toUpperCase() };
+			},
+			release: () => { calls.push('release'); }
+		})
+	} });
+	const retryingAdapter: StoreAdapter = {
+		...adapter,
+		transaction: async (callback, options) => {
+			try {
+				return await adapter.transaction!(callback, options);
+			} catch {
+				return await adapter.transaction!(callback, options);
+			}
+		}
+	};
+	const context = createActiveTs({ stores: { default: retryingAdapter } });
+	let attempts = 0;
+	await assert.rejects(() => context.transaction(async (tx) => {
+		const attempt = ++attempts;
+		await tx.afterCommit(() => { deferred.push(`commit:${attempt}`); });
+		await tx.afterRollback(() => { deferred.push(`rollback:${attempt}`); });
+		if (attempt === 1) throw new Error('retry after confirmed rollback');
+		return 'unknown';
+	}), (error: unknown) => {
+		assert.ok(error instanceof ActiveTsUnknownTransactionOutcomeError);
+		assert.equal(error.phase, 'commit');
+		return true;
+	});
+	assert.equal(attempts, 2);
+	assert.deepEqual(calls, ['begin', 'rollback', 'release', 'begin', 'commit', 'release']);
+	assert.deepEqual(deferred, ['rollback:1']);
+});
+
 test('PostgreSQL transactions allow caught preflight failures before SQL execution', async () => {
 	const calls: string[] = [];
 	const client = {
@@ -3423,6 +3563,80 @@ test('PostgreSQL transaction release error attachment ignores polluted descripto
 		delete (Object.prototype as Record<string, unknown>).writable;
 	}
 });
+
+for (const releaseFails of [false, true]) {
+	test(`PostgreSQL transactions preserve undefined callback failures when release ${releaseFails ? 'fails' : 'succeeds'}`, async () => {
+		const calls: string[] = [];
+		const deferred: string[] = [];
+		const adapter = await createPostgresStoreAdapter({ pool: {
+			query: async () => ({ rows: [], rowCount: 0 }),
+			connect: async () => ({
+				query: async (text: string) => {
+					calls.push(text);
+					return { rows: [], rowCount: 0, command: text.toUpperCase() };
+				},
+				release: () => {
+					calls.push('release');
+					if (releaseFails) throw new Error('release failed');
+				}
+			})
+		} });
+		const context = createActiveTs({ stores: { default: adapter } });
+		let rejected = false;
+		let failure: unknown;
+		try {
+			await context.transaction(async (tx) => {
+				await tx.afterCommit(() => { deferred.push('commit'); });
+				await tx.afterRollback(() => { deferred.push('rollback'); });
+				throw undefined;
+			});
+		} catch (error) {
+			rejected = true;
+			failure = error;
+		}
+		assert.equal(rejected, true);
+		assert.deepEqual(calls, ['begin', 'rollback', 'release']);
+		assert.deepEqual(deferred, ['rollback']);
+		assert.equal(failure, undefined);
+	});
+
+	test(`PostgreSQL transactions commit undefined callback results when release ${releaseFails ? 'fails' : 'succeeds'}`, async () => {
+		const calls: string[] = [];
+		const deferred: string[] = [];
+		const releaseError = new Error('release failed');
+		const adapter = await createPostgresStoreAdapter({ pool: {
+			query: async () => ({ rows: [], rowCount: 0 }),
+			connect: async () => ({
+				query: async (text: string) => {
+					calls.push(text);
+					return { rows: [], rowCount: 0, command: text.toUpperCase() };
+				},
+				release: () => {
+					calls.push('release');
+					if (releaseFails) throw releaseError;
+				}
+			})
+		} });
+		const context = createActiveTs({ stores: { default: adapter } });
+		const transaction = () => context.transaction(async (tx) => {
+			await tx.afterCommit(() => { deferred.push('commit'); });
+			await tx.afterRollback(() => { deferred.push('rollback'); });
+			return undefined;
+		});
+		if (releaseFails) {
+			await assert.rejects(transaction, (error: unknown) => {
+				assert.ok(error instanceof ActiveTsCommittedTransactionError);
+				assert.equal(error.result, undefined);
+				assert.equal(error.cause, releaseError);
+				return true;
+			});
+		} else {
+			assert.equal(await transaction(), undefined);
+		}
+		assert.deepEqual(calls, ['begin', 'commit', 'release']);
+		assert.deepEqual(deferred, ['commit']);
+	});
+}
 
 test('PostgreSQL transaction release failures surface after successful commit', async () => {
 	const calls: string[] = [];

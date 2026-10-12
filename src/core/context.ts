@@ -6,7 +6,9 @@ import {
 	safeErrorMessage
 } from './errors.js';
 import {
+	inheritTransactionRollbackObservation,
 	markSavepointRollbackUnconfirmed,
+	observeTransactionRollback,
 	savepointRollbackUnconfirmed,
 	transactionRollbackSkipped
 } from './error-classification.js';
@@ -1465,7 +1467,7 @@ export class ActiveContext {
 						}
 						return await (current.call(
 							retained,
-							async (txStore: StoreAdapter) => {
+							inheritTransactionRollbackObservation(fn, async (txStore: StoreAdapter) => {
 								let closed: string | undefined;
 								const bound = createContextBoundTransactionStore(txStore, handle, name);
 								const guarded = createCloseGuardedStoreAdapter(
@@ -1488,7 +1490,7 @@ export class ActiveContext {
 									}
 									throw error;
 								}
-							},
+							}),
 							safeOptions
 						) as Promise<Awaited<ReturnType<typeof fn>>>);
 					});
@@ -2968,6 +2970,7 @@ export class ActiveContext {
 				let attemptState: TransactionState | undefined;
 				const callbackErrors = new WeakSet<object>();
 				const run = async (txStore: StoreAdapter) => {
+					rollbackObservation.confirmed = false;
 					if (attemptState && !attemptState.closed) await rollbackAttempt(attemptState, { staleTrackedModels: false });
 					const state = createState();
 					attemptState = state;
@@ -3007,9 +3010,11 @@ export class ActiveContext {
 						throw error;
 					}
 				};
+				// Observe this invocation's callback, never the reusable user callback or error object.
+				const rollbackObservation = observeTransactionRollback(run);
 				let result: T;
 				try {
-					result = await store.transaction((tx) => run(tx), storeOptions);
+					result = await store.transaction(run, storeOptions);
 				} catch (error) {
 					if (error instanceof ActiveTsCommittedTransactionError && !WEAKSET_HAS.call(callbackErrors, error)) {
 						if (!attemptState) throw error;
@@ -3023,13 +3028,15 @@ export class ActiveContext {
 						throw error;
 					}
 					if (attemptState) {
-						if (transactionRollbackSkipped(error)) {
+						if (transactionRollbackSkipped(error) && !rollbackObservation.confirmed) {
 							if (!attemptState.closed) attemptState.closed = 'failed';
 							throw error;
 						}
 						attachRollbackTaskErrors(error, await rollbackAttempt(attemptState, { staleTrackedModels: true }));
 					}
 					throw error;
+				} finally {
+					rollbackObservation.dispose();
 				}
 				if (!attemptState) {
 					throw new ActiveTsConfigurationError(`Store adapter "${store.kind}" completed transaction without running the callback.`);

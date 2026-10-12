@@ -32,6 +32,7 @@ import {
 	type DatastoreIdInventoryIssue
 } from '../src/adapters/store/datastore.js';
 import { createFirestoreStoreAdapter } from '../src/adapters/store/firestore.js';
+import { createPostgresStoreAdapter } from '../src/adapters/store/postgresql.js';
 import { assertGoogleInequalitySortOrder, assertGoogleMinMaxInequalityOrder } from '../src/adapters/store/google-query-constraints.js';
 import { encodeAggregatePlanFieldCodecs, encodeQueryPlanFieldCodecs } from '../src/core/field-codecs.js';
 import {
@@ -4355,6 +4356,83 @@ test('Datastore transaction outcome classification fails closed for frozen commi
 		/Datastore transaction failed and rollback failed/
 	);
 	assert.deepEqual(rollbackLifecycle, []);
+});
+
+test('PostgreSQL confirmed rollback preserves a concurrent Datastore unknown outcome on the same error', { timeout: 5000 }, async () => {
+	const sharedError = Object.freeze(new Error('shared commit response lost'));
+	const postgresLifecycle: string[] = [];
+	const datastoreLifecycle: string[] = [];
+	const datastore = await createDatastoreStoreAdapter({
+		client: datastoreClient({
+			transaction: () => ({
+				run: async () => undefined,
+				commit: async () => { throw sharedError; },
+				rollback: async () => assert.fail('unknown commits must not issue rollback'),
+				get: async () => [null],
+				runQuery: async () => [[], { moreResults: 'NO_MORE_RESULTS' }],
+				insert: async () => undefined,
+				update: async () => undefined,
+				delete: async () => undefined
+			})
+		})
+	});
+	await assert.rejects(() => datastore.transaction!(async () => undefined), (error: unknown) => error === sharedError);
+	let rollbackStarted!: () => void;
+	let finishRollback!: () => void;
+	const rollbackStartedPromise = new Promise<void>((resolve) => { rollbackStarted = resolve; });
+	const finishRollbackPromise = new Promise<void>((resolve) => { finishRollback = resolve; });
+	const postgres = await createPostgresStoreAdapter({ pool: {
+		query: async () => ({ rows: [], rowCount: 0 }),
+		connect: async () => ({
+			query: async (text: string) => {
+				assert.notEqual(text, 'commit');
+				if (text === 'rollback') {
+					rollbackStarted();
+					await finishRollbackPromise;
+				}
+				return { rows: [], rowCount: 0, command: text.toUpperCase() };
+			},
+			release: () => undefined
+		})
+	} });
+	let datastoreOutcomeReady!: () => void;
+	let finishDatastoreOutcome!: () => void;
+	const datastoreOutcomeReadyPromise = new Promise<void>((resolve) => { datastoreOutcomeReady = resolve; });
+	const finishDatastoreOutcomePromise = new Promise<void>((resolve) => { finishDatastoreOutcome = resolve; });
+	const delayedDatastore: StoreAdapter = {
+		...datastore,
+		transaction: async (callback, options) => {
+			try {
+				return await datastore.transaction!(callback, options);
+			} catch (error) {
+				datastoreOutcomeReady();
+				await finishDatastoreOutcomePromise;
+				throw error;
+			}
+		}
+	};
+	const postgresContext = createActiveTs({ stores: { default: postgres } });
+	const datastoreContext = createActiveTs({ stores: { default: delayedDatastore } });
+	const postgresResult = assert.rejects(() => postgresContext.transaction(async (tx) => {
+		await tx.afterCommit(() => { postgresLifecycle.push('commit'); });
+		await tx.afterRollback(() => { postgresLifecycle.push('rollback'); });
+		throw sharedError;
+	}), (error: unknown) => error === sharedError);
+	await rollbackStartedPromise;
+	const datastoreResult = assert.rejects(() => datastoreContext.transaction(async (tx) => {
+		await tx.afterCommit(() => { datastoreLifecycle.push('commit'); });
+		await tx.afterRollback(() => { datastoreLifecycle.push('rollback'); });
+	}), (error: unknown) => error === sharedError);
+	await datastoreOutcomeReadyPromise;
+	finishRollback();
+	try {
+		await postgresResult;
+	} finally {
+		finishDatastoreOutcome();
+	}
+	await datastoreResult;
+	assert.deepEqual(postgresLifecycle, ['rollback']);
+	assert.deepEqual(datastoreLifecycle, []);
 });
 
 test('Datastore definitive gRPC commit failures retain rollback semantics', async () => {

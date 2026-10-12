@@ -11,6 +11,7 @@ import {
 } from '../../core/errors.js';
 import {
 	clearSavepointRollbackUnconfirmed,
+	confirmTransactionRollback,
 	markSavepointRollbackUnconfirmed,
 	markTransactionRollbackSkipped,
 	ownErrorValue
@@ -1561,6 +1562,7 @@ async function createPostgresStoreAdapterInternal(
 			let result: Awaited<ReturnType<typeof fn>>;
 			let hasResult = false;
 			let primaryError: unknown;
+			let hasPrimaryError = false;
 			let commitDispatched = false;
 			let rollbackConfirmed = false;
 			let discardClient = false;
@@ -1822,6 +1824,8 @@ async function createPostgresStoreAdapterInternal(
 				}
 				hasResult = true;
 			} catch (error) {
+				hasPrimaryError = true;
+				primaryError = error;
 				if (commitDispatched && !rollbackConfirmed) {
 					const uncertain = new ActiveTsUnknownTransactionOutcomeError(
 						`PostgreSQL transaction commit outcome is unknown: ${safeErrorMessage(error)}`,
@@ -1833,6 +1837,7 @@ async function createPostgresStoreAdapterInternal(
 				} else {
 					try {
 						await client.query('rollback');
+						confirmTransactionRollback(fn);
 					} catch (rollbackError) {
 						const message = `PostgreSQL transaction failed and rollback failed: ${safeErrorMessage(error)}`;
 						primaryError = markTransactionRollbackSkipped(new ActiveTsUnknownTransactionOutcomeError(
@@ -1843,13 +1848,12 @@ async function createPostgresStoreAdapterInternal(
 						discardClient = true;
 					}
 				}
-				primaryError ??= error;
 			}
 			try {
 				if (discardClient) client.release?.(primaryError);
 				else client.release?.();
 			} catch (releaseError) {
-				if (primaryError !== undefined) {
+				if (hasPrimaryError) {
 					attachPostgresReleaseError(primaryError, releaseError);
 				} else {
 					throw new ActiveTsCommittedTransactionError(
@@ -1859,7 +1863,7 @@ async function createPostgresStoreAdapterInternal(
 					);
 				}
 			}
-			if (primaryError !== undefined) throw primaryError;
+			if (hasPrimaryError) throw primaryError;
 			if (!hasResult) {
 				throw new ActiveTsConfigurationError('PostgreSQL transaction completed without a result.');
 			}

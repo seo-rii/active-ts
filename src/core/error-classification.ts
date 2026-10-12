@@ -1,6 +1,9 @@
+import { WEAKMAP_DELETE, WEAKMAP_GET, WEAKMAP_SET } from './collection-intrinsics.js';
+
 const ACTIVE_TS_TRANSACTION_ROLLBACK_SKIPPED = Symbol('active-ts.transaction-rollback-skipped');
 const ACTIVE_TS_SAVEPOINT_ROLLBACK_UNCONFIRMED = Symbol('active-ts.savepoint-rollback-unconfirmed');
 const TRANSACTION_ROLLBACK_SKIPPED_ERRORS = new WeakSet<object>();
+const TRANSACTION_ROLLBACK_OBSERVATIONS = new WeakMap<object, { confirmed: boolean }>();
 const WEAKSET_ADD = WeakSet.prototype.add;
 const WEAKSET_HAS = WeakSet.prototype.has;
 
@@ -46,6 +49,27 @@ export function transactionRollbackSkipped(error: unknown): boolean {
 	} catch {
 		return false;
 	}
+}
+
+export function observeTransactionRollback(callback: object) {
+	const observation = {
+		confirmed: false,
+		dispose: () => { WEAKMAP_DELETE.call(TRANSACTION_ROLLBACK_OBSERVATIONS, callback); }
+	};
+	WEAKMAP_SET.call(TRANSACTION_ROLLBACK_OBSERVATIONS, callback, observation);
+	return observation;
+}
+
+export function inheritTransactionRollbackObservation<T extends object>(source: object, callback: T): T {
+	const observation = WEAKMAP_GET.call(TRANSACTION_ROLLBACK_OBSERVATIONS, source);
+	if (observation) WEAKMAP_SET.call(TRANSACTION_ROLLBACK_OBSERVATIONS, callback, observation);
+	return callback;
+}
+
+export function confirmTransactionRollback(callback: object) {
+	const observation = WEAKMAP_GET.call(TRANSACTION_ROLLBACK_OBSERVATIONS, callback) as
+		{ confirmed: boolean } | undefined;
+	if (observation) observation.confirmed = true;
 }
 
 export function markSavepointRollbackUnconfirmed<T>(error: T): T {
