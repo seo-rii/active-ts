@@ -5915,3 +5915,67 @@ test('transaction writes skip cacheKey resolution when the model has no cache', 
 
 	assert.equal((await Record.find(1).load())?.data.value, 'created');
 });
+
+for (const boundary of ['transaction', 'savepoint'] as const) {
+	for (const operation of ['create', 'save'] as const) {
+		test(`store ${operation} conflicts evict stale cache before ${boundary} rollback without commit effects`, async () => {
+			type Data = { id: number; value: string; version: number };
+			class Record extends Model<Data> {}
+			defineModel<Data>({ name: 'transaction_conflict_cache_record', cache: { ttl: 60, negativeTtl: 60 } })
+				.id('id').validate((input) => input as Data).attach(Record);
+			const store = new MemoryStoreAdapter();
+			const cache = new MemoryCacheAdapter();
+			const outbox = new MemoryOutboxAdapter();
+			const effects: string[] = [];
+			const context = createActiveTs({
+				stores: { default: store }, caches: { default: cache },
+				plugins: [
+					createOutboxPlugin({ outbox }),
+					{ name: 'conflict-write-effects', hooks: { afterStoreWrite() { effects.push('afterStoreWrite'); } } }
+				]
+			});
+			const writer = createActiveTs({ stores: { default: store } });
+			const Cached = Record.use(context);
+			const Fresh = Record.use(writer);
+			let stale: Record | null = null;
+			if (operation === 'save') {
+				await Fresh.create({ id: 1, value: 'old', version: 1 });
+				stale = await Cached.find(1).load();
+				const fresh = await Fresh.find(1).load();
+				assert.ok(fresh);
+				fresh.data.value = 'fresh';
+				await fresh.save();
+			} else {
+				assert.equal(await Cached.find(1).load(), null);
+				await Fresh.create({ id: 1, value: 'fresh', version: 1 });
+			}
+			cache.resetStats();
+			const callbacks: string[] = [];
+			const exercise = async (parent: ActiveContext) => {
+				await assert.rejects(() => parent.transaction(async (tx) => {
+					await tx.afterCommit(() => { callbacks.push('failed commit'); });
+					await tx.afterRollback(() => { callbacks.push('rollback'); });
+					try {
+						if (operation === 'create') await Cached.create({ id: 1, value: 'duplicate', version: 1 });
+						else {
+							assert.ok(stale);
+							stale.data.value = 'attempt';
+							await stale.save();
+						}
+					} catch (error) {
+						assert.equal(cache.stats.deleteMany, 1);
+						assert.deepEqual(cache.snapshot(), {});
+						throw error;
+					}
+				}, boundary === 'savepoint' ? { join: 'savepoint' } : {}), ActiveTsConflictError);
+			};
+			if (boundary === 'savepoint') await context.transaction(exercise);
+			else await exercise(context);
+			assert.deepEqual(callbacks, ['rollback']);
+			assert.deepEqual(effects, []);
+			assert.deepEqual(await outbox.list(), []);
+			assert.equal((await Cached.find(1).load())?.data.value, 'fresh');
+			assert.equal(store.dump('transaction_conflict_cache_record')[0].version, operation === 'save' ? 2 : 1);
+		});
+	}
+}
