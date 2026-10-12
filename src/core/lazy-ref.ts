@@ -1,4 +1,4 @@
-import type { ActiveContext } from './context.js';
+import { ActiveContext } from './context.js';
 import { ActiveTsValidationError } from './errors.js';
 import { QueryBuilder, relationPreloadSelectFields } from './query.js';
 import {
@@ -47,7 +47,7 @@ export class LazyRef<TModel = any> implements PromiseLike<TModel | TModel[] | nu
 	}
 
 	prime(value: TModel | TModel[] | null, options: { full?: boolean } = {}) {
-		const context = this.context.transactionScopedContext('prime relations');
+		const context = this.scopedContext('prime relations');
 		this.plannedLoad = true;
 		this.promise = Promise.resolve(value);
 		this.promiseContext = context;
@@ -65,7 +65,7 @@ export class LazyRef<TModel = any> implements PromiseLike<TModel | TModel[] | nu
 	}
 
 	load(options: LazyLoadOptions = {}) {
-		const context = this.context.transactionScopedContext('load relations');
+		const context = this.scopedContext('load relations');
 		if (options.full) {
 			if (!this.fullPromise || this.fullPromiseContext !== context) {
 				this.warnIfUnplanned();
@@ -112,8 +112,16 @@ export class LazyRef<TModel = any> implements PromiseLike<TModel | TModel[] | nu
 	private fullPromise?: Promise<TModel | TModel[] | null>;
 	private fullPromiseContext?: ActiveContext;
 
+	private scopedContext(operation: string) {
+		const context = this.context.transactionScopedContext(operation);
+		const descriptor = Object.getOwnPropertyDescriptor(this.owner, 'context');
+		const ownerContext = descriptor && 'value' in descriptor ? descriptor.value : undefined;
+		if (ownerContext instanceof ActiveContext) ownerContext.transactionScopedContext(operation);
+		return context;
+	}
+
 	private async loadNow(options: LazyLoadOptions = {}) {
-		const context = this.context.transactionScopedContext('load relations');
+		const context = this.scopedContext('load relations');
 		const ownerMeta = context.meta(this.owner.constructor as ModelConstructor);
 		const expectedOwnerId = valueFor(this.owner.data, ownerMeta.idField);
 		if (expectedOwnerId === undefined || expectedOwnerId === null) {
@@ -134,6 +142,7 @@ export class LazyRef<TModel = any> implements PromiseLike<TModel | TModel[] | nu
 				operation: 'relation',
 				meta: { relation: this.relation.name }
 			});
+			this.scopedContext('load relations');
 			context.validateModelInstance(ownerMeta, this.owner, `beforeRelationLoad ${ownerMeta.name}.${this.relation.name} target`, {
 				expectedId: expectedOwnerId,
 				expectedDatastoreAncestor,
@@ -148,6 +157,7 @@ export class LazyRef<TModel = any> implements PromiseLike<TModel | TModel[] | nu
 			`beforeRelationLoad ${ownerMeta.name}.${this.relation.name} target`
 		);
 		let result = await this.resolveNow(options);
+		this.scopedContext('load relations');
 		if (emitHooks) {
 			const resultSnapshot = snapshotRelationResult(
 				context,
@@ -162,6 +172,7 @@ export class LazyRef<TModel = any> implements PromiseLike<TModel | TModel[] | nu
 				operation: 'relation',
 				meta: { relation: this.relation.name }
 			});
+			this.scopedContext('load relations');
 			result = after.result as TModel | TModel[] | null;
 			context.validateModelInstance(ownerMeta, this.owner, `afterRelationLoad ${ownerMeta.name}.${this.relation.name} target`, {
 				expectedId: expectedOwnerId,
@@ -185,7 +196,7 @@ export class LazyRef<TModel = any> implements PromiseLike<TModel | TModel[] | nu
 	}
 
 	private async resolveNow(options: LazyLoadOptions = {}) {
-		const context = this.context.transactionScopedContext('resolve relations');
+		const context = this.scopedContext('resolve relations');
 		const target = this.relation.target() as ModelConstructor;
 		const ownerData = this.owner.data ?? {};
 		const localValue = valueFor(ownerData, this.relation.localKey);
@@ -254,7 +265,7 @@ export class LazyRef<TModel = any> implements PromiseLike<TModel | TModel[] | nu
 	}
 
 	private warnIfUnplanned() {
-		const context = this.context.transactionScopedContext('warn about lazy relation loads');
+		const context = this.scopedContext('warn about lazy relation loads');
 		if (this.plannedLoad || !context.lazyWarningsEnabled()) return;
 		const ownerMeta = context.meta(this.owner.constructor as ModelConstructor);
 		const key = `${ownerMeta.name}:${this.relation.name}`;

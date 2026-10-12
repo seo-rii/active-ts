@@ -5979,3 +5979,129 @@ for (const boundary of ['transaction', 'savepoint'] as const) {
 		});
 	}
 }
+
+async function createStaleOwnerRelationFixture() {
+	type OwnerData = { id: number; targetId: number };
+	type TargetData = { id: number; value: string };
+	class Owner extends Model<OwnerData> {}
+	class Target extends Model<TargetData> {}
+	defineModel<TargetData>({ name: 'stale_relation_target', cache: false })
+		.id('id').validate((input) => input as TargetData).attach(Target);
+	defineModel<OwnerData>({ name: 'stale_relation_owner', cache: false })
+		.id('id').validate((input) => input as OwnerData)
+		.ref('target', () => Target, { localKey: 'targetId', foreignKey: 'id', warnOnLazy: false })
+		.attach(Owner);
+	const backing = new MemoryStoreAdapter();
+	await backing.seed('stale_relation_owner', [{ id: 1, targetId: 1 }]);
+	await backing.seed('stale_relation_target', [{ id: 1, value: 'original' }, { id: 2, value: 'attempted' }]);
+	const state = { holdTargetRead: false };
+	let signalRead!: () => void;
+	let releaseRead!: () => void;
+	const readStarted = new Promise<void>((resolve) => { signalRead = resolve; });
+	const readBarrier = new Promise<void>((resolve) => { releaseRead = resolve; });
+	const store = createStoreMiddlewareAdapter(backing, [async (operation, next) => {
+		const result = await next();
+		if (state.holdTargetRead && operation.operation === 'getMany' && operation.model.name === 'stale_relation_target') {
+			state.holdTargetRead = false;
+			signalRead();
+			await readBarrier;
+		}
+		return result;
+	}]);
+	const context = createActiveTs({ stores: { default: store } });
+	return { Owner, Target, context, backing, state, readStarted, releaseRead };
+}
+
+for (const boundary of ['transaction', 'root-savepoint', 'parent-savepoint'] as const) {
+	for (const operation of ['save', 'delete'] as const) {
+		for (const loading of ['unloaded', 'cached', 'full'] as const) {
+			test(`${loading} retained relation refs reject a stale owner after ${boundary} ${operation} rollback`, async () => {
+				const fixture = await createStaleOwnerRelationFixture();
+				const rootOwner = await fixture.Owner.use(fixture.context).find(1).load();
+				assert.ok(rootOwner);
+				const rollback = new Error('rollback relation owner');
+				const exercise = async (parent: ActiveContext) => {
+					const owner = boundary === 'parent-savepoint'
+						? await fixture.Owner.use(parent).find(1).load()
+						: rootOwner;
+					assert.ok(owner);
+					const ref = owner.ref<InstanceType<typeof fixture.Target>>('target');
+					if (loading !== 'unloaded') await ref.load(loading === 'full' ? { full: true } : {});
+					await assert.rejects(() => parent.transaction(async () => {
+						if (operation === 'save') {
+							owner.data.targetId = 2;
+							await owner.save();
+						} else await owner.delete();
+						throw rollback;
+					}, boundary === 'transaction' ? {} : { join: 'savepoint' }), (error: unknown) => error === rollback);
+					assert.throws(() => owner.ref('target'), /closed transaction context after it rolled back/);
+					const reads = fixture.backing.stats.getMany;
+					assert.throws(() => ref.load(), /closed transaction context after it rolled back/);
+					assert.throws(() => ref.load({ full: true, hooks: false }), /closed transaction context after it rolled back/);
+					assert.throws(() => ref.prime(null), /closed transaction context after it rolled back/);
+					assert.throws(() => ref.prime(null, { full: true }), /closed transaction context after it rolled back/);
+					assert.equal(fixture.backing.stats.getMany, reads);
+					assert.deepEqual((await fixture.Owner.use(parent).find(1).load())?.data, { id: 1, targetId: 1 });
+				};
+				if (boundary === 'transaction') await exercise(fixture.context);
+				else await fixture.context.transaction(exercise);
+			});
+		}
+	}
+}
+
+for (const check of ['cached pending calls', 'pending completion'] as const) {
+	test(`retained relation ${check} rejects an owner rolled back during an external load`, { timeout: 5000 }, async () => {
+		const fixture = await createStaleOwnerRelationFixture();
+		const owner = await fixture.Owner.use(fixture.context).find(1).load();
+		assert.ok(owner);
+		const ref = owner.ref('target');
+		fixture.state.holdTargetRead = true;
+		const pending = ref.load({ hooks: false });
+		void Promise.prototype.then.call(pending, undefined, () => undefined);
+		await fixture.readStarted;
+		await assert.rejects(() => fixture.context.transaction(async () => {
+			owner.data.targetId = 2;
+			await owner.save();
+			throw new Error('rollback pending relation owner');
+		}), /rollback pending relation owner/);
+		try {
+			if (check === 'cached pending calls') {
+				assert.throws(() => ref.load(), /closed transaction context after it rolled back/);
+				assert.throws(() => ref.prime(null), /closed transaction context after it rolled back/);
+			}
+		} finally {
+			fixture.releaseRead();
+		}
+		await assert.rejects(() => pending, /closed transaction context after it rolled back/);
+	});
+}
+
+for (const outcome of ['commit-unknown', 'abort-unknown'] as const) {
+	test(`cached retained relation refs reject a stale owner after frozen ${outcome}`, async () => {
+		class Owner extends Model<TransactionIsolationData> {}
+		class Target extends Model<TransactionIsolationData> {}
+		defineModel<TransactionIsolationData>({ name: 'unknown_relation_target', cache: false })
+			.id('id').validate((input) => input as TransactionIsolationData).attach(Target);
+		defineModel<TransactionIsolationData>({ name: 'unknown_relation_owner', cache: false })
+			.id('id').validate((input) => input as TransactionIsolationData)
+			.ref('target', () => Target, { localKey: 'id', foreignKey: 'id', warnOnLazy: false }).attach(Owner);
+		const fixture = await createPostgresOutcomeStore(outcome, [{ id: 1, value: 'before' }], true);
+		const context = createActiveTs({ stores: { default: fixture.store } });
+		const owner = await Owner.use(context).find(1).load();
+		assert.ok(owner);
+		const ref = owner.ref('target');
+		await ref.load({ full: true });
+		await assert.rejects(() => context.transaction(async () => {
+			owner.data.value = 'attempt';
+			await owner.save();
+			if (outcome === 'abort-unknown') throw new Error('request unknown rollback');
+		}), (error: unknown) => error instanceof ActiveTsUnknownTransactionOutcomeError && Object.isFrozen(error));
+		const calls = fixture.calls.length;
+		assert.throws(() => owner.ref('target'), /closed transaction context after it failed/);
+		assert.throws(() => ref.load(), /closed transaction context after it failed/);
+		assert.throws(() => ref.load({ full: true }), /closed transaction context after it failed/);
+		assert.throws(() => ref.prime(null), /closed transaction context after it failed/);
+		assert.equal(fixture.calls.length, calls);
+	});
+}
