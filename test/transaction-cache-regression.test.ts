@@ -1007,6 +1007,64 @@ test('lazy relation failures remain visible to context transactions', async () =
 	assert.deepEqual(baseStore.dump('transaction_no_cache_record'), []);
 });
 
+for (const boundary of ['transaction', 'savepoint'] as const) {
+	for (const outcome of ['commit', 'rollback'] as const) {
+		for (const loading of ['ref', 'include'] as const) {
+			test(`retained relation owners survive ${boundary} ${outcome} after first ${loading}`, async () => {
+				type OwnerData = { id: number };
+				type ChildData = { id: number; ownerId: number; value: string };
+				class Owner extends Model<OwnerData> {}
+				class Child extends Model<ChildData> {}
+				defineModel<ChildData>({ name: 'retained_relation_child', cache: false })
+					.id('id').validate((input) => input as ChildData).attach(Child);
+				defineModel<OwnerData>({ name: 'retained_relation_owner', cache: false })
+					.id('id').validate((input) => input as OwnerData)
+					.hasMany('children', () => Child, { localKey: 'id', foreignKey: 'ownerId', warnOnLazy: false })
+					.attach(Owner);
+				const store = new MemoryStoreAdapter();
+				await store.seed('retained_relation_owner', [{ id: 1 }]);
+				await store.seed('retained_relation_child', [{ id: 1, ownerId: 1, value: 'before' }]);
+				const context = createActiveTs({ stores: { default: store } });
+				const rollbackError = new Error('request rollback');
+				const values = async (owner: Owner) => {
+					if (loading === 'include') await owner.include('children');
+					const children = await owner.ref<Child>('children').load();
+					assert.ok(Array.isArray(children));
+					return children.map((child) => child.data.value);
+				};
+				const exercise = async (parent: ActiveContext) => {
+					const retained = await Owner.use(parent).find(1).load();
+					assert.ok(retained);
+					let scopedOwner!: Owner;
+					let scopedRef!: ReturnType<Owner['ref']>;
+					const run = () => parent.transaction(async (tx) => {
+						await Child.use(tx).update(1, { value: 'pending' });
+						assert.deepEqual(await values(retained), ['pending']);
+						assert.equal(store.dump('retained_relation_child')[0].value, 'before');
+						const loaded = await Owner.use(tx).find(1).load();
+						assert.ok(loaded);
+						scopedOwner = loaded;
+						scopedRef = scopedOwner.ref('children');
+						await scopedRef.load();
+						if (outcome === 'rollback') throw rollbackError;
+					}, boundary === 'savepoint' ? { join: 'savepoint' } : {});
+					if (outcome === 'rollback') await assert.rejects(run, (error: unknown) => error === rollbackError);
+					else await run();
+					assert.deepEqual(await values(retained), [outcome === 'commit' ? 'pending' : 'before']);
+					assert.throws(() => scopedRef.load(), /closed transaction context/);
+					if (outcome === 'rollback') {
+						assert.throws(() => scopedOwner.ref('children'), /closed transaction context after it rolled back/);
+						await assert.rejects(() => scopedOwner.save(), /closed transaction context after it rolled back/);
+					} else assert.deepEqual(await values(scopedOwner), ['pending']);
+				};
+				if (boundary === 'savepoint') await context.transaction(exercise);
+				else await exercise(context);
+				assert.equal(store.dump('retained_relation_child')[0].value, outcome === 'commit' ? 'pending' : 'before');
+			});
+		}
+	}
+}
+
 test('transaction native search failures remain visible through context handles', async () => {
 	const searchError = new Error('transaction native search wrapper failed');
 	const baseStore = new MemoryStoreAdapter();
