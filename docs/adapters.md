@@ -60,7 +60,9 @@ schema and nested `transaction()` methods. Memory and PostgreSQL advertise
 `savepoint: false`. MongoDB and Firestore transaction queries reject native
 payloads; Firestore also disables transaction aggregates. Datastore disables
 portable cursors and read-policy options inside transactions. Read-only
-transaction handles reject writes and native reads. See the
+`ActiveContext` transaction handles reject writes and native reads. Low-level
+PostgreSQL read-only transactions can still execute native SELECT queries,
+subject to PostgreSQL's SQL read-only restrictions. See the
 [transaction option and savepoint table](extensions.md#transactions) for
 backend-specific options, retry behavior, and lifetime rules.
 
