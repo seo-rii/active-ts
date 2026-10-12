@@ -290,6 +290,39 @@ that `readAt()` point reads and aggregates still observe the pre-update
 snapshot. Fake-SDK regressions separately assert the exact read options passed
 to point, query, aggregate, min/max, and multi-page scan calls.
 
+## Capability Evidence
+
+The [store capability matrix](adapters.md#portable-store-capability-matrix)
+describes the public support boundary. Use the existing contracts to verify an
+adapter rather than treating every passing test as proof of supported features:
+
+| Evidence | Existing executable check | What it establishes |
+| --- | --- | --- |
+| Supported portable operations | [`runStoreAdapterContract()`](../src/testing/index.ts) | Declared features perform their positive contract, including projection ID inclusion, optimistic writes, and transaction handle lifetime. |
+| Unsupported operations | The same contract's unsupported-capability checks; [`capability-regression.test.ts`](../test/capability-regression.test.ts) | Missing/false capabilities reject; ORM guards can reject before adapter execution. PostgreSQL `select` belongs here. |
+| Incorrect adapter declarations | [`adapter-contract-regression.test.ts`](../test/adapter-contract-regression.test.ts) | Deliberately broken adapters cannot pass the shared contract merely by declaring a capability. |
+| Transaction point-read conflicts | The shared contract when `transactionConflictDetection: true` | Concurrent `get`/`getMany` read-modify-write schedules do not silently lose a write. This probe does not run for PostgreSQL's false declaration. |
+| Native backend routing | Required backend-aware `nativeProbe` | A native payload reaches the intended backend path; portable fixtures cannot infer that path themselves. |
+| Real services | [`backend-smoke.mjs`](../test/integration/backend-smoke.mjs), through the configured integration targets | The shared contracts run against those selected services and SDKs. Fake-client results alone are not service evidence. |
+
+The contract already checks work draining at callback settlement, same-ID
+operation ordering inside a transaction, callback error precedence, savepoint
+isolation, and retained transaction handles after commit/rollback. These are
+different from simultaneous transactions under a backend's isolation levels.
+The [transaction/cache regressions](../test/transaction-cache-regression.test.ts)
+also cover committed side-effect failures, caller-thrown committed-error
+classes, and model rebinding; [cache coherence regressions](../test/cache-coherence-regression.test.ts)
+cover shared cache identities and stale backfills. Their memory/fake-client
+coverage must not be reported as a fresh real PostgreSQL concurrency run.
+
+For each validation report, retain the exact commit, Node/SDK/service versions,
+selected integration targets, exit status, and logs. Identify supported positive
+checks, expected unsupported rejections, and unexecuted backends separately.
+A job that never starts supplies no new execution evidence. A local run of
+PostgreSQL does not establish MongoDB, Google emulator, distributed failover,
+or production exactly-once behavior. Receipt/idempotency, crash recovery, and
+query scan costs require their own designs and tests.
+
 ## Library Test Suite
 
 For active-ts itself:
