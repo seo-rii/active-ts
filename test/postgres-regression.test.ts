@@ -5,6 +5,7 @@ import {
 	ActiveTsConfigurationError,
 	ActiveTsConflictError,
 	ActiveTsNotFoundError,
+	ActiveTsUnknownTransactionOutcomeError,
 	ActiveTsValidationError,
 	createActiveTs,
 	type AggregatePlan,
@@ -2014,7 +2015,12 @@ test('PostgreSQL failed final rollbacks discard clients and skip rollback hooks'
 		}),
 		(error: unknown) => {
 			reportedError = error;
-			assert.ok(error instanceof AggregateError);
+			assert.ok(error instanceof ActiveTsUnknownTransactionOutcomeError);
+			assert.equal(error.outcome, 'unknown');
+			assert.equal(error.phase, 'abort');
+			assert.ok(error.cause instanceof AggregateError);
+			assert.equal(error.cause.errors.length, 2);
+			assert.match(error.cause.errors[1].message, /root rollback failed/);
 			assert.match(error.message, /transaction failed and rollback failed/);
 			return true;
 		}
@@ -2874,7 +2880,14 @@ test('PostgreSQL transactions reject malformed commit results', async () => {
 	for (let index = 0; index < commitResults.length; index++) {
 		await assert.rejects(
 			() => adapter.transaction!(async () => 'must-not-commit'),
-			index < 2 ? /commit result must be an object/ : /command must be an own string data property/
+			(error: unknown) => {
+				assert.ok(error instanceof ActiveTsUnknownTransactionOutcomeError);
+				assert.equal(error.outcome, 'unknown');
+				assert.equal(error.phase, 'commit');
+				assert.ok(error.cause instanceof ActiveTsConfigurationError);
+				assert.match(error.message, index < 2 ? /commit result must be an object/ : /command must be an own string data property/);
+				return true;
+			}
 		);
 	}
 	assert.equal(accessorReads, 0);
@@ -2925,7 +2938,9 @@ test('PostgreSQL commit transport failures skip rollback callbacks', async () =>
 				return 'unknown';
 			}),
 		(error: unknown) => {
-			assert.ok(error instanceof ActiveTsConfigurationError);
+			assert.ok(error instanceof ActiveTsUnknownTransactionOutcomeError);
+			assert.equal(error.outcome, 'unknown');
+			assert.equal(error.phase, 'commit');
 			assert.match(error.message, /commit outcome is unknown.*connection lost while committing/);
 			assert.equal(error.cause, commitError);
 			reportedError = error;
@@ -2935,6 +2950,29 @@ test('PostgreSQL commit transport failures skip rollback callbacks', async () =>
 	assert.deepEqual(calls, ['begin', 'commit', 'release']);
 	assert.deepEqual(deferred, []);
 	assert.equal(releasedWith, reportedError);
+});
+
+test('PostgreSQL unknown commit outcomes retain frozen causes and later release failures', async () => {
+	const commitError = Object.freeze(new Error('commit response lost'));
+	const releaseError = Object.freeze(new Error('client cleanup failed'));
+	const adapter = await createPostgresStoreAdapter({ pool: {
+		query: async () => ({ rows: [], rowCount: 0 }),
+		connect: async () => ({
+			query: async (text: string) => {
+				if (text === 'commit') throw commitError;
+				return { rows: [], rowCount: 0, command: text.toUpperCase() };
+			},
+			release: () => { throw releaseError; }
+		})
+	} });
+	await assert.rejects(() => adapter.transaction!(async () => 'unconfirmed'), (error: unknown) => {
+		assert.ok(error instanceof ActiveTsUnknownTransactionOutcomeError);
+		assert.equal(error.phase, 'commit');
+		assert.equal(error.outcome, 'unknown');
+		assert.equal(error.cause, commitError);
+		assert.equal(Object.getOwnPropertyDescriptor(error, 'releaseError')?.value, releaseError);
+		return true;
+	});
 });
 
 test('PostgreSQL transactions allow caught preflight failures before SQL execution', async () => {

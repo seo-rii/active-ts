@@ -5,6 +5,7 @@ import {
 	ActiveTsConfigurationError,
 	ActiveTsConflictError,
 	ActiveTsNotFoundError,
+	ActiveTsUnknownTransactionOutcomeError,
 	ActiveTsValidationError,
 	safeErrorMessage
 } from '../../core/errors.js';
@@ -1822,22 +1823,22 @@ async function createPostgresStoreAdapterInternal(
 				hasResult = true;
 			} catch (error) {
 				if (commitDispatched && !rollbackConfirmed) {
-					const uncertain = new ActiveTsConfigurationError(
-						`PostgreSQL transaction commit outcome is unknown: ${safeErrorMessage(error)}`
+					const uncertain = new ActiveTsUnknownTransactionOutcomeError(
+						`PostgreSQL transaction commit outcome is unknown: ${safeErrorMessage(error)}`,
+						'commit',
+						error
 					);
-					defineDataProperty(uncertain, 'cause', error, {
-						enumerable: false,
-						configurable: true
-					});
 					primaryError = markTransactionRollbackSkipped(uncertain);
 					discardClient = true;
 				} else {
 					try {
 						await client.query('rollback');
 					} catch (rollbackError) {
-						primaryError = markTransactionRollbackSkipped(new AggregateError(
-							[error, rollbackError],
-							`PostgreSQL transaction failed and rollback failed: ${safeErrorMessage(error)}`
+						const message = `PostgreSQL transaction failed and rollback failed: ${safeErrorMessage(error)}`;
+						primaryError = markTransactionRollbackSkipped(new ActiveTsUnknownTransactionOutcomeError(
+							message,
+							'abort',
+							new AggregateError([error, rollbackError], message)
 						));
 						discardClient = true;
 					}

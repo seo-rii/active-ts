@@ -279,6 +279,34 @@ PostgreSQL client is discarded rather than returned to the connection pool.
 Await each `query()` result when later callback code depends on it or needs to
 handle its error locally.
 
+PostgreSQL unknown outcomes use `ActiveTsUnknownTransactionOutcomeError` with
+`outcome: 'unknown'`. A failed or malformed COMMIT acknowledgement has
+`phase: 'commit'` and retains the original driver/protocol error in `cause`.
+A failed final ROLLBACK has `phase: 'abort'`; its `cause` is an `AggregateError`
+containing the original failure followed by the rollback failure. Both paths
+discard the client and suppress commit and rollback hooks. A release failure
+on either path is attached as `releaseError` without replacing the primary
+outcome. This replaces PostgreSQL's previous configuration-error/aggregate-error
+outer types; callers should migrate those catches to the public unknown type.
+
+| Evidence observed by the PostgreSQL adapter | Result | Context hooks |
+| --- | --- | --- |
+| COMMIT acknowledged, cleanup succeeds | Callback result | `afterCommit` |
+| COMMIT acknowledged, release/cache/afterCommit work fails | `ActiveTsCommittedTransactionError`, retaining the callback result | Commit tasks still run; no rollback |
+| Callback fails and ROLLBACK succeeds | Original callback error | `afterRollback` |
+| COMMIT acknowledgement is lost or malformed | Unknown, `phase: 'commit'` | Neither |
+| Final ROLLBACK fails | Unknown, `phase: 'abort'` | Neither |
+
+This table describes the transaction runner's evidence, not a classifier for
+arbitrary caught errors. A callback may itself throw an instance of a public
+committed/unknown error class; that object is not proof of this transaction's
+outcome. Context tracking distinguishes callback-origin committed errors and
+rolls their writes back when rollback is confirmed. Do not infer a committed
+operation from an error name, caller-created class, current row value, or an
+absent receipt. Reconciliation needs an application-owned durable operation
+receipt with its own identity, concurrency, and retention contract. No automatic
+replay or exactly-once guarantee is provided.
+
 MongoDB uses `startSession()` and the driver's Core transaction API. It invokes
 the application callback once and does not use `withTransaction()`, so active-ts
 never retries user hooks or model work implicitly. It also serializes portable

@@ -323,6 +323,16 @@ PostgreSQL does not establish MongoDB, Google emulator, distributed failover,
 or production exactly-once behavior. Receipt/idempotency, crash recovery, and
 query scan costs require their own designs and tests.
 
+The PostgreSQL target also runs
+[`postgres-outcome.mjs`](../test/integration/postgres-outcome.mjs). Its eight
+cases inspect durable rows through a separately reserved connection: confirmed
+commit/rollback, a callback-created committed error, lost commit/rollback
+acknowledgements, and release/afterCommit/cache failures after commit. The
+acknowledgement and cleanup failures are injected by a test-owned client wrapper
+after the real server responds. This supplies real row-state evidence for those
+failure boundaries; it does not simulate network partitions, process crashes,
+or database failover.
+
 ## Library Test Suite
 
 For active-ts itself:

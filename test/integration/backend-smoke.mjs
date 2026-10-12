@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { runPostgresOutcomeContract } from './postgres-outcome.mjs';
 import {
 	StoreOutboxAdapter,
 	createActiveTs,
@@ -252,6 +253,7 @@ if (targets.has('postgres')) {
 			/PostgreSQL native SQL query payload cannot be combined with portable query clauses/
 		);
 		ran++;
+		await runPostgresOutcomeContract({ pool, schema: postgresSchemaName });
 		ranTargets.push('postgres');
 	} catch (error) {
 		postgresSmokeError = error;
