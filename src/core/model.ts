@@ -415,7 +415,7 @@ export abstract class Model<TData extends Record<string, any> = Record<string, a
 		const relation = mapGet(meta.relations, safeName);
 		if (!relation) throw new ActiveTsConfigurationError(`Relation "${safeName}" is not registered on ${meta.name}.`);
 		cached = new LazyRef<TModel>(
-			context,
+			this.context,
 			this,
 			relation,
 			SET_HAS.call(this.plannedRelations, safeName) || relation.warnOnLazy === false
