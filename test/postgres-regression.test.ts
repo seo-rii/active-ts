@@ -3424,6 +3424,80 @@ test('PostgreSQL transaction release error attachment ignores polluted descripto
 	}
 });
 
+for (const releaseFails of [false, true]) {
+	test(`PostgreSQL transactions preserve undefined callback failures when release ${releaseFails ? 'fails' : 'succeeds'}`, async () => {
+		const calls: string[] = [];
+		const deferred: string[] = [];
+		const adapter = await createPostgresStoreAdapter({ pool: {
+			query: async () => ({ rows: [], rowCount: 0 }),
+			connect: async () => ({
+				query: async (text: string) => {
+					calls.push(text);
+					return { rows: [], rowCount: 0, command: text.toUpperCase() };
+				},
+				release: () => {
+					calls.push('release');
+					if (releaseFails) throw new Error('release failed');
+				}
+			})
+		} });
+		const context = createActiveTs({ stores: { default: adapter } });
+		let rejected = false;
+		let failure: unknown;
+		try {
+			await context.transaction(async (tx) => {
+				await tx.afterCommit(() => { deferred.push('commit'); });
+				await tx.afterRollback(() => { deferred.push('rollback'); });
+				throw undefined;
+			});
+		} catch (error) {
+			rejected = true;
+			failure = error;
+		}
+		assert.equal(rejected, true);
+		assert.deepEqual(calls, ['begin', 'rollback', 'release']);
+		assert.deepEqual(deferred, ['rollback']);
+		assert.equal(failure, undefined);
+	});
+
+	test(`PostgreSQL transactions commit undefined callback results when release ${releaseFails ? 'fails' : 'succeeds'}`, async () => {
+		const calls: string[] = [];
+		const deferred: string[] = [];
+		const releaseError = new Error('release failed');
+		const adapter = await createPostgresStoreAdapter({ pool: {
+			query: async () => ({ rows: [], rowCount: 0 }),
+			connect: async () => ({
+				query: async (text: string) => {
+					calls.push(text);
+					return { rows: [], rowCount: 0, command: text.toUpperCase() };
+				},
+				release: () => {
+					calls.push('release');
+					if (releaseFails) throw releaseError;
+				}
+			})
+		} });
+		const context = createActiveTs({ stores: { default: adapter } });
+		const transaction = () => context.transaction(async (tx) => {
+			await tx.afterCommit(() => { deferred.push('commit'); });
+			await tx.afterRollback(() => { deferred.push('rollback'); });
+			return undefined;
+		});
+		if (releaseFails) {
+			await assert.rejects(transaction, (error: unknown) => {
+				assert.ok(error instanceof ActiveTsCommittedTransactionError);
+				assert.equal(error.result, undefined);
+				assert.equal(error.cause, releaseError);
+				return true;
+			});
+		} else {
+			assert.equal(await transaction(), undefined);
+		}
+		assert.deepEqual(calls, ['begin', 'commit', 'release']);
+		assert.deepEqual(deferred, ['commit']);
+	});
+}
+
 test('PostgreSQL transaction release failures surface after successful commit', async () => {
 	const calls: string[] = [];
 	const client = {
