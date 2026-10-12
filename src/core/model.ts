@@ -4,6 +4,7 @@ import { ActiveContext, getDefaultContext } from './context.js';
 import { ActiveTsCommittedWriteError, ActiveTsConfigurationError, ActiveTsValidationError, safeErrorMessage } from './errors.js';
 import { LazyRef } from './lazy-ref.js';
 import { isPartialModel } from './partial-model.js';
+import { findTypedViewDetails, type TypedView } from './typed-view.js';
 import { entityIdKey, valueFor } from './query-utils.js';
 import {
 	snapshotRelationOwnerLocalKey,
@@ -152,7 +153,9 @@ export abstract class Model<TData extends Record<string, any> = Record<string, a
 		return valueFor(this.data, meta.idField) as EntityId | undefined;
 	}
 
-	static use(context: ActiveContext): typeof this {
+	static use<TConstructor extends abstract new (...args: any[]) => Model>(
+		this: TConstructor, context: ActiveContext
+	): TConstructor {
 		if (!(context instanceof ActiveContext)) {
 			throw new ActiveTsConfigurationError('Model.use context must be an ActiveContext.');
 		}
@@ -174,7 +177,7 @@ export abstract class Model<TData extends Record<string, any> = Record<string, a
 		if (modelName !== undefined) {
 			defineDataProperty(BoundModel, 'modelName', modelName, { enumerable: false, configurable: true, writable: true });
 		}
-		return BoundModel as unknown as typeof this;
+		return BoundModel as unknown as TConstructor;
 	}
 
 	static transaction<TModel extends Model, TResult>(
@@ -421,22 +424,29 @@ export abstract class Model<TData extends Record<string, any> = Record<string, a
 		return cached as LazyRef<TModel>;
 	}
 
-	view<TView = unknown>(name = 'default', viewer?: unknown) {
+	view<Output>(view: TypedView<TData, Output>, viewer?: unknown): Promise<Output>;
+	view<TView = unknown>(name?: string, viewer?: unknown): Promise<TView>;
+	view(name: string | TypedView<TData, unknown> = 'default', viewer?: unknown): Promise<unknown> {
 		return runTrackedContextOperation(
 			() => this.context.transactionScopedContext('resolve views'),
 			async (context) => {
 				this.assertFullModel('resolve views');
 				const meta = context.meta(this.constructor as ModelConstructor);
-				const safeName = assertSafeFieldPath(name, 'view name');
+				// Unknown objects remain invalid legacy view names; do not coerce or inspect them.
+				const contract = findTypedViewDetails(name);
+				const safeName = assertSafeFieldPath(contract?.name ?? name, 'view name');
 				const resolver = mapGet(meta.views, safeName);
 				if (!resolver) throw new ActiveTsConfigurationError(`View "${safeName}" is not registered on ${meta.name}.`);
-				return (await resolver({
+				if (contract && resolver !== contract.resolver) {
+					throw new ActiveTsConfigurationError(`Typed view "${safeName}" is not the registered contract on ${meta.name}.`);
+				}
+				return await resolver({
 					context,
 					model: this,
 					data: this.data,
 					viewer,
 					name: safeName
-				})) as TView;
+				});
 			}
 		);
 	}

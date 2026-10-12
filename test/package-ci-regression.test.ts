@@ -232,11 +232,11 @@ test('CI and package scripts keep dependency audit enabled', () => {
 	assert.equal(packageJson.scripts.audit, 'pnpm audit --audit-level moderate');
 	assert.equal(packageJson.pnpm, undefined);
 	assert.match(pnpmWorkspace, /^allowBuilds:\n(?:  [^\n]+\n)*  protobufjs: true$/m);
-	assert.match(pnpmWorkspace, /^overrides:\n(?:  [^\n]+\n)*  '@grpc\/grpc-js': 1\.14\.4$/m);
+	assert.match(pnpmWorkspace, /^overrides:\n(?:  [^\n]+\n)*  '@grpc\/grpc-js': 1\.14\.5$/m);
 	assert.match(pnpmWorkspace, /^overrides:\n(?:  [^\n]+\n)*  '@opentelemetry\/core': 2\.8\.0$/m);
-	assert.match(pnpmWorkspace, /^overrides:\n(?:  [^\n]+\n)*  brace-expansion: 2\.1\.4$/m);
+	assert.match(pnpmWorkspace, /^overrides:\n(?:  [^\n]+\n)*  brace-expansion: 2\.1\.7$/m);
 	assert.match(pnpmWorkspace, /^overrides:\n(?:  [^\n]+\n)*  protobufjs: 7\.6\.5$/m);
-	assert.match(pnpmWorkspace, /^overrides:\n(?:  [^\n]+\n)*  undici: 7\.29\.0$/m);
+	assert.match(pnpmWorkspace, /^overrides:\n(?:  [^\n]+\n)*  undici: 7\.29\.1$/m);
 	assert.ok(ciAuditIndex >= 0, 'CI workflow must run dependency audit');
 	assert.ok(ciAuditIndex < ciTypecheckIndex, 'CI dependency audit must run before typecheck');
 	assert.ok(releaseAuditIndex >= 0, 'release workflow must run dependency audit');
@@ -743,6 +743,7 @@ test('package root export keeps internal helpers out of the public surface', asy
 		'defaultAggregateResult',
 		'defaultAggregateValue',
 		'defineModel',
+		'defineTypedView',
 		'encodeCursor',
 		'entity',
 		'field',

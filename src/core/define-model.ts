@@ -21,6 +21,7 @@ import { assertDenseArrayItems, assertPlainDataObject, assertSafeFieldPath, asse
 import { assertNoOverlappingFieldPaths } from './query-utils.js';
 import { mergeHooks } from './hooks.js';
 import { ActiveTsConfigurationError } from './errors.js';
+import { typedViewDetails, type TypedView } from './typed-view.js';
 import { MAP_SET, SET_ADD, SET_HAS } from './collection-intrinsics.js';
 import {
 	type ActiveTsHooks,
@@ -135,8 +136,13 @@ export class ModelBuilder<TData extends Record<string, any>> {
 		return this;
 	}
 
-	view(name: string, resolver: ViewResolver<TData>) {
-		mapSet(this.meta.views!, assertSafeFieldPath(name, 'view name'), resolver);
+	view<Output>(view: TypedView<TData, Output>): this;
+	view(name: string, resolver: ViewResolver<TData>): this;
+	view(name: string | TypedView<TData, unknown>, resolver?: ViewResolver<TData>): this {
+		const contract = typeof name === 'string' ? undefined : typedViewDetails(name);
+		const selected = contract?.resolver ?? resolver;
+		if (typeof selected !== 'function') throw new ActiveTsConfigurationError('view resolver must be a function.');
+		mapSet(this.meta.views!, assertSafeFieldPath(contract?.name ?? name, 'view name'), selected);
 		return this;
 	}
 
