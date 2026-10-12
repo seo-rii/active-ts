@@ -17,6 +17,7 @@ import type {
 	StoreWriteOptions
 } from './types.js';
 import { ActiveTsConfigurationError, ActiveTsValidationError } from './errors.js';
+import { inheritTransactionRollbackObservation } from './error-classification.js';
 import { normalizeAggregateRow } from './aggregate.js';
 import { searchCapability, storeCapability } from './capabilities.js';
 import {
@@ -410,7 +411,7 @@ function createStoreMiddlewareTransaction(
 		}
 		const transactionOptions = normalizeStoreTransactionOptions(options, 'store middleware transaction options');
 		return await transaction(
-			async (tx) => {
+			inheritTransactionRollbackObservation(fn, async (tx: StoreAdapter) => {
 				let closed: string | undefined;
 				const middlewareTx = createStoreMiddlewareAdapterWithSource(tx, layers, adapterKind, sourceAdapter);
 				const guardedTx = createCloseGuardedStoreAdapter(
@@ -433,7 +434,7 @@ function createStoreMiddlewareTransaction(
 					}
 					throw error;
 				}
-			},
+			}),
 			transactionOptions
 		);
 	});

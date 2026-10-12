@@ -11,6 +11,7 @@ import {
 } from '../../core/errors.js';
 import {
 	clearSavepointRollbackUnconfirmed,
+	confirmTransactionRollback,
 	markSavepointRollbackUnconfirmed,
 	markTransactionRollbackSkipped,
 	ownErrorValue
@@ -1836,6 +1837,7 @@ async function createPostgresStoreAdapterInternal(
 				} else {
 					try {
 						await client.query('rollback');
+						confirmTransactionRollback(fn);
 					} catch (rollbackError) {
 						const message = `PostgreSQL transaction failed and rollback failed: ${safeErrorMessage(error)}`;
 						primaryError = markTransactionRollbackSkipped(new ActiveTsUnknownTransactionOutcomeError(
