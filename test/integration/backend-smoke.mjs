@@ -1430,9 +1430,15 @@ if (targets.has('firestore')) {
 
 if (targets.has('meilisearch')) {
 	const { Meilisearch } = await import('meilisearch');
-	const client = new Meilisearch({ host: process.env.MEILISEARCH_URL ?? 'http://127.0.0.1:7700', timeout: 5_000 });
+	const host = process.env.MEILISEARCH_URL ?? 'http://127.0.0.1:7700';
+	const apiKey = process.env.MEILISEARCH_API_KEY;
+	if (process.env.CI === 'true' || process.env.ACTIVE_TS_MEILISEARCH_REQUIRE_AUTH === 'true') {
+		assert.ok(apiKey, 'Meilisearch auth integration requires MEILISEARCH_API_KEY for its admin fixture.');
+	}
+	const client = new Meilisearch({ host, ...(apiKey ? { apiKey } : {}), timeout: 5_000 });
 	const prefix = `active_ts_meili_${randomUUID().replace(/-/g, '')}_`;
 	const indexes = new Set();
+	const keyUids = new Set();
 	const waitTask = async (pending) => {
 		const task = await pending.waitTask({ timeout: 10_000, interval: 20 });
 		assert.equal(task.status, 'succeeded', `Meilisearch fixture task failed: ${task.error?.code ?? task.status}`);
@@ -1486,6 +1492,28 @@ if (targets.has('meilisearch')) {
 			.attach(IntegrationMeiliFuzzRecord);
 		const context = createActiveTs({ stores: { default: new MemoryStoreAdapter() },
 			search: { meilisearch: adapter }, defaultSearch: 'meilisearch' });
+		if (apiKey) {
+			const model = { ...context.meta(IntegrationMeiliFuzzRecord), name: 'integration_meili_auth' };
+			await prepareModel(model);
+			const row = { slug: 'search-only', title: 'authorizedneedle', score: 7 };
+			await adapter.index(model, row.slug, row);
+			const name = `${prefix}${model.name}`;
+			const key = await client.createKey({ actions: ['search'], indexes: [name],
+				expiresAt: new Date(Date.now() + 300_000).toISOString() });
+			keyUids.add(key.uid);
+			const searchClient = new Meilisearch({ host, apiKey: key.key, timeout: 5_000 });
+			const searchAdapter = await createMeilisearchSearchAdapter({ client: searchClient, indexPrefix: prefix });
+			const forbidden = (error) => error?.response?.status === 403;
+			await assert.rejects(() => searchClient.getRawIndex(name), forbidden,
+				'The search-only key must not permit index metadata reads.');
+			assert.deepEqual((await searchAdapter.search(model, 'authorizedneedle')).list, [row],
+				'Search must work with only the search permission.');
+			await assert.rejects(() => searchAdapter.index(model, row.slug, { ...row, title: 'forbiddenwrite' }), forbidden);
+			await assert.rejects(() => searchAdapter.delete(model, row.slug), forbidden);
+			assert.deepEqual((await adapter.search(model, 'authorizedneedle')).list, [row],
+				'Rejected restricted-key writes must leave the indexed document unchanged.');
+			console.log('Meilisearch auth: an index-scoped search-only key can search; metadata and writes return 403.');
+		}
 		await runSearchAdapterFuzz({ adapter, backend: 'meilisearch', meta: context.meta(IntegrationMeiliFuzzRecord),
 			prepareModel, settleMs: 0 });
 		console.log(`Meilisearch ${version.pkgVersion}: real SDK shared search contract, native filter and seeded differential fuzz passed.`);
@@ -1494,7 +1522,10 @@ if (targets.has('meilisearch')) {
 	} catch (error) {
 		meiliError = error;
 	}
-	const cleanup = await Promise.allSettled([...indexes].map((name) => waitTask(client.deleteIndex(name))));
+	const cleanup = await Promise.allSettled([
+		...[...keyUids].map((uid) => client.deleteKey(uid)),
+		...[...indexes].map((name) => waitTask(client.deleteIndex(name)))
+	]);
 	const errors = cleanup.filter((result) => result.status === 'rejected').map((result) => result.reason);
 	if (meiliError) errors.unshift(meiliError);
 	if (errors.length === 1) throw errors[0];

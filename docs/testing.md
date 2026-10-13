@@ -336,6 +336,16 @@ ACTIVE_TS_SEARCH_FUZZ_ITERATIONS=100 \
 pnpm test:integration:backends
 ```
 
+When the server uses a master key, set `MEILISEARCH_API_KEY` to a fixture admin
+credential. The runner creates an expiring, index-scoped key with only the
+`search` action and verifies that adapter searches succeed while metadata reads
+and writes return HTTP 403. It removes the temporary key and indexes afterward.
+CI uses a public test-only master key on its disposable service and requires this
+probe; a missing admin key fails. Locally, set
+`ACTIVE_TS_MEILISEARCH_REQUIRE_AUTH=true` to require the same authenticated run.
+A local server without authentication can still run the search contract and
+fuzzing by omitting both variables.
+
 For OpenSearch use `ACTIVE_TS_INTEGRATION_TARGETS=opensearch` and set
 `OPENSEARCH_URL` (default `http://127.0.0.1:9201`) with the same fuzz environment
 variables. Its fixture refreshes after mutations and uses native pagination.

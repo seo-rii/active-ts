@@ -110,7 +110,8 @@ function projection(model: ResolvedModelMeta) {
 
 function documentId(model: ResolvedModelMeta, identity: string) {
 	// JSON escapes lone UTF-16 surrogates before UTF-8 encoding, retaining distinct string IDs.
-	const encoded = Buffer.from(JSON_STRINGIFY([model.name, assertSafeCacheKey(identity, 'Meilisearch document identity')]), 'utf8').toString('base64url');
+	const tuple = cloneJsonTransportPayload([model.name, assertSafeCacheKey(identity, 'Meilisearch document identity')], 'Meilisearch document identity');
+	const encoded = Buffer.from(JSON_STRINGIFY(tuple), 'utf8').toString('base64url');
 	if (encoded.length > 511) throw new ActiveTsValidationError('Meilisearch encoded document id exceeds 511 bytes.');
 	return encoded;
 }
@@ -239,7 +240,7 @@ export async function createMeilisearchSearchAdapter(input: MeilisearchOptions =
 				...(fields.length ? { attributesToSearchOn: fields } : {}), attributesToRetrieve: retrieve }, 'Meilisearch search request');
 			if (!fields.length && searchOptions.native === undefined) return { list: [], more: false, count: 0 };
 			const index = indexMethods(name);
-			await assertPrimaryKey(name);
+			// Search-only API keys cannot read index metadata; validate each returned identity below.
 			const response = await index.search(safeQuery, request);
 			responseObject(response, 'Meilisearch search response');
 			const responsePage = unsigned(own(response, 'page', 'Meilisearch search response'), 'Meilisearch response page');
