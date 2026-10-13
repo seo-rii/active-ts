@@ -91,6 +91,8 @@ entries in `queryOperators`, declaring that stored ordering preserves domain
 ordering. Sorting a parent or child path that overlaps a codec is rejected.
 Select and aggregate fallback operations decode the complete codec field before
 reading a selected child path.
+Codecs cannot overlap the reserved numeric `version` field: optimistic locking
+compares its unencoded stored value.
 
 ## Context
 

@@ -102,6 +102,13 @@ function validateIdentityFieldCodecs(modelName: string, idField: string, fieldCo
 			`Field codec cannot be registered on id field "${idField}" for ${modelName}. Id fields use the active-ts entity id codec.`
 		);
 	}
+	for (const field of MAP_KEYS.call(fieldCodecs)) {
+		if (fieldPathsOverlap(field, 'version')) {
+			throw new ActiveTsConfigurationError(
+				`Field codec cannot overlap version field "version" for ${modelName}. Optimistic locking requires the stored version to remain an unencoded number.`
+			);
+		}
+	}
 	assertNoOverlappingFieldPaths([idField, ...MAP_KEYS.call(fieldCodecs)], `field codec paths for ${modelName}`);
 }
 

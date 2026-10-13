@@ -157,3 +157,22 @@ test('sorting below an encoded codec parent fails before the store query', async
 	await assert.rejects(() => Records.query().orderBy('profile.score').load(), /codec.*sort|exact codec/i);
 	assert.equal(store.stats.query, 0);
 });
+
+for (const field of ['version', 'version.counter']) {
+	test(`metadata rejects a codec overlapping optimistic version: ${field}`, () => {
+		class VersionRecord extends Model<{ id: number; version: number }> {}
+		assert.throws(() => defineModel<VersionRecord['data']>(`audit_version_${field.replace('.', '_')}`).id('id')
+			.fieldCodec(field, { name: 'number-text', encode: String, decode: Number }).attach(VersionRecord), /codec.*version|version.*codec/i);
+	});
+}
+
+test('ordinary numeric version saves remain supported', async () => {
+	class VersionRecord extends Model<{ id: number; version: number; name: string }> {}
+	defineModel<VersionRecord['data']>('audit_plain_version').id('id').validate((data) => data as VersionRecord['data']).attach(VersionRecord);
+	const store = new MemoryStoreAdapter();
+	const context = createActiveTs({ stores: { default: store } });
+	const row = await VersionRecord.use(context).create({ id: 1, version: 1, name: 'before' });
+	row.data.name = 'after';
+	await row.save();
+	assert.deepEqual(await store.get(context.meta(VersionRecord), 1), { id: 1, version: 2, name: 'after' });
+});
