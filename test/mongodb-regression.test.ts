@@ -2023,3 +2023,24 @@ test('MongoDB query filters preserve null and same-field portable semantics', as
 		]
 	});
 });
+
+for (const op of ['count', 'sum', 'avg'] as const) {
+	test(`MongoDB ${op} aggregate preserves the public _id alias`, async () => {
+		const adapter = await mongoAdapter({ aggregate(pipeline: any[]) {
+			const group = pipeline[1].$group;
+			assert.equal(group._id, null, 'MongoDB group identity stays constant');
+			const result: Record<string, unknown> = { _id: null };
+			for (const [key, expression] of Object.entries(group)) {
+				if (key === '_id') continue;
+				result[key] = key.startsWith('__activeTsInvalid') ? 0 : 3;
+				assert.ok(expression);
+			}
+			return { toArray: async () => [result] };
+		} });
+		assert.deepEqual(await adapter.aggregate!(meta, { where: [], or: [], aggregates: [
+			op === 'count' ? { op, as: '_id' } : { op, field: 'score', as: '_id' },
+			{ op: 'count', as: '_activeTsResult_id' },
+			{ op: 'count', as: 'count' }
+		] }), { _id: 3, _activeTsResult_id: 3, count: 3 });
+	});
+}
