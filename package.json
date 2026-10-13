@@ -66,6 +66,10 @@
 			"types": "./build/src/adapters/search/meilisearch.d.ts",
 			"import": "./build/src/adapters/search/meilisearch.js"
 		},
+		"./adapters/search/opensearch": {
+			"types": "./build/src/adapters/search/opensearch.d.ts",
+			"import": "./build/src/adapters/search/opensearch.js"
+		},
 		"./adapters/search/memory": {
 			"types": "./build/src/adapters/search/memory.d.ts",
 			"import": "./build/src/adapters/search/memory.js"
@@ -109,6 +113,7 @@
 		"@elastic/elasticsearch": "^8.0.0",
 		"@google-cloud/datastore": "^10.0.0",
 		"@google-cloud/firestore": "^8.0.0",
+		"@opensearch-project/opensearch": "^3.9.0",
 		"algoliasearch": "^5.0.0",
 		"meilisearch": "^0.62.0",
 		"mongodb": "^7.0.0",
@@ -124,6 +129,9 @@
 			"optional": true
 		},
 		"@google-cloud/firestore": {
+			"optional": true
+		},
+		"@opensearch-project/opensearch": {
 			"optional": true
 		},
 		"algoliasearch": {

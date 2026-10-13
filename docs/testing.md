@@ -314,13 +314,15 @@ to point, query, aggregate, min/max, and multi-page scan calls.
 
 ## Seeded Search Fuzzing
 
-The Meilisearch integration target runs
+The Meilisearch and OpenSearch integration targets run
 [`search-fuzz.mjs`](../test/integration/search-fuzz.mjs) against the real service
 after the shared search contract. Each of two fixed seeds exercises 100 random
 operations plus deterministic edge cases. An independent reference map checks
 full replacement, deletion, numeric/string IDs, custom ID fields, declared
 projection, result limits, marker queries and pagination after mutations.
-Meilisearch also rejects explicit write revisions because it cannot fence stale
+OpenSearch additionally generates newer, equal and older revisions and verifies
+that stale indexes/deletes cannot overwrite the latest state or resurrect a
+deleted document. Meilisearch rejects explicit write revisions because it cannot fence stale
 writes. Test indexes disable typo tolerance and prefix matching so the oracle
 compares exact marker membership without depending on search ranking.
 
@@ -343,6 +345,10 @@ probe; a missing admin key fails. Locally, set
 `ACTIVE_TS_MEILISEARCH_REQUIRE_AUTH=true` to require the same authenticated run.
 A local server without authentication can still run the search contract and
 fuzzing by omitting both variables.
+
+For OpenSearch use `ACTIVE_TS_INTEGRATION_TARGETS=opensearch` and set
+`OPENSEARCH_URL` (default `http://127.0.0.1:9201`) with the same fuzz environment
+variables. Its fixture refreshes after mutations and uses native pagination.
 
 Failure output includes the backend, seed, operation and replay environment.
 The runner creates isolated indexes and removes them on completion. These are
@@ -386,7 +392,7 @@ query scan costs require their own designs and tests.
 
 ### Backend Coverage
 
-The integration and release workflows require all nine configured targets to
+The integration and release workflows require all ten configured targets to
 finish; the runner rejects unknown targets and fails if any requested target is
 missing from the completed set. Backend coverage is not interchangeable:
 
@@ -401,6 +407,7 @@ missing from the completed set. Backend coverage is not interchangeable:
 | Redis 7 | Real server in integration/release CI | Shared cache contract. |
 | Valkey 9.1.2 | Separate real server in integration/release CI | Shared cache contract, including TTL and versioned writes. `INFO server` must identify Valkey before cache operations; Redis cannot satisfy this target. |
 | Elasticsearch 8.15.3 | Real server in integration/release CI | Shared search/native paths and Datastore outbox integration. |
+| OpenSearch 3.9.0 | Real server in integration/release CI | Shared search/native paths, typed IDs, ancestor identity, projection, and seeded revision/tombstone/pagination fuzzing using the OpenSearch SDK. |
 | Meilisearch CE 1.55.0 | Real server in integration/release CI | Shared search/native paths, successful task completion, typed IDs, ancestor identity, projection and seeded mutation fuzzing. Revision-ordered writes are explicitly unsupported. |
 | Algolia | Injected SDK clients in the default suite | Shared search behavior; no live Algolia integration target. |
 
@@ -459,7 +466,7 @@ pnpm test:integration:backends
 The GitHub `Backend Integration` workflow runs this script on schedule, manual
 dispatch, main pushes, and pull requests that touch adapter, core, testing harness,
 integration, package, or workflow files. It uses PostgreSQL, MongoDB,
-Redis, Valkey, Elasticsearch, and Meilisearch service containers, then starts Datastore and
+Redis, Valkey, Elasticsearch, Meilisearch, and OpenSearch service containers, then starts Datastore and
 Firestore emulators with Google Cloud CLI. The workflow pins the Elasticsearch
 client to the same major as its service container, pins the Google Cloud SDK
 used for emulator startup, waits for Datastore and Firestore SDK probes before
