@@ -2031,6 +2031,20 @@ export class ActiveContext {
 				for (let index = 0; index < missingIds.length; index++) {
 					mapSet(loadedById, entityIdKey(missingIds[index]), loaded[index] ?? null);
 				}
+				const rawById = new Map<string, any | null>();
+				for (let index = 0; index < uniqueIds.length; index++) {
+					const id = uniqueIds[index];
+					const value = cached[index] !== undefined ? cached[index] : mapGet(loadedById, entityIdKey(id));
+					mapSet(rawById, entityIdKey(id), value ?? null);
+				}
+				const list: Array<TModel | null> = [];
+				const afterInstantiateTasks: Array<Promise<unknown>> = [];
+				for (let index = 0; index < ids.length; index++) {
+					const item = this.instantiate(model, mapGet(rawById, entityIdKey(ids[index]))) as TModel | null;
+					list[index] = item;
+					if (item) afterInstantiateTasks[afterInstantiateTasks.length] = this.runAfterInstantiateHooks(meta, item as any);
+				}
+				await Promise.all(afterInstantiateTasks);
 				if (cache && missingIds.length && !this.transactionState) {
 					const cacheableMissingIds: EntityId[] = [];
 					for (let index = 0; index < missingIds.length; index++) {
@@ -2085,20 +2099,6 @@ export class ActiveContext {
 						cacheVersions
 					);
 				}
-				const rawById = new Map<string, any | null>();
-				for (let index = 0; index < uniqueIds.length; index++) {
-					const id = uniqueIds[index];
-					const value = cached[index] !== undefined ? cached[index] : mapGet(loadedById, entityIdKey(id));
-					mapSet(rawById, entityIdKey(id), value ?? null);
-				}
-				const list: Array<TModel | null> = [];
-				const afterInstantiateTasks: Array<Promise<unknown>> = [];
-				for (let index = 0; index < ids.length; index++) {
-					const item = this.instantiate(model, mapGet(rawById, entityIdKey(ids[index]))) as TModel | null;
-					list[index] = item;
-					if (item) afterInstantiateTasks[afterInstantiateTasks.length] = this.runAfterInstantiateHooks(meta, item as any);
-				}
-				await Promise.all(afterInstantiateTasks);
 				return list;
 			}
 		));

@@ -57,3 +57,30 @@ for (const operation of ['query', 'aggregate'] as const) {
 		assert.deepEqual(await run(), operation === 'query' ? [2] : 1);
 	});
 }
+
+for (const failure of ['validation', 'codec', 'hook'] as const) {
+	test(`failed read ${failure} cannot publish a cache entry`, async () => {
+		class CachedRecord extends Model<{ id: number; value: number }> {}
+		const name = `audit_invalid_cache_${failure}`;
+		let rejectHook = failure === 'hook';
+		const builder = defineModel<CachedRecord['data']>({ name, cache: { ttl: 300 } }).id('id')
+			.validate((data: any) => { if (typeof data.value !== 'number') throw Error('number required'); return data; })
+			.readValidation('error');
+		if (failure === 'codec') builder.fieldCodec('value', { name: 'number', encode: (value) => value, decode: (value) => {
+			if (typeof value !== 'number') throw Error('number required'); return value;
+		} });
+		builder.attach(CachedRecord);
+		const store = new MemoryStoreAdapter();
+		const cache = new MemoryCacheAdapter();
+		const context = createActiveTs({ stores: { default: store }, caches: { default: cache }, plugins: [{ name: 'failing-read-hook', hooks: {
+			afterInstantiate() { if (rejectHook) throw Error('read hook failed'); }
+		} }] });
+		const Records = CachedRecord.use(context);
+		await store.seed(name, [{ id: 1, value: failure === 'hook' ? 1 : 'broken' }]);
+		await assert.rejects(() => Records.find(1).load(), /number required|read hook failed/);
+		assert.deepEqual(cache.snapshot(), {});
+		rejectHook = false;
+		await store.update(context.meta(CachedRecord), 1, { id: 1, value: 7 });
+		assert.equal((await Records.find(1).load())?.data.value, 7);
+	});
+}
