@@ -320,11 +320,14 @@ function aggregateFields(specs: readonly AggregateSpec[]) {
 	return uniqueStrings(fields);
 }
 
+// Public aliases beginning with __ are rejected by aggregate plan validation.
+const MONGO_AGGREGATE_ID_ALIAS = '__activeTsResult_id';
+
 function mongoAggregateGroup(specs: readonly AggregateSpec[], invalidAliases: Map<string, AggregateSpec>) {
 	const group: Record<string, unknown> = { _id: null };
 	for (let index = 0; index < specs.length; index++) {
 		const spec = specs[index];
-		defineDataProperty(group, spec.as, aggregateExpression(spec), {
+		defineDataProperty(group, spec.as === '_id' ? MONGO_AGGREGATE_ID_ALIAS : spec.as, aggregateExpression(spec), {
 			enumerable: true,
 			configurable: true,
 			writable: true
@@ -1263,7 +1266,7 @@ function mongoAggregateResultRow(row: unknown, invalidAliases: Map<string, Aggre
 			continue;
 		}
 		if (MAP_HAS.call(invalidAliases, property)) continue;
-		defineDataProperty(clean, property, descriptor.value, {
+		defineDataProperty(clean, property === MONGO_AGGREGATE_ID_ALIAS ? '_id' : property, descriptor.value, {
 			enumerable: true,
 			configurable: true,
 			writable: true

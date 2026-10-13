@@ -477,7 +477,11 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 			for (const where of plan.where) {
 				query = normalizeFirestoreObject(applyFirestoreWhere(query, where), 'Firestore query');
 			}
-			if (!plan.or.length && AggregateField && firestoreOptionalMethod(query, 'aggregate', 'Firestore query.aggregate')) {
+			// Firestore sum/avg silently omit nonnumeric rows; combining fields also
+			// intersects their document sets. Only count has portable native semantics.
+			let countOnly = true;
+			for (const spec of specs) if (spec.op !== 'count') countOnly = false;
+			if (countOnly && AggregateField && firestoreOptionalMethod(query, 'aggregate', 'Firestore query.aggregate')) {
 				const aggregateSpec: Record<string, unknown> = {};
 				let aggregateSpecValid = true;
 				for (let index = 0; index < specs.length; index++) {

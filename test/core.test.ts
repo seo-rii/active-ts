@@ -3807,7 +3807,7 @@ test('firestore adapter validates field paths, document ids, and write payloads'
 		sum: (field: string) => ({ aggregateType: 'sum', field }),
 		average: (field: string) => ({ aggregateType: 'average', field })
 	};
-	const adapter = await createFirestoreStoreAdapter({ client, aggregateField });
+	const adapter = await createFirestoreStoreAdapter({ client, aggregateField, allowAggregateScanFallback: true });
 	const meta = setup().context.meta(Account);
 	const sortableMeta = { ...meta, fieldTypes: new Map([...meta.fieldTypes, ['name', 'string' as const]]) };
 
@@ -3837,15 +3837,8 @@ test('firestore adapter validates field paths, document ids, and write payloads'
 		]
 	});
 	assert.deepEqual(aggregate, { count: 2, total: 50, average: 25 });
-	assert.deepEqual(calls.find((call) => call.op === 'aggregate'), {
-		op: 'aggregate',
-		spec: {
-			count: { aggregateType: 'count' },
-			total: { aggregateType: 'sum', field: 'score' },
-			average: { aggregateType: 'average', field: 'score' }
-		}
-	});
-	assert.equal(calls.some((call) => call.op === 'select'), false);
+	assert.equal(calls.some((call) => call.op === 'aggregate'), false);
+	assert.deepEqual(calls.find((call) => call.op === 'select'), { op: 'select', fields: ['id', 'score'] });
 	calls.length = 0;
 	await assert.rejects(
 		() =>
@@ -3854,7 +3847,7 @@ test('firestore adapter validates field paths, document ids, and write payloads'
 				or: [],
 				aggregates: [{ op: 'sum', field: 'profile/score', as: 'bad' }]
 			}),
-		/Firestore sum aggregate field/
+		/Firestore aggregate field/
 	);
 	assert.equal(calls.some((call) => call.op === 'aggregate'), false);
 
