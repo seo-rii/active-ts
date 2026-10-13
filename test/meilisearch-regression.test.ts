@@ -70,6 +70,45 @@ test('Meilisearch preserves typed/custom IDs, projects nested fields and replace
 	assert.equal(fixture.docs.size, 1);
 });
 
+for (const [name, prototype] of [['Array', Array.prototype], ['Object', Object.prototype]] as const) {
+	test(`Meilisearch keeps typed document identities stable with inherited ${name}.toJSON`, async () => {
+		const fixture = fake(); const originalIndex = fixture.client.index;
+		fixture.client.index = (indexName) => ({ ...originalIndex(indexName), search: async (_query, options) => {
+			JSON.stringify(options);
+			// The real server serializes outside the application's patched prototypes.
+			return { hits: structuredClone([...fixture.docs.values()]), page: options.page,
+				hitsPerPage: options.hitsPerPage, totalPages: fixture.docs.size ? 1 : 0, totalHits: fixture.docs.size };
+		} });
+		const adapter = await createMeilisearchSearchAdapter({ client: fixture.client }); const model = metadata();
+		await adapter.index(model, 1, { slug: 1, title: 'shared original' });
+		const originalKey = [...fixture.docs.keys()][0];
+		const previous = Object.getOwnPropertyDescriptor(prototype, 'toJSON');
+		let calls = 0;
+		Object.defineProperty(prototype, 'toJSON', { configurable: true, value() {
+			calls++;
+			return ['forced_model', 'forced_identity'];
+		} });
+		try {
+			await adapter.index(model, 1, { slug: 1, title: 'shared replacement' });
+			await adapter.index(model, '1', { slug: '1', title: 'shared string' });
+			assert.equal(fixture.docs.size, 2);
+			assert.equal(fixture.docs.get(originalKey).title, 'shared replacement');
+			const result = await adapter.search(model, 'shared', {});
+			assert.deepEqual(result.list, [{ slug: 1, title: 'shared replacement' }, { slug: '1', title: 'shared string' }]);
+			assert.deepEqual(result.list.map(searchHitDocumentIdentity), ['number:1', 'string:1']);
+			await adapter.delete(model, 1);
+			assert.equal(fixture.docs.has(originalKey), false);
+			assert.deepEqual((await adapter.search(model, 'shared', {})).list, [{ slug: '1', title: 'shared string' }]);
+			await adapter.delete(model, '1');
+			assert.equal(fixture.docs.size, 0);
+		} finally {
+			if (previous) Object.defineProperty(prototype, 'toJSON', previous);
+			else Reflect.deleteProperty(prototype, 'toJSON');
+		}
+		assert.equal(calls, 0);
+	});
+}
+
 test('Meilisearch awaits successful matched task completion instead of accepting the queue acknowledgement', async () => {
 	const fixture = fake(); const adapter = await createMeilisearchSearchAdapter({ client: fixture.client, taskTimeoutMs: 321, taskIntervalMs: 7 });
 	let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });

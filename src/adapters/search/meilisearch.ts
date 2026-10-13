@@ -110,7 +110,8 @@ function projection(model: ResolvedModelMeta) {
 
 function documentId(model: ResolvedModelMeta, identity: string) {
 	// JSON escapes lone UTF-16 surrogates before UTF-8 encoding, retaining distinct string IDs.
-	const encoded = Buffer.from(JSON_STRINGIFY([model.name, assertSafeCacheKey(identity, 'Meilisearch document identity')]), 'utf8').toString('base64url');
+	const tuple = cloneJsonTransportPayload([model.name, assertSafeCacheKey(identity, 'Meilisearch document identity')], 'Meilisearch document identity');
+	const encoded = Buffer.from(JSON_STRINGIFY(tuple), 'utf8').toString('base64url');
 	if (encoded.length > 511) throw new ActiveTsValidationError('Meilisearch encoded document id exceeds 511 bytes.');
 	return encoded;
 }
