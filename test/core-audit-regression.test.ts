@@ -84,3 +84,45 @@ for (const failure of ['validation', 'codec', 'hook'] as const) {
 		assert.equal((await Records.find(1).load())?.data.value, 7);
 	});
 }
+
+class HistoricalChild extends Model<{ id: number }> {}
+class HistoricalParent extends Model<{ id: number; childId: number }> {}
+defineModel<HistoricalChild['data']>('audit_history_child').id('id').validate((data) => data as HistoricalChild['data']).attach(HistoricalChild);
+defineModel<HistoricalParent['data']>('audit_history_parent').id('id').validate((data) => data as HistoricalParent['data'])
+	.ref('child', () => HistoricalChild, { localKey: 'childId', foreignKey: 'id' }).attach(HistoricalParent);
+
+for (const source of ['point', 'query'] as const) {
+	for (const operation of ['include', 'ref', 'retained'] as const) {
+		test(`historical ${source} models reject ${operation} relations before hooks or reads`, async () => {
+			let relationHooks = 0;
+			let childReads = 0;
+			let capturedRef: any;
+			const store: import('../src/index.js').StoreAdapter = {
+				kind: 'history-fixture', capabilities: { datastoreReadPolicy: true },
+				async get() { return null; },
+				async getMany(meta, ids) { if (meta.name === 'audit_history_child') childReads++; return ids.map((id) => ({ id, childId: 1 })); },
+				async query() { return { list: [{ id: 1, childId: 1 }], count: 1, more: false }; },
+				async create() {}, async update() {}, async delete() {}
+			};
+			const context = createActiveTs({ stores: { default: store }, lazyWarnings: false, plugins: [{ name: 'history-hooks', hooks: {
+				beforeRelationLoad() { relationHooks++; }
+			} }] });
+			const Parents = HistoricalParent.use(context);
+			// Direct LazyRef construction must enforce the same owner provenance.
+			if (operation === 'retained') {
+				const { LazyRef } = await import('../src/core/lazy-ref.js');
+				const row = source === 'point' ? await Parents.find(1).readAt(1700000000000).load() : await Parents.query().readAt(1700000000000).first();
+				assert.ok(row);
+				capturedRef = new LazyRef(context, row, context.meta(HistoricalParent).relations.get('child')!, true);
+				assert.throws(() => capturedRef.prime(null), /readAt|historical/);
+				await assert.rejects(async () => capturedRef.load({ hooks: false }), /readAt|historical/);
+			} else {
+				const row = source === 'point' ? await Parents.find(1).readAt(1700000000000).load() : await Parents.query().readAt(1700000000000).first();
+				assert.ok(row);
+				await assert.rejects(async () => operation === 'include' ? await row.include('child') : await row.ref('child'), /readAt|historical/);
+			}
+			assert.equal(relationHooks, 0);
+			assert.equal(childReads, 0);
+		});
+	}
+}

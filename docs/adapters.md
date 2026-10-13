@@ -445,6 +445,9 @@ const snapshot = await AuditRecord
 backfill them, so a historical row cannot replace the current cached value.
 Queries and aggregates do not use entity caches. Models returned by `readAt()`
 are read-only: instance `save()` and `delete()` fail before hooks or store calls.
+Their instance `include()` and `ref()` operations also reject before relation
+hooks or reads, including previously retained lazy refs; load each related
+snapshot explicitly using the same `readAt()` policy.
 Restore data deliberately with a current-state static update that selects the
 fields to copy, or use the low-level store API when exact replacement semantics
 are required. `readConsistency()` results are current-read models and remain
