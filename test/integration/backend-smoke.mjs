@@ -32,12 +32,13 @@ import {
 import { createFirestoreStoreAdapter } from '../../build/src/adapters/store/firestore.js';
 import { createMongoStoreAdapter } from '../../build/src/adapters/store/mongodb.js';
 import { createPostgresStoreAdapter } from '../../build/src/adapters/store/postgresql.js';
+import { createSqliteStoreAdapter } from '../../build/src/adapters/store/sqlite.js';
 import {
 	markStoreTrustsDatastoreEntityKeyRows,
 	storeTrustsDatastoreEntityKeyRows
 } from '../../build/src/core/store-options.js';
 
-const KNOWN_TARGETS = ['postgres', 'mongodb', 'redis', 'elasticsearch', 'datastore', 'firestore'];
+const KNOWN_TARGETS = ['postgres', 'mongodb', 'redis', 'elasticsearch', 'datastore', 'firestore', 'sqlite'];
 const requestedTargets = (process.env.ACTIVE_TS_INTEGRATION_TARGETS ?? 'postgres,mongodb,redis,elasticsearch')
 	.split(',')
 	.map((item) => item.trim())
@@ -163,6 +164,17 @@ function assertNativeAlphaProbeResult(list) {
 	assert.equal(list[0].id, 1);
 	assert.equal(list[0].name, 'alpha');
 	assert.ok(list[0].score === 10 || list[0].score === 30, `unexpected native probe score ${list[0].score}`);
+}
+
+if (targets.has('sqlite')) {
+	const adapter = await createSqliteStoreAdapter();
+	try {
+		await runStoreAdapterContract(adapter);
+		ran++;
+		ranTargets.push('sqlite');
+	} finally {
+		await adapter.close();
+	}
 }
 
 if (targets.has('postgres')) {

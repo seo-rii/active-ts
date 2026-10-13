@@ -253,6 +253,7 @@ Built-in store adapters support different transaction options and savepoints:
 | --- | --- | --- | --- | --- |
 | Memory | Yes | Yes | `readOnly` | Rejects `isolation`, `timeoutMs`, and `native`; intended for deterministic tests. |
 | PostgreSQL | Yes | Yes | `isolation`, `readOnly`, `timeoutMs` | Rejects transaction `native`; native SQL is still available through query builders outside read-only transaction guards. |
+| SQLite | Yes | Yes | `readOnly`, `isolation: 'serializable'` | `BEGIN IMMEDIATE`; rejects other isolation levels, `timeoutMs`, transaction `native`, and native query payloads. |
 | MongoDB | When the client exposes `startSession()` | No | `readOnly`, `timeoutMs`, plus `native.readConcern`, `native.writeConcern`, `native.readPreference`, and `native.maxCommitTimeMS` | Requires a replica set or sharded cluster; transaction handles reject native query payloads and serialize portable driver operations on one session. |
 | Datastore | When the SDK client exposes `transaction()` | No | `readOnly`, plus `native.gaxOptions`, `native.commitGaxOptions`, and `native.rollbackGaxOptions` | Write transactions allow native query callbacks before buffered writes; read-only transactions reject native callbacks. |
 | Firestore | Yes | No | `readOnly`, plus `native.maxAttempts`, `native.readOnly`, and `native.readTime` | Transaction queries reject native function payloads; Firestore requires all unbuffered reads before writes. Queries wait for earlier pending mutations before enforcing that boundary. |

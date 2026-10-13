@@ -18,7 +18,7 @@ expected to move while real applications exercise the adapter contracts.
 - Active Record style `Model.find()`, `Model.where()`, `Model.search()`, single
   writes, and atomic lifecycle-aware model bulk APIs
 - optimized query aggregates such as `count`, `sum`, `avg`, `min`, and `max`
-- pluggable store adapters for Datastore, Firestore, MongoDB, PostgreSQL, and
+- pluggable store adapters for Datastore, Firestore, MongoDB, PostgreSQL, SQLite, and
   in-memory tests
 - Redis/Valkey cache adapter with batch reads and negative cache entries
 - search adapters for native store search, Algolia, Elasticsearch, and memory
@@ -75,6 +75,9 @@ pnpm add mongodb @elastic/elasticsearch
 
 active-ts is ESM-only and requires Node.js 22 or newer. Use `import` or dynamic
 `import()` from an ESM application; CommonJS `require()` is not supported.
+The SQLite adapter uses built-in `node:sqlite` and requires Node.js 22.13 or
+newer; it needs no additional database package. See the
+[SQLite setup and limitations](docs/adapters.md#sqlite).
 
 ## Quick Example
 

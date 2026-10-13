@@ -42,6 +42,10 @@
 			"types": "./build/src/adapters/store/postgresql.d.ts",
 			"import": "./build/src/adapters/store/postgresql.js"
 		},
+		"./adapters/store/sqlite": {
+			"types": "./build/src/adapters/store/sqlite.d.ts",
+			"import": "./build/src/adapters/store/sqlite.js"
+		},
 		"./adapters/cache/memory": {
 			"types": "./build/src/adapters/cache/memory.d.ts",
 			"import": "./build/src/adapters/cache/memory.js"
