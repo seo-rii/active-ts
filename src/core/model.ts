@@ -27,6 +27,7 @@ import {
 import {
 	ACTIVE_TS_MODEL_INSTANCE,
 	datastoreHistoricalModelReadTime,
+	assertModelSnapshotRelationsAllowed,
 	MODEL_DATASTORE_WRITE_ANCESTOR,
 	MODEL_PERSISTED_TOKEN,
 	trackTransactionModel,
@@ -290,6 +291,7 @@ export abstract class Model<TData extends Record<string, any> = Record<string, a
 			() => this.context.transactionScopedContext('include relations'),
 			async (context) => {
 				this.assertFullModel('include relations');
+				if (relations.length) assertModelSnapshotRelationsAllowed(this);
 				const meta = context.meta(this.constructor as ModelConstructor);
 				const expectedId = valueFor(this.data, meta.idField);
 				if (expectedId === undefined || expectedId === null) {
@@ -406,6 +408,7 @@ export abstract class Model<TData extends Record<string, any> = Record<string, a
 
 	ref<TModel = any>(name: string) {
 		this.assertFullModel('load relations');
+		assertModelSnapshotRelationsAllowed(this);
 		const context = this.context.transactionScopedContext('load relations');
 		const safeName = assertSafeTopLevelField(name, 'relation name');
 		let cached = mapGet(this.relationCache, safeName);

@@ -1,3 +1,4 @@
+import { ActiveTsConfigurationError } from './errors.js';
 import { WEAKMAP_GET, WEAKMAP_SET } from './collection-intrinsics.js';
 
 export const MODEL_PERSISTED_TOKEN: unique symbol = Symbol('active-ts.persisted-constructor-token') as any;
@@ -26,4 +27,12 @@ export function markDatastoreHistoricalModel(item: object, readTime: number) {
 
 export function datastoreHistoricalModelReadTime(item: object) {
 	return WEAKMAP_GET.call(DATASTORE_HISTORICAL_READ_TIMES, item) as number | undefined;
+}
+
+export function assertModelSnapshotRelationsAllowed(item: object) {
+	const readTime = datastoreHistoricalModelReadTime(item);
+	if (readTime === undefined) return;
+	throw new ActiveTsConfigurationError(
+		`Cannot load relations on a model loaded by readAt(${readTime}); historical relations require explicit snapshots with the same read policy.`
+	);
 }

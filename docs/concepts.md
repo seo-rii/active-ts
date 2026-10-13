@@ -86,6 +86,13 @@ Operators such as `startsWith`, range comparisons, and text or JSON containment
 must be listed in `queryOperators` only when the encoded representation preserves
 that operator's semantics. `encodeQuery` receives `context.operator` for those
 cases.
+Sorting a codec field also requires `encodeQuery` and explicit `<` and `>`
+entries in `queryOperators`, declaring that stored ordering preserves domain
+ordering. Sorting a parent or child path that overlaps a codec is rejected.
+Select and aggregate fallback operations decode the complete codec field before
+reading a selected child path.
+Codecs cannot overlap the reserved numeric `version` field: optimistic locking
+compares its unencoded stored value.
 
 ## Context
 
@@ -138,7 +145,9 @@ const context = createActiveTs({
 ## Batch Loading and Cache
 
 `Model.find(id).load()` goes through a per-model batch loader. Loads scheduled in
-the same event-loop turn are coalesced into one `getMany()` store call.
+the same event-loop turn are coalesced into `getMany()` store calls. Each caller
+receives its own mutable model instance and its own `afterInstantiate` lifecycle;
+matching IDs share raw cache/store reads within a request chunk.
 Large batches are chunked before cache/store adapters see them. The default
 chunk size is `500`; set `batch.maxSize` on the context when a backend has a
 lower request limit.

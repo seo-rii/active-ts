@@ -15,7 +15,7 @@ import {
 } from './relation-result.js';
 import { assertSafeEntityId } from './safe-keys.js';
 import { SET_ADD, SET_HAS, WEAKMAP_GET, WEAKMAP_SET } from './collection-intrinsics.js';
-import { MODEL_DATASTORE_WRITE_ANCESTOR } from './model-internal.js';
+import { assertModelSnapshotRelationsAllowed, MODEL_DATASTORE_WRITE_ANCESTOR } from './model-internal.js';
 import type { DatastoreKey, EntityId, ModelConstructor, RelationMeta } from './types.js';
 import { runTrackedContextOperation } from './context-internal.js';
 
@@ -113,6 +113,7 @@ export class LazyRef<TModel = any> implements PromiseLike<TModel | TModel[] | nu
 	private fullPromiseContext?: ActiveContext;
 
 	private scopedContext(operation: string) {
+		assertModelSnapshotRelationsAllowed(this.owner);
 		const context = this.context.transactionScopedContext(operation);
 		const descriptor = Object.getOwnPropertyDescriptor(this.owner, 'context');
 		const ownerContext = descriptor && 'value' in descriptor ? descriptor.value : undefined;

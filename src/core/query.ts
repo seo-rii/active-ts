@@ -52,6 +52,7 @@ import {
 	entityIdKey,
 	isOperator,
 	portableScalarKey,
+	pickFields,
 	valueFor,
 	filterRows,
 	withIdField,
@@ -100,6 +101,8 @@ import {
 import { cloneNativePayload } from './native-payload.js';
 import { clonePlanMeta } from './plan-meta.js';
 import {
+	applyFieldCodecs,
+	fieldCodecProjectionFields,
 	copyFieldCodecQueryOperandMarker,
 	encodeAggregatePlanFieldCodecs,
 	encodeQueryPlanFieldCodecs,
@@ -1599,14 +1602,16 @@ export class QueryBuilder<TModel extends { data: any }, TData extends Record<str
 		meta: ResolvedModelMeta,
 		context: ActiveContext
 	): Promise<QueryResult<TModel>> {
+		const baseWhere = initialPlan.or.length ? this.compileBaseConstraints() : [];
+		const protectedMeta = clonePlanMeta(initialPlan.meta);
 		const before = await context.runHooks('beforeQuery', {
 			model: meta,
 			plan: initialPlan,
 			operation: 'query'
 		});
 		const sanitizedPlan = this.reapplyProtectedMeta(this.reapplyBaseConstraints(
-			sanitizeQueryPlan(before.plan as QueryPlan<TData>, meta.idField)
-		));
+			sanitizeQueryPlan(before.plan as QueryPlan<TData>, meta.idField), baseWhere
+		), protectedMeta);
 		const plan = encodeQueryPlanFieldCodecs(
 			meta,
 			normalizeQueryPlanFieldTypes(meta, sanitizedPlan)
@@ -1623,7 +1628,10 @@ export class QueryBuilder<TModel extends { data: any }, TData extends Record<str
 			);
 		}
 		const store = context.storeForQuery(meta, plan);
+		const selectedFields = fieldCodecProjectionFields(meta, plan.select);
+		const expandedProjection = selectedFields !== plan.select;
 		const adapterPlan = stripStoreNativeAdapterTag(cloneQueryBranch(plan));
+		adapterPlan.select = selectedFields === undefined ? undefined : [...selectedFields];
 		const rawQueryResult = await store.query(meta, adapterPlan, {
 			select: adapterPlan.select,
 			native: adapterPlan.native?.payload,
@@ -1645,8 +1653,10 @@ export class QueryBuilder<TModel extends { data: any }, TData extends Record<str
 			let relationInstantiationData: Record<string, any> | undefined;
 			const item = context.instantiate(
 				this.model,
-				raw.list[index],
-				{ partial: !!plan.select?.length },
+				expandedProjection
+					? pickFields(applyFieldCodecs(meta, raw.list[index], 'read'), plan.select!, meta.idField)
+					: raw.list[index],
+				{ partial: !!plan.select?.length, ...(expandedProjection ? { fieldCodecs: false } : {}) },
 				this.retainRelationInstantiationData
 					? (data) => {
 							relationInstantiationData = data;
@@ -1696,6 +1706,8 @@ export class QueryBuilder<TModel extends { data: any }, TData extends Record<str
 		const context = this.activeContext('run aggregate queries');
 		const meta = context.meta(this.model);
 		const queryPlan = this.compilePlan(meta.idField);
+		const baseWhere = queryPlan.or.length ? this.compileBaseConstraints() : [];
+		const protectedMeta = clonePlanMeta(queryPlan.meta);
 		const plan: AggregatePlan<TData> = {
 			where: queryPlan.where,
 			or: queryPlan.or,
@@ -1709,8 +1721,8 @@ export class QueryBuilder<TModel extends { data: any }, TData extends Record<str
 			operation: 'aggregate'
 		});
 		const sanitizedPlan = this.reapplyProtectedMeta(this.reapplyBaseConstraints(
-			sanitizeAggregatePlan(before.plan as AggregatePlan<TData>)
-		));
+			sanitizeAggregatePlan(before.plan as AggregatePlan<TData>), baseWhere
+		), protectedMeta);
 		const activePlan = encodeAggregatePlanFieldCodecs(
 			meta,
 			normalizeAggregatePlanFieldTypes(meta, sanitizedPlan)
@@ -1762,7 +1774,7 @@ export class QueryBuilder<TModel extends { data: any }, TData extends Record<str
 				aggregateFields[aggregateFields.length] = meta.datastore.ancestorFields[index];
 			}
 		}
-		const fields = uniqueStrings(aggregateFields);
+		const fields = fieldCodecProjectionFields(meta, uniqueStrings(aggregateFields))!;
 		const select = fields.length && storeCapability(store.capabilities, 'select') ? fields : undefined;
 		const fallbackPlan: QueryPlan<TData> = {
 			where: activePlan.where,
@@ -1835,9 +1847,10 @@ export class QueryBuilder<TModel extends { data: any }, TData extends Record<str
 		return [...cloneWhereEntries(this.constraints), ...cloneWhereEntries(this.plan.where)];
 	}
 
-	private reapplyBaseConstraints<TPlan extends QueryPlan<TData> | AggregatePlan<TData>>(plan: TPlan): TPlan {
-		if (!this.plan.or.length || !plan.or.length) return plan;
-		const baseWhere = this.compileBaseConstraints();
+	private reapplyBaseConstraints<TPlan extends QueryPlan<TData> | AggregatePlan<TData>>(
+		plan: TPlan, baseWhere: QueryPlan<TData>['where']
+	): TPlan {
+		if (!plan.or.length) return plan;
 		if (!baseWhere.length) return plan;
 		const or: TPlan['or'] = [] as TPlan['or'];
 		for (let index = 0; index < plan.or.length; index++) {
@@ -1850,9 +1863,11 @@ export class QueryBuilder<TModel extends { data: any }, TData extends Record<str
 		};
 	}
 
-	private reapplyProtectedMeta<TPlan extends QueryPlan<TData> | AggregatePlan<TData>>(plan: TPlan): TPlan {
-		const ancestor = this.plan.meta?.datastoreAncestor;
-		const readPolicy = datastoreReadPolicyFromMeta(this.plan.meta, 'query Datastore read policy');
+	private reapplyProtectedMeta<TPlan extends QueryPlan<TData> | AggregatePlan<TData>>(
+		plan: TPlan, originalMeta: QueryPlan['meta']
+	): TPlan {
+		const ancestor = originalMeta?.datastoreAncestor;
+		const readPolicy = datastoreReadPolicyFromMeta(originalMeta, 'query Datastore read policy');
 		if (ancestor === undefined && readPolicy === undefined) return plan;
 		const meta = clonePlanMeta(plan.meta) ?? {};
 		if (ancestor !== undefined) {
