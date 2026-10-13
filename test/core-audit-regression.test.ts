@@ -126,3 +126,34 @@ for (const source of ['point', 'query'] as const) {
 		});
 	}
 }
+
+for (const support of ['none', 'equality', 'one-direction', 'ordering'] as const) {
+	test(`codec ordering requires explicit comparison preservation: ${support}`, async () => {
+		class SortRecord extends Model<{ id: number; score: number }> {}
+		const encode = (value: number) => support === 'ordering' ? String(value).padStart(8, '0') : String(value);
+		defineModel<SortRecord['data']>(`audit_codec_sort_${support.replace('-', '_')}`).id('id')
+			.validate((data) => data as SortRecord['data']).fieldCodec('score', {
+				name: 'number-text', encode, decode: Number,
+				...(support === 'none' ? {} : { encodeQuery: encode }),
+				...(support === 'one-direction' ? { queryOperators: ['>'] as const } : {}),
+				...(support === 'ordering' ? { queryOperators: ['<', '>'] as const } : {})
+			}).attach(SortRecord);
+		const store = new MemoryStoreAdapter();
+		const Records = SortRecord.use(createActiveTs({ stores: { default: store } }));
+		await Records.createMany([{ id: 1, score: 2 }, { id: 2, score: 10 }]);
+		if (support === 'ordering') {
+			assert.equal((await Records.query().orderBy('score').limit(1).first())?.data.score, 2);
+			assert.equal((await Records.query().orderBy({ field: 'score', direction: 'desc' }).limit(1).first())?.data.score, 10);
+		} else {
+			await assert.rejects(() => Records.query().orderBy('score').limit(1).load(), /codec.*sort|portable.*order/i);
+			assert.equal(store.stats.query, 0);
+		}
+	});
+}
+
+test('sorting below an encoded codec parent fails before the store query', async () => {
+	const store = new MemoryStoreAdapter();
+	const Records = EncodedProfile.use(createActiveTs({ stores: { default: store } }));
+	await assert.rejects(() => Records.query().orderBy('profile.score').load(), /codec.*sort|exact codec/i);
+	assert.equal(store.stats.query, 0);
+});

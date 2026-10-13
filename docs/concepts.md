@@ -86,6 +86,11 @@ Operators such as `startsWith`, range comparisons, and text or JSON containment
 must be listed in `queryOperators` only when the encoded representation preserves
 that operator's semantics. `encodeQuery` receives `context.operator` for those
 cases.
+Sorting a codec field also requires `encodeQuery` and explicit `<` and `>`
+entries in `queryOperators`, declaring that stored ordering preserves domain
+ordering. Sorting a parent or child path that overlaps a codec is rejected.
+Select and aggregate fallback operations decode the complete codec field before
+reading a selected child path.
 
 ## Context
 

@@ -110,6 +110,16 @@ export function encodeQueryPlanFieldCodecs<TPlan extends QueryPlan>(
 	meta: ResolvedModelMeta,
 	plan: TPlan
 ): TPlan {
+	for (const sort of plan.sort) {
+		const match = findFieldCodecPathMatch(meta, sort.field);
+		if (!match) continue;
+		assertExactFieldCodecPath(meta, sort.field, match, 'sort field');
+		if (!match.codec.encodeQuery || !fieldCodecSupportsOperator(match.codec, '<') || !fieldCodecSupportsOperator(match.codec, '>')) {
+			throw new ActiveTsConfigurationError(
+				`Field codec "${match.codec.name}" on ${meta.name}.${sort.field} does not support portable ordering. Sorting requires encodeQuery and explicit queryOperators '<' and '>' that preserve encoded order.`
+			);
+		}
+	}
 	if (hasFieldCodecQueryOperandsEncoded(plan)) return plan;
 	const encoded = {
 		...plan,
