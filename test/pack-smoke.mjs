@@ -137,6 +137,7 @@ const PUBLIC_SUBPATH_SMOKE_EXPORTS = {
 	'./adapters/store/memory': ['MemoryStoreAdapter'],
 	'./adapters/store/mongodb': ['createMongoStoreAdapter'],
 	'./adapters/store/postgresql': ['createPostgresStoreAdapter'],
+	'./adapters/store/sqlite': ['createSqliteStoreAdapter'],
 	'./adapters/cache/memory': ['MemoryCacheAdapter'],
 	'./adapters/cache/redis-valkey': ['createRedisValkeyCacheAdapter'],
 	'./adapters/search/algolia': ['createAlgoliaSearchAdapter'],
@@ -363,6 +364,7 @@ import {
 	withTestContext
 } from 'active-ts/testing';
 import { createPostgresStoreAdapter, type PostgresStoreOptions } from 'active-ts/adapters/store/postgresql';
+import { createSqliteStoreAdapter, type SqliteStoreOptions } from 'active-ts/adapters/store/sqlite';
 import {
 	createMongoStoreAdapter,
 	type MongoStoreAdapter,
@@ -649,6 +651,9 @@ const integrationContextHandle: IntegrationHarnessContextHandle = await createdI
 await integrationContextHandle.close();
 await createdIntegrationHarness.runStoreContract(storeContractOptions);
 const postgresOptions = { connectionString: 'postgres://localhost/active_ts' } satisfies PostgresStoreOptions;
+const sqliteOptions = { filename: ':memory:' } satisfies SqliteStoreOptions;
+const sqliteStore = await createSqliteStoreAdapter(sqliteOptions);
+await sqliteStore.close();
 const mongoOptions = {
 	dbName: 'active_ts',
 	cacheScope: 'mongodb|cluster=primary|db=active_ts',
@@ -947,6 +952,7 @@ import {
   isDatastoreInt64Id as isDatastoreSubpathInt64Id
 } from 'active-ts/adapters/store/datastore';
 import { createPostgresStoreAdapter } from 'active-ts/adapters/store/postgresql';
+import { createSqliteStoreAdapter } from 'active-ts/adapters/store/sqlite';
 import { createRedisValkeyCacheAdapter } from 'active-ts/adapters/cache/redis-valkey';
 import { createNativeSearchAdapter } from 'active-ts/adapters/search/native';
 
@@ -961,6 +967,17 @@ defineModel('packed_user')
   .validate((input) => input)
   .fieldType('name', 'string')
   .attach(PackedUser);
+
+const sqlite = await createSqliteStoreAdapter();
+try {
+  const sqliteContext = createActiveTs({ stores: { default: sqlite } });
+  await sqlite.schema.apply([sqliteContext.meta(PackedUser)], { mode: 'safe' });
+  const SqliteUser = PackedUser.use(sqliteContext);
+  await SqliteUser.create({ id: 1, name: 'installed-sqlite' });
+  assert.equal((await SqliteUser.find(1).load()).data.name, 'installed-sqlite');
+} finally {
+  await sqlite.close();
+}
 
 const packedInt64Id = datastoreInt64Id('9223372036854775807');
 const packedSubpathInt64Id = datastoreSubpathInt64Id('-9223372036854775808');

@@ -262,6 +262,15 @@ local test library. MongoDB, PostgreSQL, Redis/Valkey, and Elasticsearch fit the
 same harness shape with Testcontainers, Docker Compose, or already-running CI
 services.
 
+The SQLite adapter is tested against the real `node:sqlite` engine in the
+normal unit suite, including temporary-file persistence, queries, aggregates,
+indexes and transaction lifetimes. Its shared store contract also runs in the
+backend integration and release workflows. To run it without external services:
+
+```sh
+ACTIVE_TS_INTEGRATION_TARGETS=sqlite pnpm test:integration:backends
+```
+
 The repository backend smoke runner also accepts Google emulator targets:
 
 ```sh
@@ -353,8 +362,8 @@ pnpm typecheck
 pnpm test
 ```
 
-The default suite uses memory adapters and fake SDK clients, so it is fast and
-does not require external services.
+The default suite uses memory adapters, the real built-in SQLite engine and
+fake SDK clients. It does not require external services.
 
 README and docs TypeScript/JavaScript fences must declare
 `doc-test=typecheck` for standalone examples or `doc-test=fragment` for

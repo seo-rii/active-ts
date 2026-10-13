@@ -12,6 +12,7 @@ an `ActiveContext`; models select adapters by metadata or by context defaults.
 | Firestore | `active-ts/adapters/store/firestore` | `@google-cloud/firestore` | validates paths; optimizes `count`; numeric aggregates require validated scans |
 | MongoDB | `active-ts/adapters/store/mongodb` | `mongodb` | validates names; pipelines count/sum/avg |
 | PostgreSQL | `active-ts/adapters/store/postgresql` | `pg` | stores row data in JSONB; optimizes aggregates with SQL |
+| SQLite | `active-ts/adapters/store/sqlite` | built-in `node:sqlite` | persistent files or memory; SQL queries, aggregates, unique indexes and transactions |
 
 ### Portable Store Capability Matrix
 
@@ -22,23 +23,23 @@ a record of which services a particular test run exercised.
 See [capability evidence](testing.md#capability-evidence) for the shared checks
 and the distinction between support and rejection coverage.
 
-| Portable feature | Memory | PostgreSQL | MongoDB | Datastore | Firestore |
-| --- | --- | --- | --- | --- | --- |
-| `query().select()` | Yes | **No** | Yes | Yes | Yes |
-| Portable cursor | Yes | No | No | Yes, outside transactions | No |
-| Offset | Yes | Yes | Yes | Yes | Yes |
-| OR branches | Yes | Yes | Yes | No | No |
-| Nested field paths and numeric comparisons | Yes | Yes | Yes | Yes | Yes |
-| `arrayContains` | Yes | No | Yes | No | Yes |
-| `textContains` / `jsonContains` | Yes | No | No | No | No |
-| `startsWith` | Yes | Yes | Yes | No | No |
-| Missing fields match `isNull` | Yes | Yes | Yes | Yes | No |
-| Aggregate helpers | Yes | Yes | Yes | Conditional | Yes |
-| Transactions | Yes | Requires pool `connect()` | Requires client `startSession()` | Requires SDK `transaction()` | Yes |
-| Transaction point-read conflict detection | Yes | **No** | With transactions | With transactions | Yes |
-| Optimistic `expectedVersion` writes | Yes | Yes | Yes | No | No |
-| Unique schema indexes | No | Yes | Yes | No | No |
-| Trusted native query payloads | No | Yes | Yes | Yes | Yes |
+| Portable feature | Memory | PostgreSQL | MongoDB | Datastore | Firestore | SQLite |
+| --- | --- | --- | --- | --- | --- | --- |
+| `query().select()` | Yes | **No** | Yes | Yes | Yes | Yes |
+| Portable cursor | Yes | No | No | Yes, outside transactions | No | No |
+| Offset | Yes | Yes | Yes | Yes | Yes | Yes |
+| OR branches | Yes | Yes | Yes | No | No | Yes |
+| Nested field paths and numeric comparisons | Yes | Yes | Yes | Yes | Yes | Yes |
+| `arrayContains` | Yes | No | Yes | No | Yes | No |
+| `textContains` / `jsonContains` | Yes | No | No | No | No | No |
+| `startsWith` | Yes | Yes | Yes | No | No | Yes |
+| Missing fields match `isNull` | Yes | Yes | Yes | Yes | No | Yes |
+| Aggregate helpers | Yes | Yes | Yes | Conditional | Yes | Yes; scalar metadata for min/max |
+| Transactions | Yes | Requires pool `connect()` | Requires client `startSession()` | Requires SDK `transaction()` | Yes | Yes |
+| Transaction point-read conflict detection | Yes | **No** | With transactions | With transactions | Yes | No |
+| Optimistic `expectedVersion` writes | Yes | Yes | Yes | No | No | Yes |
+| Unique schema indexes | No | Yes | Yes | No | No | Yes |
+| Trusted native query payloads | No | Yes | Yes | Yes | Yes | No |
 
 Capability omission defaults to unsupported. The legacy ambiguous `contains`
 operator is unsupported by every built-in store; use the explicit containment
@@ -716,6 +717,65 @@ timeouts. Firestore SDK transactions do not expose portable savepoints, so
 `readOnly`, and `readTime`; active-ts `readOnly` is merged
 into those SDK options and rejects writes before reaching the SDK transaction
 object.
+
+## SQLite
+
+`createSqliteStoreAdapter()` uses Node's built-in
+[`node:sqlite`](https://nodejs.org/download/release/v22.13.0/docs/api/sqlite.html)
+module. Use Node.js 22.13 or newer; no external SQLite driver is needed. The
+Node 22 API remains experimental. The default database is `:memory:`; pass a
+filename for durable storage.
+
+```ts doc-test=typecheck
+import { createActiveTs, defineModel, Model } from 'active-ts';
+import { createSqliteStoreAdapter } from 'active-ts/adapters/store/sqlite';
+
+class Note extends Model<{ id: number; title: string }> {}
+defineModel<Note['data']>('notes').id('id')
+  .validate(data => data as Note['data']).attach(Note);
+
+const store = await createSqliteStoreAdapter({ filename: 'notes.sqlite' });
+try {
+  const context = createActiveTs({ stores: { default: store } });
+  await store.schema!.apply([context.meta(Note)], { mode: 'safe' });
+  const Notes = Note.use(context);
+  await Notes.create({ id: 1, title: 'First note' });
+  console.log((await Notes.find(1).load())?.data.title);
+} finally {
+  await store.close();
+}
+```
+
+You can inject an existing `DatabaseSync` with `{ database }` instead of a
+filename. The adapter closes a database it created; the caller owns an injected
+database. SQLite calls are synchronous inside the async StoreAdapter API, so
+large queries can block the Node event loop.
+Default file cache scopes include the host and physical file identity; injected
+connections share a scope only when they share the same `DatabaseSync` object.
+Set an explicit `cacheScope` when coordinating independently injected handles
+or a shared file across hosts.
+
+Rows use a typed ID key and a JSON document. SQL performs filtering, ordering,
+pagination and aggregation; no implicit full-result JavaScript scan is used.
+Declare scalar field metadata for `min`/`max`. Unique indexes, optimistic version
+checks, nested field predicates and portable projections are supported. Cursor,
+containment operators, native payloads and Datastore read policies reject.
+Field path segments containing quotes, backslashes or control characters, and
+numeric-only segments, also reject. Unique indexed values must be scalars;
+explicit null participates in uniqueness, while missing values can repeat.
+Create tables and indexes with `store.schema.apply()`. Schema health checks
+require the adapter's exact table/index definitions, including JSON validation
+and strict tables; independently authored equivalent DDL may be rejected.
+
+Transactions use `BEGIN IMMEDIATE` and serialize access to a shared connection.
+Unrelated root operations wait for the active transaction; using that root
+handle from its own callback rejects. Use the supplied transaction handle,
+which closes when the callback settles. Savepoints isolate child callbacks.
+The supported options are `readOnly` and `isolation: 'serializable'`; other
+isolation levels, `timeoutMs` and `native` reject. No application callback is
+retried automatically, and the adapter does not advertise portable concurrent
+point-read conflict detection. File locking can still reject competing writers
+on other connections.
 
 ## Cache Adapters
 

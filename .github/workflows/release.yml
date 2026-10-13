@@ -69,7 +69,7 @@ jobs:
       FIRESTORE_EMULATOR_HOST: 127.0.0.1:8082
       GOOGLE_CLOUD_PROJECT: active-ts-emulator
       GCLOUD_PROJECT: active-ts-emulator
-      ACTIVE_TS_INTEGRATION_TARGETS: postgres,mongodb,redis,elasticsearch,datastore,firestore
+      ACTIVE_TS_INTEGRATION_TARGETS: postgres,mongodb,redis,elasticsearch,datastore,firestore,sqlite
     permissions:
       contents: read
     steps:
