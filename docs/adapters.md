@@ -13,6 +13,67 @@ an `ActiveContext`; models select adapters by metadata or by context defaults.
 | MongoDB | `active-ts/adapters/store/mongodb` | `mongodb` | validates names; pipelines count/sum/avg |
 | PostgreSQL | `active-ts/adapters/store/postgresql` | `pg` | stores row data in JSONB; optimizes aggregates with SQL |
 
+### Portable Store Capability Matrix
+
+This table describes the built-in adapters' root-handle capabilities. **Yes**
+means an adapter advertises the portable contract; **No** means that contract is
+unavailable. Requests for unsupported query features are rejected. This is not
+a record of which services a particular test run exercised.
+See [capability evidence](testing.md#capability-evidence) for the shared checks
+and the distinction between support and rejection coverage.
+
+| Portable feature | Memory | PostgreSQL | MongoDB | Datastore | Firestore |
+| --- | --- | --- | --- | --- | --- |
+| `query().select()` | Yes | **No** | Yes | Yes | Yes |
+| Portable cursor | Yes | No | No | Yes, outside transactions | No |
+| Offset | Yes | Yes | Yes | Yes | Yes |
+| OR branches | Yes | Yes | Yes | No | No |
+| Nested field paths and numeric comparisons | Yes | Yes | Yes | Yes | Yes |
+| `arrayContains` | Yes | No | Yes | No | Yes |
+| `textContains` / `jsonContains` | Yes | No | No | No | No |
+| `startsWith` | Yes | Yes | Yes | No | No |
+| Missing fields match `isNull` | Yes | Yes | Yes | Yes | No |
+| Aggregate helpers | Yes | Yes | Yes | Conditional | Yes |
+| Transactions | Yes | Requires pool `connect()` | Requires client `startSession()` | Requires SDK `transaction()` | Yes |
+| Transaction point-read conflict detection | Yes | **No** | With transactions | With transactions | Yes |
+| Optimistic `expectedVersion` writes | Yes | Yes | Yes | No | No |
+| Unique schema indexes | No | Yes | Yes | No | No |
+| Trusted native query payloads | No | Yes | Yes | Yes | Yes |
+
+Capability omission defaults to unsupported. The legacy ambiguous `contains`
+operator is unsupported by every built-in store; use the explicit containment
+operators above. Datastore alone supports Datastore ancestor and read-policy
+metadata. Its aggregate capability depends on SDK aggregation support or an
+explicitly enabled scan fallback; a successful fallback is not evidence of a
+bounded backend scan. See [aggregate optimization](#aggregate-optimization).
+
+PostgreSQL portable projection is deliberately unsupported in this version.
+Both model `query().select()` and a direct store query with `plan.select` must
+reject; do not remove the selection or return full rows as a projection
+fallback. A rejection test establishes this boundary, not SQL partial-model
+support. An application Typed View can still project a full loaded model into
+a DTO, but that does not reduce the columns or JSONB data fetched by the store.
+
+Transaction handles have a narrower surface than the root table. All hide
+schema and nested `transaction()` methods. Memory and PostgreSQL advertise
+`savepoint: true` on transaction handles, while their root handles advertise
+`savepoint: false`. MongoDB and Firestore transaction queries reject native
+payloads; Firestore also disables transaction aggregates. Datastore disables
+portable cursors and read-policy options inside transactions. Read-only
+`ActiveContext` transaction handles reject writes and native reads. Low-level
+PostgreSQL read-only transactions can still execute native SELECT queries,
+subject to PostgreSQL's SQL read-only restrictions. See the
+[transaction option and savepoint table](extensions.md#transactions) for
+backend-specific options, retry behavior, and lifetime rules.
+
+`transactionConflictDetection` and `optimisticLock` are separate contracts.
+PostgreSQL's ordinary transaction support does not promise to detect a stale
+application read followed by an unversioned write. Use explicit version checks
+or an appropriate application-owned isolation/locking strategy. Memory's
+conflict checks are useful for tests and do not establish PostgreSQL isolation
+behavior. Likewise, query limits bound returned rows; they do not bound SQL
+statement count, scanned rows, callback work, or per-parent top-k cost.
+
 PostgreSQL model and index identifiers still use active-ts portable schema
 identifier rules. The adapter-level `schema` option is a PostgreSQL schema
 identifier and is SQL-quoted by the adapter, so it may use PostgreSQL quoted
