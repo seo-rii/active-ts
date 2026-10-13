@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { runPostgresOutcomeContract } from './postgres-outcome.mjs';
 import { runPostgresConcurrencyContract } from './postgres-concurrency.mjs';
 import { runPostgresSchemaContract } from './postgres-schema.mjs';
+import { runMongoAggregateParity, runFirestoreAggregateParity } from './aggregate-parity.mjs';
 import {
 	StoreOutboxAdapter,
 	createActiveTs,
@@ -339,6 +340,7 @@ if (targets.has('mongodb')) {
 			.attach(IntegrationMongoNativeRecord);
 		const context = createActiveTs({ stores: { default: adapter } });
 		const meta = context.meta(IntegrationMongoNativeRecord);
+		await runMongoAggregateParity({ adapter, meta });
 		try {
 			await adapter.create(meta, 1, { id: 1, handle: 'native-one', score: 11 });
 			const native = await adapter.query(meta, {
@@ -1268,6 +1270,7 @@ if (targets.has('firestore')) {
 		const aggregateMeta = context.meta(IntegrationFirestoreAggregateRecord);
 		const bulkMeta = context.meta(IntegrationFirestoreBulkRecord);
 		const BulkRecord = IntegrationFirestoreBulkRecord.use(context);
+		await runFirestoreAggregateParity({ adapter, client, aggregateField: AggregateField, meta: aggregateMeta });
 		try {
 			await adapter.create(nativeMeta, 1, { id: 1, handle: 'native-one', score: 11 });
 			const native = await adapter.query(nativeMeta, {
