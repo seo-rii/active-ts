@@ -271,6 +271,19 @@ backend integration and release workflows. To run it without external services:
 ACTIVE_TS_INTEGRATION_TARGETS=sqlite pnpm test:integration:backends
 ```
 
+Redis and Valkey share `createRedisValkeyCacheAdapter()`, but run as separate
+integration targets against separate servers. To exercise a running Valkey
+instance independently:
+
+```sh
+VALKEY_URL=redis://127.0.0.1:6380 \
+ACTIVE_TS_INTEGRATION_TARGETS=valkey pnpm test:integration:backends
+```
+
+The Valkey target requires `INFO server` access to verify the server identity,
+then runs the shared cache contract using a random key prefix. Connection
+failures stop after a five-second connection timeout without automatic retries.
+
 The repository backend smoke runner also accepts Google emulator targets:
 
 ```sh
@@ -334,7 +347,7 @@ query scan costs require their own designs and tests.
 
 ### Backend Coverage
 
-The integration and release workflows require all seven configured targets to
+The integration and release workflows require all eight configured targets to
 finish; the runner rejects unknown targets and fails if any requested target is
 missing from the completed set. Backend coverage is not interchangeable:
 
@@ -347,7 +360,7 @@ missing from the completed set. Backend coverage is not interchangeable:
 | Datastore | Official Google emulator in integration/release CI | Shared store/native paths, namespace/ancestor/key identity, ID repair, read policies, aggregates and Elasticsearch/outbox integration. Historical snapshots require a real service; emulator success does not establish production behavior. |
 | Firestore | Official Google emulator in integration/release CI | Shared store/native paths, bulk rollback/codecs, typed min/max, sparse sum/avg/count, numeric validation and explicit aggregate scan opt-in. Production behavior is not established by emulator tests. |
 | Redis 7 | Real server in integration/release CI | Shared cache contract. |
-| Valkey | Redis-compatible adapter tests only | No Valkey server target currently runs in CI. Redis success is not a Valkey execution result. |
+| Valkey 9.1.2 | Separate real server in integration/release CI | Shared cache contract, including TTL and versioned writes. `INFO server` must identify Valkey before cache operations; Redis cannot satisfy this target. |
 | Elasticsearch 8.15.3 | Real server in integration/release CI | Shared search/native paths and Datastore outbox integration. |
 | Algolia | Injected SDK clients in the default suite | Shared search behavior; no live Algolia integration target. |
 
@@ -406,7 +419,7 @@ pnpm test:integration:backends
 The GitHub `Backend Integration` workflow runs this script on schedule, manual
 dispatch, main pushes, and pull requests that touch adapter, core, testing harness,
 integration, package, or workflow files. It uses PostgreSQL, MongoDB,
-Redis, and Elasticsearch service containers, then starts Datastore and
+Redis, Valkey, and Elasticsearch service containers, then starts Datastore and
 Firestore emulators with Google Cloud CLI. The workflow pins the Elasticsearch
 client to the same major as its service container, pins the Google Cloud SDK
 used for emulator startup, waits for Datastore and Firestore SDK probes before
