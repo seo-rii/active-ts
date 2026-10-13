@@ -47,6 +47,15 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+      valkey:
+        image: valkey/valkey:9.1.2-alpine@sha256:48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11
+        ports:
+          - 6380:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
       elasticsearch:
         image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3@sha256:01c1732062b4a846c5ca687b0094b89bad0bfed00c6d71626db32fb8f3131a78
         env:
@@ -64,12 +73,13 @@ jobs:
       POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/active_ts
       MONGODB_URL: mongodb://127.0.0.1:27017/?replicaSet=active-ts-rs
       REDIS_URL: redis://127.0.0.1:6379
+      VALKEY_URL: redis://127.0.0.1:6380
       ELASTICSEARCH_URL: http://127.0.0.1:9200
       DATASTORE_EMULATOR_HOST: 127.0.0.1:8081
       FIRESTORE_EMULATOR_HOST: 127.0.0.1:8082
       GOOGLE_CLOUD_PROJECT: active-ts-emulator
       GCLOUD_PROJECT: active-ts-emulator
-      ACTIVE_TS_INTEGRATION_TARGETS: postgres,mongodb,redis,elasticsearch,datastore,firestore,sqlite
+      ACTIVE_TS_INTEGRATION_TARGETS: postgres,mongodb,redis,elasticsearch,datastore,firestore,sqlite,valkey
     permissions:
       contents: read
     steps:

@@ -39,7 +39,7 @@ import {
 	storeTrustsDatastoreEntityKeyRows
 } from '../../build/src/core/store-options.js';
 
-const KNOWN_TARGETS = ['postgres', 'mongodb', 'redis', 'elasticsearch', 'datastore', 'firestore', 'sqlite'];
+const KNOWN_TARGETS = ['postgres', 'mongodb', 'redis', 'valkey', 'elasticsearch', 'datastore', 'firestore', 'sqlite'];
 const requestedTargets = (process.env.ACTIVE_TS_INTEGRATION_TARGETS ?? 'postgres,mongodb,redis,elasticsearch')
 	.split(',')
 	.map((item) => item.trim())
@@ -432,6 +432,82 @@ if (targets.has('redis')) {
 		await runCacheAdapterContract(cache);
 		ran++;
 		ranTargets.push('redis');
+	} finally {
+		await client.quit().catch(() => undefined);
+	}
+}
+
+if (targets.has('valkey')) {
+	const { createClient } = await import('redis');
+	const client = createClient({
+		url: process.env.VALKEY_URL ?? 'redis://127.0.0.1:6380',
+		socket: { reconnectStrategy: false, connectTimeout: 5_000 }
+	});
+	const prefix = `active-ts:valkey:${randomUUID()}:`;
+	try {
+		await client.connect();
+		const serverInfo = await client.sendCommand(['INFO', 'server']);
+		assert.equal(typeof serverInfo, 'string', 'Valkey INFO server must return text.');
+		const serverName = /^server_name:([^\r\n]+)\r?$/m.exec(serverInfo)?.[1];
+		assert.equal(serverName, 'valkey', 'The valkey integration target requires an actual Valkey server.');
+		const serverVersion = /^valkey_version:([^\r\n]+)\r?$/m.exec(serverInfo)?.[1];
+		assert.ok(serverVersion, 'The valkey integration target requires Valkey version information.');
+		const cache = await createRedisValkeyCacheAdapter({ client, prefix });
+		await runCacheAdapterContract(cache);
+		const peerClient = client.duplicate();
+		const probeKeys = ['version-invalidated', 'version-unconditional', 'version-ttl'];
+		const [invalidatedKey, unconditionalKey, ttlKey] = probeKeys;
+		try {
+			await peerClient.connect();
+			const peer = await createRedisValkeyCacheAdapter({ client: peerClient, prefix });
+			for (const adapter of [cache, peer]) {
+				for (const operation of ['getManyVersioned', 'setManyVersioned', 'invalidateMany']) {
+					assert.equal(typeof adapter[operation], 'function', `Valkey cache must support ${operation}.`);
+				}
+			}
+			await cache.setMany([[invalidatedKey, 'before invalidation'], [unconditionalKey, 'before replacement']]);
+			const [beforeInvalidation, beforeReplacement] = await cache.getManyVersioned([invalidatedKey, unconditionalKey]);
+			assert.deepEqual([beforeInvalidation.value, beforeReplacement.value], ['before invalidation', 'before replacement']);
+
+			await peer.invalidateMany([invalidatedKey]);
+			assert.deepEqual(await cache.setManyVersioned([[invalidatedKey, 'stale refill', beforeInvalidation.version]]), [false]);
+			assert.deepEqual(await peer.getMany([invalidatedKey]), [undefined]);
+			const [afterInvalidation] = await peer.getManyVersioned([invalidatedKey]);
+			assert.notEqual(afterInvalidation.version, beforeInvalidation.version);
+			assert.deepEqual(await cache.setManyVersioned([[invalidatedKey, 'fresh refill', afterInvalidation.version]]), [true]);
+			assert.deepEqual(await peer.getMany([invalidatedKey]), ['fresh refill']);
+
+			await peer.setMany([[unconditionalKey, 'unconditional replacement']]);
+			const [afterReplacement] = await cache.getManyVersioned([unconditionalKey]);
+			assert.notEqual(afterReplacement.version, beforeReplacement.version);
+			assert.deepEqual(await cache.setManyVersioned([[unconditionalKey, 'stale overwrite', beforeReplacement.version]]), [false]);
+			assert.deepEqual(await peer.getMany([unconditionalKey]), ['unconditional replacement']);
+
+			const [emptyTtl] = await cache.getManyVersioned([ttlKey]);
+			assert.equal(emptyTtl.value, undefined);
+			assert.deepEqual(await cache.setManyVersioned([[ttlKey, 'temporary value', emptyTtl.version]], { ttl: 1 }), [true]);
+			const [beforeExpiry] = await peer.getManyVersioned([ttlKey]);
+			assert.equal(beforeExpiry.value, 'temporary value');
+			await new Promise((resolve) => setTimeout(resolve, 1_100));
+			assert.deepEqual(await cache.getMany([ttlKey]), [undefined]);
+			// Do not read a new version first: the stale CAS must reject even when
+			// the previous value and its version key have both expired in Valkey.
+			assert.deepEqual(await peer.setManyVersioned([[ttlKey, 'expired refill', beforeExpiry.version]]), [false]);
+			assert.deepEqual(await cache.getMany([ttlKey]), [undefined]);
+			const [afterExpiry] = await cache.getManyVersioned([ttlKey]);
+			assert.notEqual(afterExpiry.version, beforeExpiry.version);
+			assert.deepEqual(await peer.setManyVersioned([[ttlKey, 'fresh after expiry', afterExpiry.version]]), [true]);
+			assert.deepEqual(await cache.getMany([ttlKey]), ['fresh after expiry']);
+		} finally {
+			try {
+				await cache.deleteMany(probeKeys);
+			} finally {
+				await peerClient.quit().catch(() => undefined);
+			}
+		}
+		console.log(`Valkey ${serverVersion} cache contract passed: shared cache operations, cross-connection invalidation, versioned writes and TTL expiry.`);
+		ran++;
+		ranTargets.push('valkey');
 	} finally {
 		await client.quit().catch(() => undefined);
 	}
