@@ -25,6 +25,7 @@ import {
 import { createRedisValkeyCacheAdapter } from '../../build/src/adapters/cache/redis-valkey.js';
 import { createElasticsearchSearchAdapter } from '../../build/src/adapters/search/elasticsearch.js';
 import { createMeilisearchSearchAdapter } from '../../build/src/adapters/search/meilisearch.js';
+import { createOpenSearchSearchAdapter } from '../../build/src/adapters/search/opensearch.js';
 import {
 	applyDatastoreIdRepairManifest,
 	createDatastoreIdRepairManifest,
@@ -41,7 +42,7 @@ import {
 	storeTrustsDatastoreEntityKeyRows
 } from '../../build/src/core/store-options.js';
 
-const KNOWN_TARGETS = ['postgres', 'mongodb', 'redis', 'valkey', 'elasticsearch', 'meilisearch', 'datastore', 'firestore', 'sqlite'];
+const KNOWN_TARGETS = ['postgres', 'mongodb', 'redis', 'valkey', 'elasticsearch', 'meilisearch', 'opensearch', 'datastore', 'firestore', 'sqlite'];
 const requestedTargets = (process.env.ACTIVE_TS_INTEGRATION_TARGETS ?? 'postgres,mongodb,redis,elasticsearch')
 	.split(',')
 	.map((item) => item.trim())
@@ -1498,6 +1499,86 @@ if (targets.has('meilisearch')) {
 	if (meiliError) errors.unshift(meiliError);
 	if (errors.length === 1) throw errors[0];
 	if (errors.length > 1) throw new AggregateError(errors, 'Meilisearch smoke or index cleanup failed.');
+}
+
+if (targets.has('opensearch')) {
+	const { Client } = await import('@opensearch-project/opensearch');
+	const client = new Client({ node: process.env.OPENSEARCH_URL ?? 'http://127.0.0.1:9201',
+		requestTimeout: 5_000, maxRetries: 0 });
+	const prefix = `active_ts_os_${randomUUID().replace(/-/g, '')}_`;
+	const indexes = new Set();
+	const prepareModel = async (model) => {
+		const name = `${prefix}${model.name}`;
+		if (indexes.has(name)) return;
+		await client.indices.create({ index: name, body: {
+			settings: { number_of_shards: 1, number_of_replicas: 0 },
+			// Keyword indexing accepts both logical ID types; _source retains the
+			// original number/string value. Dynamic numeric mappings would reject
+			// later nonnumeric custom string IDs.
+			mappings: { properties: { [model.idField]: { type: 'keyword' }, score: { type: 'integer' } } }
+		} });
+		indexes.add(name);
+	};
+	let openSearchError;
+	try {
+		const info = (await client.info()).body;
+		assert.equal(info.version.distribution, 'opensearch', 'OpenSearch target requires an actual OpenSearch server.');
+		assert.equal(info.version.number, '3.9.0', 'OpenSearch smoke must run the pinned server version.');
+		// Immediate refresh is a test fixture choice, avoiding a refresh-interval
+		// sleep after each mutation. Every request still uses the real SDK/server.
+		const adapter = await createOpenSearchSearchAdapter({ indexPrefix: prefix, client: {
+			search: (request) => client.search(request),
+			index: (request) => client.index({ ...request, refresh: true }),
+			delete: (request) => client.delete({ ...request, refresh: true })
+		} });
+		const contractAdapter = { ...adapter, schema: { ...adapter.schema, apply: async (models, options) => {
+			const plan = await adapter.schema.apply(models, options);
+			for (const model of models) await prepareModel(model);
+			return plan;
+		} } };
+		await runSearchAdapterContract(contractAdapter, {
+			settleMs: 1_000,
+			pollIntervalMs: 20,
+			nativeProbe: async ({ adapter, model }) => {
+				try {
+					await adapter.index(model, 900, { id: 900, title: 'nativefilterneedle', score: 90 });
+					await adapter.index(model, 901, { id: 901, title: 'nativefilterneedle', score: 10 });
+					const nativeOnlyModel = { ...model, searchIndexes: [] };
+					const result = await adapter.search(nativeOnlyModel, 'ignored', {
+						native: { query: { range: { score: { gte: 80 } } } }
+					});
+					assert.deepEqual(result.list.map((row) => row.id), [900]);
+				} finally {
+					await adapter.delete(model, 900);
+					await adapter.delete(model, 901);
+				}
+			}
+		});
+		class IntegrationOpenSearchFuzzRecord extends Model {}
+		defineModel({ name: 'integration_opensearch_fuzz', search: 'opensearch' })
+			.id('slug')
+			.validate((input) => input)
+			.search('opensearch', ['title', 'subtitle', 'score'])
+			.attach(IntegrationOpenSearchFuzzRecord);
+		const context = createActiveTs({ stores: { default: new MemoryStoreAdapter() },
+			search: { opensearch: adapter }, defaultSearch: 'opensearch' });
+		await runSearchAdapterFuzz({ adapter, backend: 'opensearch', meta: context.meta(IntegrationOpenSearchFuzzRecord),
+			prepareModel, settleMs: 0,
+			nativePageOptions: ({ offset, limit }) => ({ native: {
+				query: { match_all: {} }, from: offset, size: limit, sort: ['_doc']
+			} }) });
+		console.log(`OpenSearch ${info.version.number}: real SDK shared search/native contract and seeded revision/tombstone fuzz passed.`);
+		ran++;
+		ranTargets.push('opensearch');
+	} catch (error) {
+		openSearchError = error;
+	}
+	const cleanup = await Promise.allSettled([...indexes].map((name) => client.indices.delete({ index: name })));
+	const errors = cleanup.filter((result) => result.status === 'rejected').map((result) => result.reason);
+	try { await client.close(); } catch (error) { errors.push(error); }
+	if (openSearchError) errors.unshift(openSearchError);
+	if (errors.length === 1) throw errors[0];
+	if (errors.length > 1) throw new AggregateError(errors, 'OpenSearch smoke or index cleanup failed.');
 }
 
 if (targets.has('elasticsearch')) {

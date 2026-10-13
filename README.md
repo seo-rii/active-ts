@@ -21,7 +21,7 @@ expected to move while real applications exercise the adapter contracts.
 - pluggable store adapters for Datastore, Firestore, MongoDB, PostgreSQL, SQLite, and
   in-memory tests
 - Redis/Valkey cache adapter with batch reads and negative cache entries
-- search adapters for native store search, Algolia, Elasticsearch, Meilisearch, and memory
+- search adapters for native store search, Algolia, Elasticsearch, Meilisearch, OpenSearch, and memory
 - explicit `include()` relation loading with warned lazy relation fallback
 - lifecycle hooks and plugins for validation, read/write, query, search,
   aggregate, cache, and relation-loading events

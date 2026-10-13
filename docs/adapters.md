@@ -823,12 +823,14 @@ const redisWithCodec = await createRedisValkeyCacheAdapter({
 | Native | `active-ts/adapters/search/native` | none | maps search fields to store `textContains` queries |
 | Algolia | `active-ts/adapters/search/algolia` | `algoliasearch` | validates writes; revision-ordered writes are unsupported |
 | Elasticsearch | `active-ts/adapters/search/elasticsearch` | `@elastic/elasticsearch` | supports persistent revision writes and delete tombstones |
+| OpenSearch | `active-ts/adapters/search/opensearch` | `@opensearch-project/opensearch` | supports persistent revision writes and delete tombstones through the OpenSearch SDK |
 | Meilisearch | `active-ts/adapters/search/meilisearch` | `meilisearch` | waits for successful indexing tasks; revision-ordered writes are unsupported |
 
 Supported peer ranges:
 
 - `algoliasearch`: `^5.0.0`
 - `@elastic/elasticsearch`: `^8.0.0`
+- `@opensearch-project/opensearch`: `^3.9.0`
 - `meilisearch`: `^0.62.0` (Node.js 22.12+ on Node 22)
 
 Example:
@@ -862,11 +864,11 @@ await search.delete(meta, 1, { revision: 43 });
 For a given physical document identity, only a revision strictly greater than
 the retained revision may change state. Older and equal writes resolve as
 successful no-ops. A revisioned delete must retain its revision indefinitely so
-a delayed lower-revision index cannot recreate the document. Elasticsearch
-implements this with external versions and hidden tombstone documents; normal
+a delayed lower-revision index cannot recreate the document. Elasticsearch and OpenSearch
+implement this with external versions and hidden tombstone documents; normal
 search results exclude those tombstones. Memory retains revisions until
 `clear()`. Adapters without the capability reject revision options instead of
-silently weakening the contract. Elasticsearch indexes with strict mappings
+silently weakening the contract. Elasticsearch and OpenSearch indexes with strict mappings
 must allow the reserved `active_ts_deleted` boolean field. Index replacement
 must preserve tombstones, or stop search writers and replay authoritative rows
 with newer revisions before accepting delayed traffic; deleting the target
@@ -874,6 +876,43 @@ index also deletes its retained fences. `requireRevisionWrites: true` rejects
 direct index and delete calls without a revision. Enable it only after stopping
 or draining older workers, and keep it enabled once all writers share the same
 durable revision allocator.
+
+### OpenSearch
+
+Install `@opensearch-project/opensearch` alongside active-ts. This adapter uses
+the OpenSearch JavaScript SDK and its request/response envelopes.
+
+```ts doc-test=typecheck
+import { createOpenSearchSearchAdapter } from 'active-ts/adapters/search/opensearch';
+
+const search = await createOpenSearchSearchAdapter({
+  node: 'http://127.0.0.1:9201',
+  indexPrefix: 'app-',
+  requireRevisionWrites: true
+});
+```
+
+Declare indexes with `.search('opensearch', ['title'])`. Schema operations return
+manual mapping plans; provision `${indexPrefix}${model.name}` with OpenSearch
+tooling. Review mappings for the declared fields and logical ID. A `keyword`
+ID mapping supports both numeric and string logical IDs without dynamic numeric
+mapping rejecting later string values. Strict mappings must also allow the
+reserved `active_ts_deleted` boolean. The adapter preserves the original JSON
+ID type and keeps numeric and string document identities distinct.
+
+Portable full-text search and projection are supported. Portable `where` and
+cursor options reject; use native OpenSearch filters and pagination. Native
+`query`, `_source`, `size`, `from`, and `search_after` cannot override a model's
+declared portable search fields. Use native-only model metadata for a complete
+native query body, and omit portable `limit` when native pagination owns size.
+Search visibility follows OpenSearch refresh behavior.
+
+Revision writes use external versions, and revisioned deletes retain hidden
+tombstones. Older/equal revisions are successful no-ops. Keep the tombstones
+and use one durable, monotonically increasing revision allocator for all
+writers; `requireRevisionWrites` prevents unversioned calls from bypassing the
+fence. This capability allows normal outbox synchronization without enabling
+unsafe unfenced writes.
 
 ### Meilisearch
 

@@ -143,6 +143,7 @@ const PUBLIC_SUBPATH_SMOKE_EXPORTS = {
 	'./adapters/search/algolia': ['createAlgoliaSearchAdapter'],
 	'./adapters/search/elasticsearch': ['createElasticsearchSearchAdapter'],
 	'./adapters/search/meilisearch': ['createMeilisearchSearchAdapter'],
+	'./adapters/search/opensearch': ['createOpenSearchSearchAdapter'],
 	'./adapters/search/memory': ['MemorySearchAdapter'],
 	'./adapters/search/native': ['createNativeSearchAdapter'],
 	'./testing': [
@@ -415,6 +416,7 @@ import { createRedisValkeyCacheAdapter, type RedisValkeyOptions } from 'active-t
 import type { AlgoliaOptions } from 'active-ts/adapters/search/algolia';
 import type { ElasticsearchOptions } from 'active-ts/adapters/search/elasticsearch';
 import type { MeilisearchOptions } from 'active-ts/adapters/search/meilisearch';
+import type { OpenSearchOptions } from 'active-ts/adapters/search/opensearch';
 import { createNativeSearchAdapter } from 'active-ts/adapters/search/native';
 type PackedUserData = { id: EntityId; name: string };
 type PackedCommentData = { id: EntityId; parentId: EntityId; body: string; updatedAt: number };
@@ -801,6 +803,7 @@ const meilisearchOptions = {
 	taskTimeoutMs: 5_000,
 	taskIntervalMs: 50
 } satisfies MeilisearchOptions;
+const opensearchOptions = { node: 'http://127.0.0.1:9201', indexPrefix: 'active-ts-', requireRevisionWrites: true } satisfies OpenSearchOptions;
 const noInternalTracker: 'trackTransactionModelInstance' extends keyof ActiveContext ? never : true = true;
 const noInternalStore: 'internalStore' extends keyof ActiveContext ? never : true = true;
 const noInternalCache: 'internalCache' extends keyof ActiveContext ? never : true = true;
@@ -1269,7 +1272,8 @@ const noPeerFactoryValidationCases = [
   ['active-ts/adapters/cache/redis-valkey', 'createRedisValkeyCacheAdapter', { url: 1 }, /url/],
   ['active-ts/adapters/search/algolia', 'createAlgoliaSearchAdapter', {}, /appId/],
   ['active-ts/adapters/search/elasticsearch', 'createElasticsearchSearchAdapter', {}, /node/],
-  ['active-ts/adapters/search/meilisearch', 'createMeilisearchSearchAdapter', {}, /host/]
+  ['active-ts/adapters/search/meilisearch', 'createMeilisearchSearchAdapter', {}, /host/],
+  ['active-ts/adapters/search/opensearch', 'createOpenSearchSearchAdapter', {}, /node/]
 ];
 for (const [specifier, factoryName, options, message] of noPeerFactoryValidationCases) {
   const mod = await import(specifier);
