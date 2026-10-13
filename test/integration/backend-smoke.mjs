@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { runPostgresOutcomeContract } from './postgres-outcome.mjs';
 import { runPostgresConcurrencyContract } from './postgres-concurrency.mjs';
+import { runPostgresSchemaContract } from './postgres-schema.mjs';
 import {
 	StoreOutboxAdapter,
 	createActiveTs,
@@ -256,6 +257,7 @@ if (targets.has('postgres')) {
 		ran++;
 		await runPostgresOutcomeContract({ pool, schema: postgresSchemaName });
 		await runPostgresConcurrencyContract({ pool, schema: postgresSchemaName });
+		await runPostgresSchemaContract({ pool, schema: postgresSchemaName });
 		ranTargets.push('postgres');
 	} catch (error) {
 		postgresSmokeError = error;

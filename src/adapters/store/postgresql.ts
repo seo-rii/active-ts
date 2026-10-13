@@ -446,36 +446,56 @@ function assertPostgresIndexDefinitionMatches(model: ResolvedModelMeta, index: R
 			`PostgreSQL index "${index.name}" on "${model.name}" is missing definition metadata.`
 		);
 	}
+	const actualKeys = postgresIndexDefinitionKeys(definition);
+	const expectedKeys = postgresIndexDefinitionKeys(`USING btree (${postgresIndexFieldsSql(index)})`);
+	let matches = actualKeys !== undefined && expectedKeys !== undefined && actualKeys.length === expectedKeys.length;
+	if (matches) {
+		for (let position = 0; position < actualKeys!.length; position++) {
+			if (actualKeys![position] !== expectedKeys![position]) matches = false;
+		}
+	}
+	if (!matches || Boolean(index.unique) !== isPostgresUniqueIndexDefinition(definition) ||
+		hasUnsupportedPostgresIndexDefinitionOptions(definition, index.directions)) {
+		throw new ActiveTsConfigurationError(
+			`PostgreSQL index "${index.name}" on "${model.name}" does not match declared fields or uniqueness.`
+		);
+	}
+}
+
+function postgresIndexDefinitionKeys(definition: string): string[] | undefined {
 	const canonical = canonicalPostgresIndexSql(definition);
-	const unique = isPostgresUniqueIndexDefinition(definition);
-	if (Boolean(index.unique) !== unique || hasUnsupportedPostgresIndexDefinitionOptions(definition, index.directions)) {
-		throw new ActiveTsConfigurationError(
-			`PostgreSQL index "${index.name}" on "${model.name}" does not match declared fields or uniqueness.`
-		);
-	}
-	const jsonFieldCount = canonical.match(/data#>>array\[|data#>array\[/g)?.length ?? 0;
-	if (jsonFieldCount !== index.fields.length) {
-		throw new ActiveTsConfigurationError(
-			`PostgreSQL index "${index.name}" on "${model.name}" does not match declared fields or uniqueness.`
-		);
-	}
-	let position = 0;
-	for (let fieldIndex = 0; fieldIndex < index.fields.length; fieldIndex++) {
-		const expected = canonicalPostgresIndexSql(jsonIndexFieldLiteral(index, index.fields[fieldIndex]));
-		const next = canonical.indexOf(expected, position);
-		if (next < 0) {
-			throw new ActiveTsConfigurationError(
-				`PostgreSQL index "${index.name}" on "${model.name}" does not match declared fields or uniqueness.`
-			);
+	const start = canonical.indexOf('usingbtree(');
+	if (start < 0) return undefined;
+	const keys: string[] = [];
+	let key = '';
+	let depth = 1;
+	let brackets = 0;
+	let quoted = false;
+	for (let position = start + 'usingbtree('.length; position < canonical.length; position++) {
+		const char = canonical[position];
+		if (char === "'") {
+			key += char;
+			if (quoted && canonical[position + 1] === "'") {
+				key += canonical[++position];
+			} else quoted = !quoted;
+			continue;
 		}
-		const actual = postgresIndexDefinitionFieldDirection(canonical, next + expected.length);
-		if (actual.direction !== (index.directions?.[fieldIndex] ?? 'asc')) {
-			throw new ActiveTsConfigurationError(
-				`PostgreSQL index "${index.name}" on "${model.name}" does not match declared fields or uniqueness.`
-			);
+		if (quoted) { key += char; continue; }
+		if (char === '(') { depth++; continue; }
+		if (char === ')') {
+			depth--;
+			if (depth !== 0) continue;
+			keys[keys.length] = key.endsWith('asc') ? key.slice(0, -3) : key;
+			return keys;
 		}
-		position = actual.end;
+		if (char === '[') brackets++;
+		if (char === ']') brackets--;
+		if (char === ',' && depth === 1 && brackets === 0) {
+			keys[keys.length] = key.endsWith('asc') ? key.slice(0, -3) : key;
+			key = '';
+		} else key += char;
 	}
+	return undefined;
 }
 
 function hasUnsupportedPostgresIndexDefinitionOptions(definition: string, directions: readonly SortDirection[] | undefined) {
@@ -494,22 +514,6 @@ function indexDirectionsContainDesc(directions: readonly SortDirection[] | undef
 		if (directions[index] === 'desc') return true;
 	}
 	return false;
-}
-
-function postgresIndexDefinitionFieldDirection(canonical: string, position: number): { direction: SortDirection; end: number } {
-	let cursor = position;
-	while (canonical[cursor] === ')') cursor++;
-	if (canonical.startsWith('desc', cursor) && postgresIndexDirectionTokenBoundary(canonical[cursor + 4])) {
-		return { direction: 'desc', end: cursor + 4 };
-	}
-	if (canonical.startsWith('asc', cursor) && postgresIndexDirectionTokenBoundary(canonical[cursor + 3])) {
-		return { direction: 'asc', end: cursor + 3 };
-	}
-	return { direction: 'asc', end: cursor };
-}
-
-function postgresIndexDirectionTokenBoundary(char: string | undefined) {
-	return char === undefined || !/[a-z0-9_]/i.test(char);
 }
 
 function canonicalPostgresIndexSql(value: string) {
@@ -534,7 +538,7 @@ function canonicalPostgresIndexSql(value: string) {
 			continue;
 		}
 		const cast = value.slice(index).match(/^::[a-z_][a-z0-9_]*/i);
-		if (cast) {
+		if (cast && cast[0].toLowerCase() === '::text' && canonical.endsWith("'")) {
 			index += cast[0].length;
 			continue;
 		}

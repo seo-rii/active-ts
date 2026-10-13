@@ -3887,3 +3887,23 @@ test('PostgreSQL schema apply retains verified legacy physical index names', asy
 	assert.deepEqual(plan.changes, []);
 	assert.equal(statements.some((sql) => sql.startsWith('create unique index ')), false);
 });
+
+for (const keys of [
+	"((data #> ARRAY['handle'::text])), id",
+	"id, ((data #> ARRAY['handle'::text]))",
+	"((data #> ARRAY['handle'::text])::text)",
+	"(((data #> ARRAY['handle'::text])) || 'null'::jsonb)"
+]) {
+	test(`PostgreSQL schema rejects additional index key semantics: ${keys}`, async () => {
+		const name = `${meta.name}_handle_idx`;
+		const adapter = await createPostgresStoreAdapter({ pool: { query: async (sql: string) => {
+			if (sql.includes('information_schema.tables')) return { rows: [{}] };
+			if (sql.includes('information_schema.columns')) return { rows: postgresActiveTableColumns };
+			if (sql.includes('from pg_index i')) return { rows: postgresActivePrimaryKey };
+			if (sql.includes('pg_indexes')) return { rows: [{ indexname: name,
+				indexdef: `CREATE UNIQUE INDEX ${name} ON public.${meta.name} USING btree (${keys})` }] };
+			return { rows: [] };
+		} } });
+		await assert.rejects(() => adapter.schema!.plan([{ ...meta, indexes: [{ name: 'handle_idx', fields: ['handle'], unique: true }] }]), /does not match/);
+	});
+}
