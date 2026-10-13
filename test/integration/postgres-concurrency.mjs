@@ -250,11 +250,17 @@ export async function runPostgresConcurrencyContract({ pool, schema }) {
 		await otherTenant.store('default').schema.apply([otherTenant.meta(Record)], { mode: 'safe' });
 		await store.create(meta, 401, { id: 401, score: 1 });
 		await otherTenant.store('default').create(otherTenant.meta(Record), 401, { id: 401, score: 9 });
-		const [left, right] = await Promise.all([
-			Record.use(firstContext).find(401).load(), Record.use(otherTenant).find(401).load()
-		]);
-		assert.equal(left.data.score, 1);
-		assert.equal(right.data.score, 9);
+		// Prime one schema before reading the other: simultaneous cold misses
+		// could both return correct store values even if their cache keys collide.
+		cache.resetStats();
+		assert.equal((await Record.use(firstContext).find(401).load()).data.score, 1);
+		assert.equal((await Record.use(otherTenant).find(401).load()).data.score, 9);
+		assert.equal(cache.stats.misses, 2, 'each schema must populate its own cache entry');
+		assert.equal(cache.stats.hits, 0);
+		assert.equal((await Record.use(firstContext).find(401).load()).data.score, 1);
+		assert.equal((await Record.use(otherTenant).find(401).load()).data.score, 9);
+		assert.equal(cache.stats.hits, 2, 'both schema-specific values must be served from the shared cache');
+		assert.equal(cache.stats.misses, 2, 'cached rereads must not hide a cache-scope failure with store reads');
 		assert.equal((await persisted(401)).score, 1);
 		assert.equal((await persisted(401, tenantSchema)).score, 9);
 		cases++;
