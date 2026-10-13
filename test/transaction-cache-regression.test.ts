@@ -6,6 +6,7 @@ import {
 	ActiveTsCommittedTransactionError,
 	ActiveTsCommittedWriteError,
 	ActiveTsNotFoundError,
+	ActiveTsUnknownTransactionOutcomeError,
 	MemoryCacheAdapter,
 	MemoryOutboxAdapter,
 	MemorySearchAdapter,
@@ -36,6 +37,7 @@ import {
 	trackStoreTransactionWork
 } from '../src/index.js';
 import { createNativeSearchAdapter } from '../src/adapters/search/native.js';
+import { createPostgresStoreAdapter } from '../src/adapters/store/postgresql.js';
 import {
 	datastoreSearchDocumentIdentity,
 	searchHitDocumentIdentity
@@ -139,6 +141,95 @@ function createMalformedMemorySavepointStore(
 		}
 	};
 	return { backing, store };
+}
+
+async function createPostgresOutcomeStore(
+	outcome: 'commit' | 'commit-unknown' | 'abort-unknown',
+	initialRows: TransactionIsolationData[],
+	freezeOutcome = false,
+	failSavepointRollback = false
+) {
+	let committed = new Map(initialRows.map((row) => [`number:${row.id}`, structuredClone(row)]));
+	const calls: string[] = [];
+	const released: unknown[] = [];
+	const fault = Object.freeze(new Error(`${outcome} acknowledgement lost`));
+	const queryRows = (
+		rows: Map<string, TransactionIsolationData>,
+		text: string,
+		values: any[],
+		scope: 'root' | 'transaction'
+	) => {
+		calls.push(`${scope}:${text.split(' ')[0]}`);
+		if (text.startsWith('select')) {
+			const ids: string[] = Array.isArray(values[0]) ? values[0] : [values[0]];
+			const selected = ids.flatMap((id) => rows.has(id) ? [{ id, data: structuredClone(rows.get(id)) }] : []);
+			return { rows: selected, rowCount: selected.length, command: 'SELECT' };
+		}
+		if (text.startsWith('insert')) {
+			assert.equal(rows.has(values[0]), false);
+			rows.set(values[0], structuredClone(values[1]));
+			return { rows: [], rowCount: 1, command: 'INSERT' };
+		}
+		if (text.startsWith('update')) {
+			assert.ok(rows.has(values[0]));
+			rows.set(values[0], structuredClone(values[1]));
+			return { rows: [], rowCount: 1, command: 'UPDATE' };
+		}
+		assert.ok(text.startsWith('delete'), `Unexpected PostgreSQL fixture query: ${text}`);
+		return { rows: [], rowCount: Number(rows.delete(values[0])), command: 'DELETE' };
+	};
+	const store = await createPostgresStoreAdapter({ pool: {
+		query: async (text: string, values: any[]) => queryRows(committed, text, values, 'root'),
+		connect: async () => {
+			let pending = structuredClone(committed);
+			const savepoints = new Map<string, typeof pending>();
+			return {
+				query: async (text: string, values: any[]) => {
+					if (text === 'begin') {
+						calls.push('begin');
+						pending = structuredClone(committed);
+						return { rows: [], rowCount: 0, command: 'BEGIN' };
+					}
+					if (text === 'commit') {
+						calls.push('commit');
+						committed = pending;
+						if (outcome === 'commit-unknown') throw fault;
+						return { rows: [], rowCount: 0, command: 'COMMIT' };
+					}
+					if (text === 'rollback') {
+						calls.push('rollback');
+						if (outcome === 'abort-unknown') throw fault;
+						return { rows: [], rowCount: 0, command: 'ROLLBACK' };
+					}
+					if (text.startsWith('savepoint ')) {
+						calls.push('savepoint');
+						savepoints.set(text.slice('savepoint '.length), structuredClone(pending));
+						return { rows: [], rowCount: 0, command: 'SAVEPOINT' };
+					}
+					if (text.startsWith('rollback to savepoint ')) {
+						calls.push('rollback-to');
+						if (failSavepointRollback) throw fault;
+						const snapshot = savepoints.get(text.slice('rollback to savepoint '.length));
+						assert.ok(snapshot);
+						pending = structuredClone(snapshot);
+						return { rows: [], rowCount: 0, command: 'ROLLBACK' };
+					}
+					if (text.startsWith('release savepoint ')) {
+						calls.push('release-savepoint');
+						savepoints.delete(text.slice('release savepoint '.length));
+						return { rows: [], rowCount: 0, command: 'RELEASE' };
+					}
+					return queryRows(pending, text, values, 'transaction');
+				},
+				release: (error?: unknown) => {
+					calls.push('release');
+					released.push(error);
+					if (freezeOutcome && error instanceof Error) Object.freeze(error);
+				}
+			};
+		}
+	} });
+	return { store, calls, released, fault };
 }
 
 let transactionReadOnlyHookEvents: string[] = [];
@@ -915,6 +1006,64 @@ test('lazy relation failures remain visible to context transactions', async () =
 	assert.deepEqual(baseStore.dump('transaction_lazy_owner_record'), []);
 	assert.deepEqual(baseStore.dump('transaction_no_cache_record'), []);
 });
+
+for (const boundary of ['transaction', 'savepoint'] as const) {
+	for (const outcome of ['commit', 'rollback'] as const) {
+		for (const loading of ['ref', 'include'] as const) {
+			test(`retained relation owners survive ${boundary} ${outcome} after first ${loading}`, async () => {
+				type OwnerData = { id: number };
+				type ChildData = { id: number; ownerId: number; value: string };
+				class Owner extends Model<OwnerData> {}
+				class Child extends Model<ChildData> {}
+				defineModel<ChildData>({ name: 'retained_relation_child', cache: false })
+					.id('id').validate((input) => input as ChildData).attach(Child);
+				defineModel<OwnerData>({ name: 'retained_relation_owner', cache: false })
+					.id('id').validate((input) => input as OwnerData)
+					.hasMany('children', () => Child, { localKey: 'id', foreignKey: 'ownerId', warnOnLazy: false })
+					.attach(Owner);
+				const store = new MemoryStoreAdapter();
+				await store.seed('retained_relation_owner', [{ id: 1 }]);
+				await store.seed('retained_relation_child', [{ id: 1, ownerId: 1, value: 'before' }]);
+				const context = createActiveTs({ stores: { default: store } });
+				const rollbackError = new Error('request rollback');
+				const values = async (owner: Owner) => {
+					if (loading === 'include') await owner.include('children');
+					const children = await owner.ref<Child>('children').load();
+					assert.ok(Array.isArray(children));
+					return children.map((child) => child.data.value);
+				};
+				const exercise = async (parent: ActiveContext) => {
+					const retained = await Owner.use(parent).find(1).load();
+					assert.ok(retained);
+					let scopedOwner!: Owner;
+					let scopedRef!: ReturnType<Owner['ref']>;
+					const run = () => parent.transaction(async (tx) => {
+						await Child.use(tx).update(1, { value: 'pending' });
+						assert.deepEqual(await values(retained), ['pending']);
+						assert.equal(store.dump('retained_relation_child')[0].value, 'before');
+						const loaded = await Owner.use(tx).find(1).load();
+						assert.ok(loaded);
+						scopedOwner = loaded;
+						scopedRef = scopedOwner.ref('children');
+						await scopedRef.load();
+						if (outcome === 'rollback') throw rollbackError;
+					}, boundary === 'savepoint' ? { join: 'savepoint' } : {});
+					if (outcome === 'rollback') await assert.rejects(run, (error: unknown) => error === rollbackError);
+					else await run();
+					assert.deepEqual(await values(retained), [outcome === 'commit' ? 'pending' : 'before']);
+					assert.throws(() => scopedRef.load(), /closed transaction context/);
+					if (outcome === 'rollback') {
+						assert.throws(() => scopedOwner.ref('children'), /closed transaction context after it rolled back/);
+						await assert.rejects(() => scopedOwner.save(), /closed transaction context after it rolled back/);
+					} else assert.deepEqual(await values(scopedOwner), ['pending']);
+				};
+				if (boundary === 'savepoint') await context.transaction(exercise);
+				else await exercise(context);
+				assert.equal(store.dump('retained_relation_child')[0].value, outcome === 'commit' ? 'pending' : 'before');
+			});
+		}
+	}
+}
 
 test('transaction native search failures remain visible through context handles', async () => {
 	const searchError = new Error('transaction native search wrapper failed');
@@ -2244,6 +2393,178 @@ test('transaction cache invalidation failures reject after the store commits', a
 	assert.deepEqual(store.dump('transaction_cache_record'), [{ id: 12, value: 'after' }]);
 });
 
+for (const outcome of ['commit-unknown', 'abort-unknown'] as const) {
+	for (const freezeOutcome of [false, true]) {
+		test(`unknown PostgreSQL ${outcome} invalidates only dirty cache entries with ${freezeOutcome ? 'frozen' : 'mutable'} errors`, async () => {
+			const fixture = await createPostgresOutcomeStore(outcome, [
+				{ id: 1, value: 'before' },
+				{ id: 3, value: 'before-delete' },
+				{ id: 4, value: 'untouched' }
+			], freezeOutcome);
+			const cache = new MemoryCacheAdapter();
+			const outbox = new MemoryOutboxAdapter();
+			const tasks: string[] = [];
+			const invalidations: string[] = [];
+			const context = createActiveTs({
+				stores: { default: fixture.store },
+				caches: { default: cache },
+				plugins: [createOutboxPlugin({ outbox, includeData: true }), {
+					name: 'unknown-cache-hooks',
+					hooks: {
+						beforeCacheInvalidate: ({ id }) => { invalidations.push(`before:${id}`); },
+						afterCacheInvalidate: ({ id }) => { invalidations.push(`after:${id}`); }
+					}
+				}]
+			});
+			const Record = TransactionCacheRecord.use(context);
+			for (const id of [1, 2, 3, 4]) await Record.find(id).load();
+			const untouchedKey = 'transaction_cache_record:number:4';
+			const untouchedEntry = cache.snapshot()[untouchedKey];
+			const callbackError = new Error('request rollback');
+			await assert.rejects(() => context.transaction(async (tx) => {
+				await tx.afterCommit(() => { tasks.push('commit'); });
+				await tx.afterRollback(() => { tasks.push('rollback'); });
+				await tx.afterCommitInternal(() => { tasks.push('internal'); });
+				const TxRecord = TransactionCacheRecord.use(tx);
+				await TxRecord.update(1, { value: 'after' });
+				await TxRecord.update(1, { value: 'after' });
+				await TxRecord.create({ id: 2, value: 'created' });
+				await TxRecord.delete(3);
+				assert.equal(cache.stats.deleteMany, 0);
+				assert.deepEqual(invalidations, []);
+				if (outcome === 'abort-unknown') throw callbackError;
+			}), (error: unknown) => {
+				assert.ok(error instanceof ActiveTsUnknownTransactionOutcomeError);
+				assert.equal(error, fixture.released[0]);
+				assert.equal(error.phase, outcome === 'commit-unknown' ? 'commit' : 'abort');
+				assert.equal(Object.isFrozen(error), freezeOutcome);
+				assert.equal(Object.hasOwn(error, 'cacheInvalidationError'), false);
+				return true;
+			});
+			assert.equal(cache.stats.deleteMany, 3);
+			assert.deepEqual(invalidations, ['before:1', 'after:1', 'before:2', 'after:2', 'before:3', 'after:3']);
+			assert.deepEqual(cache.snapshot(), { [untouchedKey]: untouchedEntry });
+			assert.deepEqual(tasks, []);
+			assert.deepEqual(await outbox.list(), []);
+			const fresh = createActiveTs({ stores: { default: fixture.store }, caches: { default: cache } });
+			const FreshRecord = TransactionCacheRecord.use(fresh);
+			const reads = fixture.calls.filter((call) => call === 'root:select').length;
+			assert.equal((await FreshRecord.find(4).load())?.data.value, 'untouched');
+			assert.equal(fixture.calls.filter((call) => call === 'root:select').length, reads);
+			assert.equal((await FreshRecord.find(1).load())?.data.value, outcome === 'commit-unknown' ? 'after' : 'before');
+			assert.equal((await FreshRecord.find(2).load())?.data.value, outcome === 'commit-unknown' ? 'created' : undefined);
+			assert.equal((await FreshRecord.find(3).load())?.data.value, outcome === 'commit-unknown' ? undefined : 'before-delete');
+			assert.equal(fixture.calls.filter((call) => call === 'root:select').length, reads + 3);
+		});
+	}
+}
+
+for (const freezeOutcome of [false, true]) {
+	test(`unknown PostgreSQL cache cleanup preserves ${freezeOutcome ? 'frozen' : 'mutable'} errors and poisons failed invalidations`, async () => {
+		const fixture = await createPostgresOutcomeStore('commit-unknown', [1, 2, 3, 4, 5].map((id) => ({ id, value: 'before' })), freezeOutcome);
+		const beforeError = new Error('before invalidation failed');
+		const deleteError = new Error('cache delete failed');
+		const afterError = new Error('after invalidation failed');
+		const attempts: string[] = [];
+		class FailingCache extends MemoryCacheAdapter {
+			override async deleteMany(keys: string[]) {
+				attempts.push(...keys);
+				if (keys.includes('transaction_cache_record:number:2')) throw deleteError;
+				await super.deleteMany(keys);
+			}
+		}
+		const cache = new FailingCache();
+		const tasks: string[] = [];
+		const context = createActiveTs({
+			stores: { default: fixture.store },
+			caches: { default: cache },
+			plugins: [{
+				name: 'unknown-failing-cache-hooks',
+				hooks: {
+					beforeCacheInvalidate: ({ id }) => { if (id === 1) throw beforeError; },
+					afterCacheInvalidate: ({ id }) => { if (id === 3) throw afterError; }
+				}
+			}]
+		});
+		const Record = TransactionCacheRecord.use(context);
+		for (const id of [1, 2, 3, 4, 5]) await Record.find(id).load();
+		await assert.rejects(() => context.transaction(async (tx) => {
+			await tx.afterCommit(() => { tasks.push('commit'); });
+			await tx.afterRollback(() => { tasks.push('rollback'); });
+			await tx.afterCommitInternal(() => { tasks.push('internal'); });
+			for (const id of [1, 2, 3, 4]) await TransactionCacheRecord.use(tx).update(id, { value: 'after' });
+		}), (error: unknown) => {
+			assert.ok(error instanceof ActiveTsUnknownTransactionOutcomeError);
+			assert.equal(error, fixture.released[0]);
+			assert.equal(error.phase, 'commit');
+			assert.equal(error.cause, fixture.fault);
+			assert.equal(Object.isFrozen(error), freezeOutcome);
+			assert.equal(Object.hasOwn(error, 'afterRollbackError'), false);
+			const diagnostic = Object.getOwnPropertyDescriptor(error, 'cacheInvalidationError');
+			if (freezeOutcome) assert.equal(diagnostic, undefined);
+			else {
+				assert.ok(diagnostic?.value instanceof AggregateError);
+				assert.deepEqual(diagnostic.value.errors, [beforeError, deleteError, afterError]);
+			}
+			return true;
+		});
+		assert.deepEqual(tasks, []);
+		assert.deepEqual(attempts, [2, 3, 4].map((id) => `transaction_cache_record:number:${id}`));
+		assert.deepEqual(Object.keys(cache.snapshot()).sort(), [1, 2, 5].map((id) => `transaction_cache_record:number:${id}`));
+		const fresh = createActiveTs({ stores: { default: fixture.store }, caches: { default: cache } });
+		const FreshRecord = TransactionCacheRecord.use(fresh);
+		const reads = fixture.calls.filter((call) => call === 'root:select').length;
+		assert.equal((await FreshRecord.find(5).load())?.data.value, 'before');
+		assert.equal(fixture.calls.filter((call) => call === 'root:select').length, reads);
+		for (const id of [1, 2, 3, 4]) assert.equal((await FreshRecord.find(id).load())?.data.value, 'after');
+		assert.equal(fixture.calls.filter((call) => call === 'root:select').length, reads + 4);
+	});
+}
+
+for (const outcome of ['commit', 'abort-unknown'] as const) {
+	test(`unconfirmed PostgreSQL savepoints retain cache invalidations for ${outcome === 'commit' ? 'confirmed' : 'unknown'} root abort`, async () => {
+		const fixture = await createPostgresOutcomeStore(outcome, [1, 2, 3].map((id) => ({ id, value: 'before' })), false, true);
+		const cache = new MemoryCacheAdapter();
+		const outbox = new MemoryOutboxAdapter();
+		const context = createActiveTs({
+			stores: { default: fixture.store },
+			caches: { default: cache },
+			plugins: [createOutboxPlugin({ outbox, includeData: true })]
+		});
+		const Record = TransactionCacheRecord.use(context);
+		for (const id of [1, 2, 3]) await Record.find(id).load();
+		const tasks: string[] = [];
+		await assert.rejects(() => context.transaction(async (tx) => {
+			await tx.afterCommit(() => { tasks.push('root-commit'); });
+			await tx.afterRollback(() => { tasks.push('root-rollback'); });
+			await TransactionCacheRecord.use(tx).update(1, { value: 'root-attempt' });
+			await tx.transaction(async (child) => {
+				await child.afterRollback(() => { tasks.push('child-rollback'); });
+				await child.transaction(async (grandchild) => {
+					await grandchild.afterCommit(() => { tasks.push('grandchild-commit'); });
+					await grandchild.afterRollback(() => { tasks.push('grandchild-rollback'); });
+					await grandchild.afterCommitInternal(() => { tasks.push('grandchild-internal'); });
+					await TransactionCacheRecord.use(grandchild).update(1, { value: 'child-overwrite' });
+					await TransactionCacheRecord.use(grandchild).update(2, { value: 'child-attempt' });
+					throw new Error('request savepoint rollback');
+				}, { join: 'savepoint' });
+			}, { join: 'savepoint' });
+		}), (error: unknown) => {
+			if (outcome === 'abort-unknown') {
+				assert.ok(error instanceof ActiveTsUnknownTransactionOutcomeError);
+				assert.equal(error, fixture.released[0]);
+				assert.equal(error.phase, 'abort');
+			} else assert.ok(error instanceof AggregateError);
+			return true;
+		});
+		assert.equal(fixture.calls.filter((call) => call === 'rollback-to').length, 2);
+		assert.equal(cache.stats.deleteMany, outcome === 'abort-unknown' ? 2 : 0);
+		assert.deepEqual(Object.keys(cache.snapshot()).sort(), (outcome === 'abort-unknown' ? [3] : [1, 2, 3]).map((id) => `transaction_cache_record:number:${id}`));
+		assert.deepEqual(tasks, outcome === 'abort-unknown' ? [] : ['root-rollback', 'child-rollback', 'grandchild-rollback']);
+		assert.deepEqual(await outbox.list(), []);
+	});
+}
+
 test('transaction write hook failures are not reported as committed side effects', async () => {
 	const store = new MemoryStoreAdapter();
 	const context = createActiveTs({ stores: { default: store } });
@@ -2452,6 +2773,70 @@ test('rolled-back transactions stale retained root instances deleted in the tran
 		/closed transaction context after it rolled back/
 	);
 	assert.equal((await Record.find(51).load())?.data.value, 'before-delete');
+});
+
+for (const outcome of ['commit-unknown', 'abort-unknown'] as const) {
+	for (const freezeOutcome of [false, true]) {
+		for (const operation of ['save', 'delete'] as const) {
+			test(`unknown PostgreSQL ${outcome} closes retained models after ${operation} with ${freezeOutcome ? 'frozen' : 'mutable'} errors`, async () => {
+				const fixture = await createPostgresOutcomeStore(outcome, [{ id: 1, value: 'before' }], freezeOutcome);
+				const outbox = new MemoryOutboxAdapter();
+				const context = createActiveTs({
+					stores: { default: fixture.store },
+					plugins: [createOutboxPlugin({ outbox, includeData: true })]
+				});
+				const Record = TransactionIsolationRecord.use(context);
+				const retained = await Record.find(1).load();
+				assert.ok(retained);
+				let transactionBound: TransactionIsolationRecord | null = null;
+				const hooks: string[] = [];
+				const callbackError = new Error('request rollback');
+				await assert.rejects(() => context.transaction(async (tx) => {
+					transactionBound = await TransactionIsolationRecord.use(tx).find(1).load();
+					await tx.afterCommit(() => { hooks.push('commit'); });
+					await tx.afterRollback(() => { hooks.push('rollback'); });
+					retained.data.value = 'attempted';
+					await retained[operation]();
+					if (outcome === 'abort-unknown') throw callbackError;
+				}), (error: unknown) => {
+					assert.ok(error instanceof ActiveTsUnknownTransactionOutcomeError);
+					assert.equal(error, fixture.released[0]);
+					assert.equal(error.phase, outcome === 'commit-unknown' ? 'commit' : 'abort');
+					assert.equal(Object.isFrozen(error), freezeOutcome);
+					if (outcome === 'commit-unknown') assert.equal(error.cause, fixture.fault);
+					else {
+						assert.ok(error.cause instanceof AggregateError);
+						assert.deepEqual(error.cause.errors, [callbackError, fixture.fault]);
+					}
+					return true;
+				});
+				const finishedCalls = [...fixture.calls];
+				assert.ok(transactionBound);
+				for (const item of [retained, transactionBound]) {
+					await assert.rejects(() => item.save(), /closed transaction context after it failed/);
+					await assert.rejects(() => item.delete(), /closed transaction context after it failed/);
+				}
+				assert.deepEqual(fixture.calls, finishedCalls);
+				assert.deepEqual(hooks, []);
+				assert.deepEqual(await outbox.list(), []);
+			});
+		}
+	}
+}
+
+test('confirmed PostgreSQL commits keep retained root models usable', async () => {
+	const fixture = await createPostgresOutcomeStore('commit', [{ id: 1, value: 'before' }]);
+	const context = createActiveTs({ stores: { default: fixture.store } });
+	const Record = TransactionIsolationRecord.use(context);
+	const retained = await Record.find(1).load();
+	assert.ok(retained);
+	await context.transaction(async () => {
+		retained.data.value = 'committed';
+		await retained.save();
+	});
+	retained.data.value = 'after-commit';
+	await retained.save();
+	assert.equal((await Record.find(1).load())?.data.value, 'after-commit');
 });
 
 test('transaction retries do not stale retained root instances from retried attempts', async () => {
@@ -5530,3 +5915,193 @@ test('transaction writes skip cacheKey resolution when the model has no cache', 
 
 	assert.equal((await Record.find(1).load())?.data.value, 'created');
 });
+
+for (const boundary of ['transaction', 'savepoint'] as const) {
+	for (const operation of ['create', 'save'] as const) {
+		test(`store ${operation} conflicts evict stale cache before ${boundary} rollback without commit effects`, async () => {
+			type Data = { id: number; value: string; version: number };
+			class Record extends Model<Data> {}
+			defineModel<Data>({ name: 'transaction_conflict_cache_record', cache: { ttl: 60, negativeTtl: 60 } })
+				.id('id').validate((input) => input as Data).attach(Record);
+			const store = new MemoryStoreAdapter();
+			const cache = new MemoryCacheAdapter();
+			const outbox = new MemoryOutboxAdapter();
+			const effects: string[] = [];
+			const context = createActiveTs({
+				stores: { default: store }, caches: { default: cache },
+				plugins: [
+					createOutboxPlugin({ outbox }),
+					{ name: 'conflict-write-effects', hooks: { afterStoreWrite() { effects.push('afterStoreWrite'); } } }
+				]
+			});
+			const writer = createActiveTs({ stores: { default: store } });
+			const Cached = Record.use(context);
+			const Fresh = Record.use(writer);
+			let stale: Record | null = null;
+			if (operation === 'save') {
+				await Fresh.create({ id: 1, value: 'old', version: 1 });
+				stale = await Cached.find(1).load();
+				const fresh = await Fresh.find(1).load();
+				assert.ok(fresh);
+				fresh.data.value = 'fresh';
+				await fresh.save();
+			} else {
+				assert.equal(await Cached.find(1).load(), null);
+				await Fresh.create({ id: 1, value: 'fresh', version: 1 });
+			}
+			cache.resetStats();
+			const callbacks: string[] = [];
+			const exercise = async (parent: ActiveContext) => {
+				await assert.rejects(() => parent.transaction(async (tx) => {
+					await tx.afterCommit(() => { callbacks.push('failed commit'); });
+					await tx.afterRollback(() => { callbacks.push('rollback'); });
+					try {
+						if (operation === 'create') await Cached.create({ id: 1, value: 'duplicate', version: 1 });
+						else {
+							assert.ok(stale);
+							stale.data.value = 'attempt';
+							await stale.save();
+						}
+					} catch (error) {
+						assert.equal(cache.stats.deleteMany, 1);
+						assert.deepEqual(cache.snapshot(), {});
+						throw error;
+					}
+				}, boundary === 'savepoint' ? { join: 'savepoint' } : {}), ActiveTsConflictError);
+			};
+			if (boundary === 'savepoint') await context.transaction(exercise);
+			else await exercise(context);
+			assert.deepEqual(callbacks, ['rollback']);
+			assert.deepEqual(effects, []);
+			assert.deepEqual(await outbox.list(), []);
+			assert.equal((await Cached.find(1).load())?.data.value, 'fresh');
+			assert.equal(store.dump('transaction_conflict_cache_record')[0].version, operation === 'save' ? 2 : 1);
+		});
+	}
+}
+
+async function createStaleOwnerRelationFixture() {
+	type OwnerData = { id: number; targetId: number };
+	type TargetData = { id: number; value: string };
+	class Owner extends Model<OwnerData> {}
+	class Target extends Model<TargetData> {}
+	defineModel<TargetData>({ name: 'stale_relation_target', cache: false })
+		.id('id').validate((input) => input as TargetData).attach(Target);
+	defineModel<OwnerData>({ name: 'stale_relation_owner', cache: false })
+		.id('id').validate((input) => input as OwnerData)
+		.ref('target', () => Target, { localKey: 'targetId', foreignKey: 'id', warnOnLazy: false })
+		.attach(Owner);
+	const backing = new MemoryStoreAdapter();
+	await backing.seed('stale_relation_owner', [{ id: 1, targetId: 1 }]);
+	await backing.seed('stale_relation_target', [{ id: 1, value: 'original' }, { id: 2, value: 'attempted' }]);
+	const state = { holdTargetRead: false };
+	let signalRead!: () => void;
+	let releaseRead!: () => void;
+	const readStarted = new Promise<void>((resolve) => { signalRead = resolve; });
+	const readBarrier = new Promise<void>((resolve) => { releaseRead = resolve; });
+	const store = createStoreMiddlewareAdapter(backing, [async (operation, next) => {
+		const result = await next();
+		if (state.holdTargetRead && operation.operation === 'getMany' && operation.model.name === 'stale_relation_target') {
+			state.holdTargetRead = false;
+			signalRead();
+			await readBarrier;
+		}
+		return result;
+	}]);
+	const context = createActiveTs({ stores: { default: store } });
+	return { Owner, Target, context, backing, state, readStarted, releaseRead };
+}
+
+for (const boundary of ['transaction', 'root-savepoint', 'parent-savepoint'] as const) {
+	for (const operation of ['save', 'delete'] as const) {
+		for (const loading of ['unloaded', 'cached', 'full'] as const) {
+			test(`${loading} retained relation refs reject a stale owner after ${boundary} ${operation} rollback`, async () => {
+				const fixture = await createStaleOwnerRelationFixture();
+				const rootOwner = await fixture.Owner.use(fixture.context).find(1).load();
+				assert.ok(rootOwner);
+				const rollback = new Error('rollback relation owner');
+				const exercise = async (parent: ActiveContext) => {
+					const owner = boundary === 'parent-savepoint'
+						? await fixture.Owner.use(parent).find(1).load()
+						: rootOwner;
+					assert.ok(owner);
+					const ref = owner.ref<InstanceType<typeof fixture.Target>>('target');
+					if (loading !== 'unloaded') await ref.load(loading === 'full' ? { full: true } : {});
+					await assert.rejects(() => parent.transaction(async () => {
+						if (operation === 'save') {
+							owner.data.targetId = 2;
+							await owner.save();
+						} else await owner.delete();
+						throw rollback;
+					}, boundary === 'transaction' ? {} : { join: 'savepoint' }), (error: unknown) => error === rollback);
+					assert.throws(() => owner.ref('target'), /closed transaction context after it rolled back/);
+					const reads = fixture.backing.stats.getMany;
+					assert.throws(() => ref.load(), /closed transaction context after it rolled back/);
+					assert.throws(() => ref.load({ full: true, hooks: false }), /closed transaction context after it rolled back/);
+					assert.throws(() => ref.prime(null), /closed transaction context after it rolled back/);
+					assert.throws(() => ref.prime(null, { full: true }), /closed transaction context after it rolled back/);
+					assert.equal(fixture.backing.stats.getMany, reads);
+					assert.deepEqual((await fixture.Owner.use(parent).find(1).load())?.data, { id: 1, targetId: 1 });
+				};
+				if (boundary === 'transaction') await exercise(fixture.context);
+				else await fixture.context.transaction(exercise);
+			});
+		}
+	}
+}
+
+for (const check of ['cached pending calls', 'pending completion'] as const) {
+	test(`retained relation ${check} rejects an owner rolled back during an external load`, { timeout: 5000 }, async () => {
+		const fixture = await createStaleOwnerRelationFixture();
+		const owner = await fixture.Owner.use(fixture.context).find(1).load();
+		assert.ok(owner);
+		const ref = owner.ref('target');
+		fixture.state.holdTargetRead = true;
+		const pending = ref.load({ hooks: false });
+		void Promise.prototype.then.call(pending, undefined, () => undefined);
+		await fixture.readStarted;
+		await assert.rejects(() => fixture.context.transaction(async () => {
+			owner.data.targetId = 2;
+			await owner.save();
+			throw new Error('rollback pending relation owner');
+		}), /rollback pending relation owner/);
+		try {
+			if (check === 'cached pending calls') {
+				assert.throws(() => ref.load(), /closed transaction context after it rolled back/);
+				assert.throws(() => ref.prime(null), /closed transaction context after it rolled back/);
+			}
+		} finally {
+			fixture.releaseRead();
+		}
+		await assert.rejects(() => pending, /closed transaction context after it rolled back/);
+	});
+}
+
+for (const outcome of ['commit-unknown', 'abort-unknown'] as const) {
+	test(`cached retained relation refs reject a stale owner after frozen ${outcome}`, async () => {
+		class Owner extends Model<TransactionIsolationData> {}
+		class Target extends Model<TransactionIsolationData> {}
+		defineModel<TransactionIsolationData>({ name: 'unknown_relation_target', cache: false })
+			.id('id').validate((input) => input as TransactionIsolationData).attach(Target);
+		defineModel<TransactionIsolationData>({ name: 'unknown_relation_owner', cache: false })
+			.id('id').validate((input) => input as TransactionIsolationData)
+			.ref('target', () => Target, { localKey: 'id', foreignKey: 'id', warnOnLazy: false }).attach(Owner);
+		const fixture = await createPostgresOutcomeStore(outcome, [{ id: 1, value: 'before' }], true);
+		const context = createActiveTs({ stores: { default: fixture.store } });
+		const owner = await Owner.use(context).find(1).load();
+		assert.ok(owner);
+		const ref = owner.ref('target');
+		await ref.load({ full: true });
+		await assert.rejects(() => context.transaction(async () => {
+			owner.data.value = 'attempt';
+			await owner.save();
+			if (outcome === 'abort-unknown') throw new Error('request unknown rollback');
+		}), (error: unknown) => error instanceof ActiveTsUnknownTransactionOutcomeError && Object.isFrozen(error));
+		const calls = fixture.calls.length;
+		assert.throws(() => owner.ref('target'), /closed transaction context after it failed/);
+		assert.throws(() => ref.load(), /closed transaction context after it failed/);
+		assert.throws(() => ref.load({ full: true }), /closed transaction context after it failed/);
+		assert.throws(() => ref.prime(null), /closed transaction context after it failed/);
+		assert.equal(fixture.calls.length, calls);
+	});
+}

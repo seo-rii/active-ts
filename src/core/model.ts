@@ -1,7 +1,7 @@
 import { isDeepStrictEqual } from 'node:util';
 import { snapshotArrayInput } from './array-input.js';
 import { ActiveContext, getDefaultContext } from './context.js';
-import { ActiveTsCommittedWriteError, ActiveTsConfigurationError, ActiveTsValidationError, safeErrorMessage } from './errors.js';
+import { ActiveTsCommittedWriteError, ActiveTsConfigurationError, ActiveTsConflictError, ActiveTsValidationError, safeErrorMessage } from './errors.js';
 import { LazyRef } from './lazy-ref.js';
 import { isPartialModel } from './partial-model.js';
 import { findTypedViewDetails, type TypedView } from './typed-view.js';
@@ -78,6 +78,7 @@ export type ModelUpsertResult<TModel extends Model = Model> = {
 
 type PreparedModelCreate<TModel extends Model> = {
 	context: ActiveContext;
+	model: ModelConstructor<TModel>;
 	meta: ResolvedModelMeta;
 	store: StoreAdapter;
 	id: EntityId;
@@ -90,6 +91,7 @@ type PreparedModelCreate<TModel extends Model> = {
 
 type PreparedModelUpdate = {
 	context: ActiveContext;
+	model: ModelConstructor;
 	meta: ResolvedModelMeta;
 	store: StoreAdapter;
 	id: EntityId;
@@ -415,7 +417,7 @@ export abstract class Model<TData extends Record<string, any> = Record<string, a
 		const relation = mapGet(meta.relations, safeName);
 		if (!relation) throw new ActiveTsConfigurationError(`Relation "${safeName}" is not registered on ${meta.name}.`);
 		cached = new LazyRef<TModel>(
-			context,
+			this.context,
 			this,
 			relation,
 			SET_HAS.call(this.plannedRelations, safeName) || relation.warnOnLazy === false
@@ -485,7 +487,8 @@ export abstract class Model<TData extends Record<string, any> = Record<string, a
 
 	private async prepareSave(context: ActiveContext): Promise<PreparedModelUpdate> {
 		this.assertFullModel('save');
-		const meta = context.meta(this.constructor as ModelConstructor);
+		const model = this.constructor as ModelConstructor;
+		const meta = context.meta(model);
 		assertModelSnapshotWritable(this, meta.name, 'save');
 		const id = this.persistedId;
 		if (id === undefined || id === null) {
@@ -549,6 +552,7 @@ export abstract class Model<TData extends Record<string, any> = Record<string, a
 		);
 		return {
 			context,
+			model,
 			meta,
 			store,
 			id,
@@ -561,11 +565,9 @@ export abstract class Model<TData extends Record<string, any> = Record<string, a
 
 	private async writePreparedSave(prepared: PreparedModelUpdate) {
 		assertReplaceableDataTarget(this.data, prepared.data, `${prepared.meta.name} model data`, true);
-		await prepared.store.update(
-			prepared.meta,
-			prepared.id,
-			prepared.encodedData,
-			prepared.writeOptions
+		await writeWithConflictInvalidation(
+			prepared.context, prepared.model, prepared.id,
+			() => prepared.store.update(prepared.meta, prepared.id, prepared.encodedData, prepared.writeOptions)
 		);
 		replaceData(this.data, prepared.data);
 		this.persistedId = prepared.id;
@@ -606,7 +608,8 @@ export abstract class Model<TData extends Record<string, any> = Record<string, a
 			() => this.context.transactionScopedContext('delete'),
 			async (context) => {
 				this.assertFullModel('delete');
-				const meta = context.meta(this.constructor as ModelConstructor);
+				const model = this.constructor as ModelConstructor;
+				const meta = context.meta(model);
 				assertModelSnapshotWritable(this, meta.name, 'delete');
 				const id = this.persistedId;
 				if (id === undefined || id === null) {
@@ -640,10 +643,10 @@ export abstract class Model<TData extends Record<string, any> = Record<string, a
 					operation: 'delete'
 				});
 				assertDatastoreWriteMatchesScopedAncestor(meta, id, safeData, this[MODEL_DATASTORE_WRITE_ANCESTOR], `${meta.name}.delete()`);
-				await store.delete(
-					meta,
-					id,
-					datastoreWriteOptions(meta, id, safeData, expectedVersion, this[MODEL_DATASTORE_WRITE_ANCESTOR])
+				const writeOptions = datastoreWriteOptions(meta, id, safeData, expectedVersion, this[MODEL_DATASTORE_WRITE_ANCESTOR]);
+				await writeWithConflictInvalidation(
+					context, model, id,
+					() => store.delete(meta, id, writeOptions)
 				);
 				this.persistedId = undefined;
 				MAP_CLEAR.call(this.relationCache);
@@ -870,7 +873,7 @@ export abstract class Model<TData extends Record<string, any> = Record<string, a
 				const store = contextInternalStore(resolvedContext, meta.store);
 				const existing = await store.get(meta, id);
 				const prepared = await prepareStaticDelete(resolvedContext, meta, store, id, existing);
-				await writePreparedStaticDelete(prepared);
+				await writePreparedStaticDelete(prepared, this);
 				await finishPreparedStaticDelete(prepared);
 			}
 		);
@@ -919,7 +922,7 @@ export abstract class Model<TData extends Record<string, any> = Record<string, a
 						);
 					}
 					for (let index = 0; index < prepared.length; index++) {
-						await writePreparedStaticDelete(prepared[index]);
+						await writePreparedStaticDelete(prepared[index], this);
 					}
 					for (let index = 0; index < prepared.length; index++) {
 						await finishPreparedStaticDelete(prepared[index]);
@@ -994,6 +997,7 @@ async function prepareModelCreate<TModel extends Model>(
 	const writeOptions = datastoreWriteOptions(meta, id, clean);
 	const prepared = {
 		context,
+		model,
 		meta,
 		store: contextInternalStore(context, meta.store),
 		id,
@@ -1035,11 +1039,9 @@ async function writePreparedModelCreate<TModel extends Model>(
 			);
 		}
 	}
-	await prepared.store.create(
-		prepared.meta,
-		prepared.id,
-		prepared.encodedData,
-		prepared.writeOptions
+	await writeWithConflictInvalidation(
+		prepared.context, prepared.model, prepared.id,
+		() => prepared.store.create(prepared.meta, prepared.id, prepared.encodedData, prepared.writeOptions)
 	);
 }
 
@@ -1102,9 +1104,12 @@ async function prepareStaticDelete(
 	return { context, meta, store, id, writeOptions: { expectedVersion } };
 }
 
-async function writePreparedStaticDelete(prepared: PreparedStaticDelete) {
+async function writePreparedStaticDelete(prepared: PreparedStaticDelete, model: ModelConstructor) {
 	if (prepared.writeOptions === undefined) return;
-	await prepared.store.delete(prepared.meta, prepared.id, prepared.writeOptions);
+	await writeWithConflictInvalidation(
+		prepared.context, model, prepared.id,
+		() => prepared.store.delete(prepared.meta, prepared.id, prepared.writeOptions)
+	);
 }
 
 async function finishPreparedStaticDelete(prepared: PreparedStaticDelete) {
@@ -1408,6 +1413,26 @@ function assertDatastoreWriteMatchesScopedAncestor(
 	const actual = meta.datastore.ancestor({ model: meta, id, data });
 	if (datastoreScopedAncestorMatches(actual, expected)) return;
 	throw new ActiveTsValidationError(`${context} cannot move ${meta.name}:${String(id)} outside the scoped Datastore ancestor.`);
+}
+
+async function writeWithConflictInvalidation(
+	context: ActiveContext,
+	model: ModelConstructor,
+	id: EntityId,
+	write: () => Promise<void>
+) {
+	try {
+		await write();
+	} catch (error) {
+		if (error instanceof ActiveTsConflictError) {
+			try {
+				await context.invalidateModelExternal(model, id);
+			} catch (invalidationError) {
+				throw new AggregateError([error, invalidationError], 'Store write conflicted and entity cache invalidation failed.');
+			}
+		}
+		throw error;
+	}
 }
 
 async function afterStoreWrite(

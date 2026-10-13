@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
 	ActiveTsCommittedTransactionError,
 	ActiveTsCommittedWriteError,
+	ActiveTsConflictError,
 	ActiveTsValidationError,
 	clearDefaultContext,
 	Model,
@@ -12,6 +13,7 @@ import {
 	createCodecCacheAdapter,
 	createFunctionCache,
 	createOutboxPlugin,
+	createStoreMiddlewareAdapter,
 	defineModel,
 	getFunctionCacheDiagnostics,
 	isPartialModel,
@@ -28,7 +30,7 @@ import {
 	encodeQueryPlanFieldCodecs,
 	stripFieldCodecQueryOperandMarker
 } from '../src/core/field-codecs.js';
-import type { CacheAdapter } from '../src/index.js';
+import type { CacheAdapter, CacheVersionedEntry } from '../src/index.js';
 
 type CacheRegressionData = {
 	id: number;
@@ -425,6 +427,150 @@ test('duplicate concurrent find calls share one batch and store read', async () 
 	assert.equal(cache.stats.hits, 1);
 });
 
+function createConflictCacheFixture() {
+	type Data = { id: number; value: string; version: number };
+	class Record extends Model<Data> {}
+	const state = {
+		cleanupCalls: 0,
+		cleanupFailure: false,
+		writeFailure: undefined as Error | undefined,
+		preflightFailure: undefined as Error | undefined,
+		advanceBeforeDelete: false,
+		conflict: undefined as ActiveTsConflictError | undefined
+	};
+	const cleanupError = new Error('conflict cache cleanup failed');
+	const store = new MemoryStoreAdapter({ cacheScope: 'conflict-cache-store' });
+	const backingCache = new MemoryCacheAdapter();
+	const cache: CacheAdapter = {
+		kind: 'conflict-cache',
+		getMany: (keys) => backingCache.getMany(keys),
+		setMany: (entries, options) => backingCache.setMany(entries, options),
+		async deleteMany(keys) {
+			state.cleanupCalls++;
+			if (state.cleanupFailure) throw cleanupError;
+			await backingCache.deleteMany(keys);
+		}
+	};
+	defineModel<Data>({ name: 'conflict_cache_record', cache: { ttl: 60, negativeTtl: 60 } })
+		.id('id').validate((input) => input as Data)
+		.hooks({
+			beforeCreate() {
+				if (state.preflightFailure) throw state.preflightFailure;
+			},
+			async beforeDelete(payload) {
+				if (!state.advanceBeforeDelete) return;
+				state.advanceBeforeDelete = false;
+				assert.ok(payload.model);
+				await store.update(payload.model, payload.id!, { id: payload.id, value: 'fresh', version: 2 }, { expectedVersion: 1 });
+			}
+		})
+		.attach(Record);
+	const guardedStore = createStoreMiddlewareAdapter(store, [async (operation, next) => {
+		if (state.writeFailure && ['create', 'update', 'delete'].includes(operation.operation)) throw state.writeFailure;
+		try {
+			return await next();
+		} catch (error) {
+			if (error instanceof ActiveTsConflictError) state.conflict = Object.freeze(error);
+			throw error;
+		}
+	}]);
+	const context = createActiveTs({ stores: { default: guardedStore }, caches: { default: cache } });
+	const observer = createActiveTs({ stores: { default: guardedStore }, caches: { default: cache } });
+	const writer = createActiveTs({ stores: { default: store } });
+	return {
+		state, cleanupError, store, backingCache,
+		Cached: Record.use(context), Observer: Record.use(observer), Fresh: Record.use(writer)
+	};
+}
+
+test('store create conflicts evict a known-stale cached miss across shared contexts', async () => {
+	const fixture = createConflictCacheFixture();
+	assert.equal(await fixture.Cached.find(1).load(), null);
+	await fixture.Fresh.create({ id: 1, value: 'fresh', version: 1 });
+	const cleanupBefore = fixture.state.cleanupCalls;
+	await assert.rejects(
+		() => fixture.Cached.create({ id: 1, value: 'duplicate', version: 1 }),
+		(error: unknown) => error === fixture.state.conflict && Object.isFrozen(error)
+	);
+	assert.equal(fixture.state.cleanupCalls, cleanupBefore + 1);
+	assert.equal((await fixture.Observer.find(1).load())?.data.value, 'fresh');
+	assert.equal((await fixture.Cached.find(1).load())?.data.value, 'fresh');
+});
+
+for (const operation of ['save', 'delete'] as const) {
+	test(`store ${operation} conflicts evict a known-stale positive entity cache`, async () => {
+		const fixture = createConflictCacheFixture();
+		await fixture.Fresh.create({ id: 1, value: 'old', version: 1 });
+		const stale = await fixture.Cached.find(1).load();
+		assert.ok(stale);
+		const fresh = await fixture.Fresh.find(1).load();
+		assert.ok(fresh);
+		fresh.data.value = 'fresh';
+		await fresh.save();
+		stale.data.value = 'attempt';
+		const cleanupBefore = fixture.state.cleanupCalls;
+		await assert.rejects(() => stale[operation](), (error: unknown) => error === fixture.state.conflict);
+		assert.equal(fixture.state.cleanupCalls, cleanupBefore + 1);
+		assert.deepEqual((await fixture.Observer.find(1).load())?.data, { id: 1, value: 'fresh', version: 2 });
+		assert.deepEqual(stale.data, { id: 1, value: 'attempt', version: 1 });
+	});
+}
+
+test('static delete conflicts evict the row invalidated between the probe and write', async () => {
+	const fixture = createConflictCacheFixture();
+	await fixture.Fresh.create({ id: 1, value: 'old', version: 1 });
+	await fixture.Cached.find(1).load();
+	fixture.state.advanceBeforeDelete = true;
+	const cleanupBefore = fixture.state.cleanupCalls;
+	await assert.rejects(() => fixture.Cached.delete(1), (error: unknown) => error === fixture.state.conflict);
+	assert.equal(fixture.state.cleanupCalls, cleanupBefore + 1);
+	assert.deepEqual((await fixture.Observer.find(1).load())?.data, { id: 1, value: 'fresh', version: 2 });
+});
+
+for (const operation of ['create', 'save', 'delete'] as const) {
+	test(`failed cache cleanup after ${operation} conflict preserves both errors and poisons shared cache reads`, async () => {
+		const fixture = createConflictCacheFixture();
+		let stale: InstanceType<typeof fixture.Cached> | null = null;
+		if (operation === 'create') {
+			assert.equal(await fixture.Cached.find(1).load(), null);
+			await fixture.Fresh.create({ id: 1, value: 'fresh', version: 1 });
+		} else {
+			await fixture.Fresh.create({ id: 1, value: 'old', version: 1 });
+			stale = await fixture.Cached.find(1).load();
+			const fresh = await fixture.Fresh.find(1).load();
+			assert.ok(fresh);
+			fresh.data.value = 'fresh';
+			await fresh.save();
+		}
+		fixture.state.cleanupFailure = true;
+		await assert.rejects(
+			() => operation === 'create'
+				? fixture.Cached.create({ id: 1, value: 'duplicate', version: 1 })
+				: stale![operation](),
+			(error: unknown) => error instanceof AggregateError &&
+				error.errors.length === 2 && error.errors[0] === fixture.state.conflict &&
+				error.errors[1] === fixture.cleanupError
+		);
+		const hits = fixture.backingCache.stats.hits;
+		assert.equal((await fixture.Observer.find(1).load())?.data.value, 'fresh');
+		assert.equal(fixture.backingCache.stats.hits, hits);
+	});
+}
+
+for (const phase of ['store', 'preflight'] as const) {
+	test(`${phase} failures without an authoritative store conflict preserve the cached miss`, async () => {
+		const fixture = createConflictCacheFixture();
+		assert.equal(await fixture.Cached.find(1).load(), null);
+		const error = phase === 'store' ? new Error('store unavailable') : new ActiveTsConflictError('hook rejected create');
+		if (phase === 'store') fixture.state.writeFailure = error;
+		else fixture.state.preflightFailure = error;
+		const cleanupBefore = fixture.state.cleanupCalls;
+		await assert.rejects(() => fixture.Cached.create({ id: 1, value: 'attempt', version: 1 }), (cause: unknown) => cause === error);
+		assert.equal(fixture.state.cleanupCalls, cleanupBefore);
+		assert.equal(await fixture.Observer.find(1).load(), null);
+	});
+}
+
 test('save and delete invalidate positive cache entries before the next find', async () => {
 	const { store, cache, Record } = setup();
 	await store.seed('cache_regression_record', [{ id: 7, value: 'before' }]);
@@ -582,6 +728,185 @@ test('entity cache cleanup failures poison stale race writes', async () => {
 	assert.equal(cache.snapshot()['cache_regression_record:number:24'].value.value, 'new');
 	assert.deepEqual(store.getManyBatches, [[24], [24]]);
 });
+
+for (const negative of [false, true]) {
+	for (const cleanupFails of [false, true]) {
+		test(`entity cache lost set acknowledgements clean ${negative ? 'negative' : 'positive'} race writes when cleanup ${cleanupFails ? 'fails' : 'succeeds'}`, async () => {
+			const writeError = Object.freeze(new Error('cache SET acknowledgement lost'));
+			const cleanupError = new Error('cache cleanup failed');
+			class FailingSetCache extends BlockingSetCache {
+				failWrite = true;
+				failCleanup = false;
+				readonly deletions: string[][] = [];
+				override async setMany(...args: Parameters<MemoryCacheAdapter['setMany']>) {
+					await super.setMany(...args);
+					if (this.failWrite) {
+						this.failWrite = false;
+						throw writeError;
+					}
+				}
+				override async deleteMany(keys: string[]) {
+					this.deletions.push([...keys]);
+					if (this.failCleanup) throw cleanupError;
+					await super.deleteMany(keys);
+				}
+			}
+			const store = new TrackingStore();
+			const cache = new FailingSetCache();
+			const context = createActiveTs({ stores: { default: store }, caches: { default: cache } });
+			const untouched = { id: 99, value: 'untouched' };
+			const untouchedKey = 'cache_hook_record:number:99';
+			const keys = [1, 2].map((id) => `cache_hook_record:number:${id}`);
+			await store.seed('cache_hook_record', [...(negative ? [] : [1, 2].map((id) => ({ id, value: 'before' }))), untouched]);
+			await MemoryCacheAdapter.prototype.setMany.call(cache, [[untouchedKey, untouched]], { ttl: 60 });
+			const pending = context.loadManyNow(CacheHookRecord, [1, 2]);
+			await cache.entered;
+			await context.transaction(async (tx) => {
+				const TxRecord = CacheHookRecord.use(tx);
+				for (const id of [1, 2]) {
+					if (negative) await TxRecord.create({ id, value: 'after' });
+					else await TxRecord.update(id, { value: 'after' });
+				}
+			});
+			cache.failCleanup = cleanupFails;
+			cache.unblock();
+			await assert.rejects(() => pending, (error: unknown) => {
+				if (cleanupFails) {
+					assert.ok(error instanceof AggregateError);
+					assert.deepEqual(error.errors, [writeError, cleanupError]);
+				} else assert.equal(error, writeError);
+				return true;
+			});
+			assert.deepEqual(cache.deletions, [[keys[0]], [keys[1]], keys]);
+			for (const key of keys) {
+				if (cleanupFails) assert.ok(Object.hasOwn(cache.snapshot(), key));
+				else assert.equal(cache.snapshot()[key], undefined);
+			}
+			assert.deepEqual(cache.snapshot()[untouchedKey].value, untouched);
+			cache.failCleanup = false;
+			const fresh = createActiveTs({ stores: { default: store }, caches: { default: cache } });
+			const reads = store.getManyBatches.length;
+			assert.equal((await CacheHookRecord.use(fresh).find(99).load())?.data.value, 'untouched');
+			assert.equal(store.getManyBatches.length, reads);
+			assert.deepEqual((await fresh.loadManyNow(CacheHookRecord, [1, 2])).map((row) => row?.data.value), ['after', 'after']);
+			assert.equal(store.getManyBatches.length, reads + 1);
+		});
+	}
+}
+
+for (const response of ['rejected', 'malformed'] as const) {
+	for (const cleanupFails of [false, true]) {
+		test(`entity cache uncertain versioned writes clean attempted keys after ${response} responses when cleanup ${cleanupFails ? 'fails' : 'succeeds'}`, async () => {
+			class VersionedRecord extends Model<CacheRegressionData> {}
+			defineModel<CacheRegressionData>({ name: 'uncertain_versioned_record', cache: { ttl: 60, consistency: 'distributed' } })
+				.id('id').validate((input) => input as CacheRegressionData).attach(VersionedRecord);
+			const writeError = Object.freeze(new Error('versioned SET acknowledgement lost'));
+			const cleanupError = new Error('versioned cleanup failed');
+			class VersionedCache extends MemoryCacheAdapter {
+				failWrite = true;
+				failCleanup = cleanupFails;
+				readonly versions = new Map<string, number>();
+				readonly invalidations: string[][] = [];
+				async getManyVersioned(keys: string[]) {
+					const values = await super.getMany(keys);
+					return keys.map((key, index) => ({ value: values[index], version: String(this.versions.get(key) ?? 0) }));
+				}
+				async setManyVersioned(entries: CacheVersionedEntry[]) {
+					if (this.failWrite) {
+						this.failWrite = false;
+						// The batch can be partially applied even though its acknowledgement is unusable.
+						await super.setMany(entries.slice(0, 1).map(([key, value]) => [key, value]));
+						if (response === 'rejected') throw writeError;
+						return [];
+					}
+					const results: boolean[] = [];
+					for (const [key, value, version] of entries) {
+						const matches = String(this.versions.get(key) ?? 0) === version;
+						if (matches) await super.setMany([[key, value]]);
+						results.push(matches);
+					}
+					return results;
+				}
+				async invalidateMany(keys: string[]) {
+					this.invalidations.push([...keys]);
+					if (this.failCleanup) throw cleanupError;
+					for (const key of keys) this.versions.set(key, (this.versions.get(key) ?? 0) + 1);
+					await super.deleteMany(keys);
+				}
+			}
+			const store = new TrackingStore({ cacheScope: 'write-test' });
+			const cache = new VersionedCache();
+			let afterSet = 0;
+			const context = createActiveTs({
+				stores: { default: store },
+				caches: { default: cache },
+				plugins: [{ name: 'uncertain-versioned-after-set', hooks: { afterCacheSet() { afterSet++; } } }]
+			});
+			const meta = context.meta(VersionedRecord);
+			const prefix = 'store:7:default:scope:10:write-test:uncertain_versioned_record:number:';
+			const keys = [1, 2].map((id) => `${prefix}${id}`);
+			const untouchedKey = `${prefix}99`;
+			const untouched = { id: 99, value: 'untouched' };
+			await store.seed(meta, [{ id: 1, value: 'before' }, { id: 2, value: 'before' }, untouched]);
+			await cache.setMany([[untouchedKey, untouched]], { ttl: 60 });
+			await assert.rejects(() => context.loadManyNow(VersionedRecord, [1, 2]), (error: unknown) => {
+				let original = error;
+				if (cleanupFails) {
+					assert.ok(error instanceof AggregateError);
+					assert.equal(error.errors.length, 2);
+					assert.equal(error.errors[1], cleanupError);
+					original = error.errors[0];
+				}
+				if (response === 'rejected') assert.equal(original, writeError);
+				else {
+					assert.ok(original instanceof ActiveTsValidationError);
+					assert.match(original.message, /setManyVersioned result must contain 2 entries/);
+				}
+				return true;
+			});
+			assert.equal(afterSet, 0);
+			assert.deepEqual(cache.invalidations, [keys]);
+			assert.equal(cache.stats.deleteMany, cleanupFails ? 0 : 1);
+			assert.equal(Object.hasOwn(cache.snapshot(), keys[0]), cleanupFails);
+			assert.equal(cache.snapshot()[keys[1]], undefined);
+			assert.deepEqual(cache.snapshot()[untouchedKey].value, untouched);
+			for (const id of [1, 2]) await store.update(meta, id, { id, value: 'after' });
+			cache.failCleanup = false;
+			const fresh = createActiveTs({ stores: { default: store }, caches: { default: cache } });
+			const reads = store.getManyBatches.length;
+			assert.equal((await VersionedRecord.use(fresh).find(99).load())?.data.value, 'untouched');
+			assert.equal(store.getManyBatches.length, reads);
+			assert.deepEqual((await fresh.loadManyNow(VersionedRecord, [1, 2])).map((row) => row?.data.value), ['after', 'after']);
+			assert.equal(store.getManyBatches.length, reads + 1);
+		});
+	}
+}
+
+for (const failure of ['throw', 'invalid-data'] as const) {
+	test(`entity cache prewrite ${failure} failures do not clean unattempted keys`, async () => {
+		const store = new TrackingStore();
+		const cache = new MemoryCacheAdapter();
+		const beforeError = new Error('before cache set failed');
+		const context = createActiveTs({
+			stores: { default: store },
+			caches: { default: cache },
+			plugins: [{ name: 'prewrite-cache-set-failure', hooks: {
+				beforeCacheSet() {
+					if (failure === 'throw') throw beforeError;
+					return { data: [['wrong-key', { id: 1, value: 'wrong' }]] };
+				}
+			} }]
+		});
+		await store.seed('cache_hook_record', [{ id: 1, value: 'before' }]);
+		await assert.rejects(() => CacheHookRecord.use(context).find(1).load(), (error: unknown) => {
+			if (failure === 'throw') assert.equal(error, beforeError);
+			else assert.ok(error instanceof ActiveTsValidationError);
+			return true;
+		});
+		assert.equal(cache.stats.setMany, 0);
+		assert.equal(cache.stats.deleteMany, 0);
+	});
+}
 
 test('entity cache afterCacheSet failures remove committed cache entries', async () => {
 	const store = new TrackingStore();

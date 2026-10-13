@@ -6,7 +6,9 @@ import {
 	safeErrorMessage
 } from './errors.js';
 import {
+	inheritTransactionRollbackObservation,
 	markSavepointRollbackUnconfirmed,
+	observeTransactionRollback,
 	savepointRollbackUnconfirmed,
 	transactionRollbackSkipped
 } from './error-classification.js';
@@ -1465,7 +1467,7 @@ export class ActiveContext {
 						}
 						return await (current.call(
 							retained,
-							async (txStore: StoreAdapter) => {
+							inheritTransactionRollbackObservation(fn, async (txStore: StoreAdapter) => {
 								let closed: string | undefined;
 								const bound = createContextBoundTransactionStore(txStore, handle, name);
 								const guarded = createCloseGuardedStoreAdapter(
@@ -1488,7 +1490,7 @@ export class ActiveContext {
 									}
 									throw error;
 								}
-							},
+							}),
 							safeOptions
 						) as Promise<Awaited<ReturnType<typeof fn>>>);
 					});
@@ -2906,14 +2908,25 @@ export class ActiveContext {
 								SET_FOR_EACH.call(state.modelInstances, (value: object) => {
 									SET_ADD.call(parentState.modelInstances, value);
 								});
+								// Preserve uncertain writes for root-outcome cache cleanup, without commit tasks.
+								MAP_FOR_EACH.call(
+									state.cacheInvalidations,
+									(invalidation: { meta: ResolvedModelMeta; id: EntityId; task: DeferredTask }, key: string) => {
+										if (!mapHas(parentState.cacheInvalidations, key)) mapSet(parentState.cacheInvalidations, key, invalidation);
+									}
+								);
+								SET_FOR_EACH.call(state.dirtyCacheKeys, (key: string) => {
+									SET_ADD.call(parentState.dirtyCacheKeys, key);
+								});
 							} else {
 								state.closed = 'rolled back';
-								markRolledBackTransactionModelInstances(state);
-								attachRollbackTaskErrors(
+								markClosedTransactionModelInstances(state);
+								attachTransactionTaskErrors(
 									error,
 									await runDeferredTasks('afterRollback', state.afterRollback, {
 										throwOnError: false
-									})
+									}),
+									'afterRollback'
 								);
 							}
 						}
@@ -2962,12 +2975,13 @@ export class ActiveContext {
 				const rollbackAttempt = async (state: TransactionState, options: { staleTrackedModels: boolean }) => {
 					if (state.closed) return [];
 					state.closed = 'rolled back';
-					if (options.staleTrackedModels) markRolledBackTransactionModelInstances(state);
+					if (options.staleTrackedModels) markClosedTransactionModelInstances(state);
 					return await runDeferredTasks('afterRollback', state.afterRollback, { throwOnError: false });
 				};
 				let attemptState: TransactionState | undefined;
 				const callbackErrors = new WeakSet<object>();
 				const run = async (txStore: StoreAdapter) => {
+					rollbackObservation.confirmed = false;
 					if (attemptState && !attemptState.closed) await rollbackAttempt(attemptState, { staleTrackedModels: false });
 					const state = createState();
 					attemptState = state;
@@ -3007,9 +3021,11 @@ export class ActiveContext {
 						throw error;
 					}
 				};
+				// Observe this invocation's callback, never the reusable user callback or error object.
+				const rollbackObservation = observeTransactionRollback(run);
 				let result: T;
 				try {
-					result = await store.transaction((tx) => run(tx), storeOptions);
+					result = await store.transaction(run, storeOptions);
 				} catch (error) {
 					if (error instanceof ActiveTsCommittedTransactionError && !WEAKSET_HAS.call(callbackErrors, error)) {
 						if (!attemptState) throw error;
@@ -3023,13 +3039,30 @@ export class ActiveContext {
 						throw error;
 					}
 					if (attemptState) {
-						if (transactionRollbackSkipped(error)) {
+						if (transactionRollbackSkipped(error) && !rollbackObservation.confirmed) {
 							if (!attemptState.closed) attemptState.closed = 'failed';
+							markClosedTransactionModelInstances(attemptState);
+							const invalidationErrors: unknown[] = [];
+							const invalidations: DeferredTask[] = [];
+							MAP_FOR_EACH.call(attemptState.cacheInvalidations, (invalidation: { task: DeferredTask }) => {
+								invalidations.push(invalidation.task);
+							});
+							// Eviction does not establish a commit or authorize other deferred side effects.
+							for (const invalidate of invalidations) {
+								try {
+									await invalidate();
+								} catch (invalidationError) {
+									invalidationErrors.push(invalidationError);
+								}
+							}
+							attachTransactionTaskErrors(error, invalidationErrors, 'cacheInvalidation');
 							throw error;
 						}
-						attachRollbackTaskErrors(error, await rollbackAttempt(attemptState, { staleTrackedModels: true }));
+						attachTransactionTaskErrors(error, await rollbackAttempt(attemptState, { staleTrackedModels: true }), 'afterRollback');
 					}
 					throw error;
+				} finally {
+					rollbackObservation.dispose();
 				}
 				if (!attemptState) {
 					throw new ActiveTsConfigurationError(`Store adapter "${store.kind}" completed transaction without running the callback.`);
@@ -3487,17 +3520,27 @@ export class ActiveContext {
 				);
 			}
 			const versionedEntries = [] as Array<[string, any, string]>;
+			const attemptedKeys: string[] = [];
 			for (let index = 0; index < writeEntries.length; index++) {
 				const [key, value] = writeEntries[index];
 				const version = mapGet(expectedVersions, key);
 				if (version === undefined) continue;
 				versionedEntries[versionedEntries.length] = [key, value, version];
+				attemptedKeys[attemptedKeys.length] = key;
 			}
-			const results = normalizeCacheVersionedSetResult(
-				await cache.setManyVersioned(versionedEntries, { ttl }),
-				versionedEntries.length,
-				`Cache adapter "${cache.kind}" setManyVersioned result`
-			);
+			let results: boolean[];
+			try {
+				results = normalizeCacheVersionedSetResult(
+					await cache.setManyVersioned(versionedEntries, { ttl }),
+					versionedEntries.length,
+					`Cache adapter "${cache.kind}" setManyVersioned result`
+				);
+			} catch (error) {
+				await this.poisonCommittedCacheSet(
+					cache, meta, attemptedKeys, error, 'Entity cache write failed and cleanup failed.'
+				);
+				throw error;
+			}
 			committedEntries = [];
 			committedIds = [];
 			let versionedIndex = 0;
@@ -3511,7 +3554,15 @@ export class ActiveContext {
 				versionedIndex++;
 			}
 		} else {
-			await cache.setMany(writeEntries, { ttl });
+			const attemptedKeys = cacheEntryKeys(writeEntries);
+			try {
+				await cache.setMany(writeEntries, { ttl });
+			} catch (error) {
+				await this.poisonCommittedCacheSet(
+					cache, meta, attemptedKeys, error, 'Entity cache write failed and cleanup failed.'
+				);
+				throw error;
+			}
 		}
 		const staleKeys: string[] = [];
 		if (expectedEpochs) {
@@ -3549,7 +3600,7 @@ export class ActiveContext {
 				meta: { keys: cacheEntryKeys(stableEntries) }
 			});
 		} catch (error) {
-			await this.poisonCommittedCacheSet(cache, meta, stableEntries, error);
+			await this.poisonCommittedCacheSet(cache, meta, cacheEntryKeys(stableEntries), error);
 			throw error;
 		}
 	}
@@ -3557,10 +3608,11 @@ export class ActiveContext {
 	private async poisonCommittedCacheSet(
 		cache: CacheAdapter,
 		meta: ResolvedModelMeta,
-		entries: Array<[string, any]>,
-		cause: unknown
+		keys: string[],
+		cause: unknown,
+		cleanupMessage = 'Entity cache set hook failed and cleanup failed.'
 	) {
-		const keys = cacheEntryKeys(entries);
+		if (!keys.length) return;
 		for (const key of keys) this.bumpCacheEpoch(cache, key);
 		try {
 			if (meta.cache?.consistency === 'distributed' && cacheSupportsVersioning(cache)) {
@@ -3571,7 +3623,7 @@ export class ActiveContext {
 			for (const key of keys) this.clearCacheInvalidationFailure(cache, key);
 		} catch (error) {
 			for (const key of keys) this.markCacheInvalidationFailure(cache, key);
-			throw new AggregateError([cause, error], 'Entity cache set hook failed and cleanup failed.');
+			throw new AggregateError([cause, error], cleanupMessage);
 		}
 	}
 
@@ -5721,40 +5773,47 @@ async function runAfterCommitTasks(state: TransactionState) {
 	}
 }
 
-function attachRollbackTaskErrors(primaryError: unknown, rollbackErrors: unknown[]) {
-	if (!rollbackErrors.length) return;
+function attachTransactionTaskErrors(
+	primaryError: unknown,
+	taskErrors: unknown[],
+	kind: 'afterRollback' | 'cacheInvalidation'
+) {
+	if (!taskErrors.length) return;
 	if (!primaryError || (typeof primaryError !== 'object' && typeof primaryError !== 'function')) {
 		return;
 	}
 	try {
+		const property = `${kind}Error`;
 		const combined: unknown[] = [];
-		const previous = Object.getOwnPropertyDescriptor(primaryError, 'afterRollbackError');
+		const previous = Object.getOwnPropertyDescriptor(primaryError, property);
 		if (previous && 'value' in previous && previous.value !== undefined) {
 			const previousErrors = previous.value instanceof AggregateError
 				? Object.getOwnPropertyDescriptor(previous.value, 'errors')
 				: undefined;
 			if (previousErrors && 'value' in previousErrors && Array.isArray(previousErrors.value)) {
-				const snapshot = snapshotArrayInput<unknown>(previousErrors.value, 'afterRollback errors');
+				const snapshot = snapshotArrayInput<unknown>(previousErrors.value, `${kind} errors`);
 				for (let index = 0; index < snapshot.length; index++) combined.push(snapshot[index]);
 			} else {
 				combined.push(previous.value);
 			}
 		}
-		for (let index = 0; index < rollbackErrors.length; index++) combined.push(rollbackErrors[index]);
+		for (let index = 0; index < taskErrors.length; index++) combined.push(taskErrors[index]);
 		const aggregate = new AggregateError(
 			combined,
-			'active-ts afterRollback task failed after transaction rollback.'
+			kind === 'afterRollback'
+				? 'active-ts afterRollback task failed after transaction rollback.'
+				: 'active-ts cache invalidation failed after an unknown transaction outcome.'
 		);
-		defineDataProperty(primaryError, 'afterRollbackError', aggregate, {
+		defineDataProperty(primaryError, property, aggregate, {
 			enumerable: false,
 			configurable: true
 		});
 	} catch {
-		// Preserve the original rollback reason even when the thrown value is not extensible.
+		// Preserve the original transaction failure even when the thrown value is not extensible.
 	}
 }
 
-function markRolledBackTransactionModelInstances(state: TransactionState) {
+function markClosedTransactionModelInstances(state: TransactionState) {
 	const txContext = state.context;
 	if (!txContext) return;
 	SET_FOR_EACH.call(state.modelInstances, (value: object) => {
@@ -5763,7 +5822,7 @@ function markRolledBackTransactionModelInstances(state: TransactionState) {
 			defineDataProperty(value, 'context', txContext, { enumerable: true, configurable: true, writable: true });
 			clearModelRelationState(value);
 		} catch {
-			// A rollback reason must remain authoritative even if stale marking cannot touch an unusual object.
+			// The transaction failure must remain authoritative even if stale marking cannot touch an unusual object.
 		}
 	});
 }
