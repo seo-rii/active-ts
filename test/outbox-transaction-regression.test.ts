@@ -5623,3 +5623,36 @@ test('outbox search sync rejects static modelName accessors without invocation',
 	);
 	assert.equal(modelNameReads, 0);
 });
+
+test('memory outbox dead-letter batch validates every id before publishing any event', async () => {
+	const outbox = new MemoryOutboxAdapter();
+	const time = '2026-10-13T00:00:00.000Z';
+	const failure = (id: string) => ({
+		identity: { id }, event: { id, model: 'outbox_transaction_account', modelId: 1,
+			operation: 'update' as const, createdAt: time },
+		attempt: 1, maxAttempts: 1, failedAt: time, error: 'delivery failed'
+	});
+	await outbox.deadLetter([failure('existing')]);
+	await assert.rejects(() => outbox.deadLetter([failure('new'), failure('existing')]), /already exists/);
+	assert.deepEqual((await outbox.listDeadLetters()).map((event) => event.id), ['existing']);
+	await outbox.deadLetter([failure('new')]);
+	assert.deepEqual((await outbox.listDeadLetters()).map((event) => event.id), ['existing', 'new']);
+	await assert.rejects(() => outbox.deadLetter([failure('duplicate'), failure('duplicate')]), /already exists/);
+	assert.deepEqual((await outbox.listDeadLetters()).map((event) => event.id), ['existing', 'new']);
+});
+
+for (const restore of ['append', 'requeue'] as const) {
+	test(`memory outbox drain excludes dead-letter-marked events restored through ${restore}`, async () => {
+		const outbox = new MemoryOutboxAdapter();
+		const time = '2026-10-13T00:00:00.000Z';
+		const event = { id: 'marked', model: 'outbox_transaction_account', modelId: 1,
+			operation: 'update' as const, createdAt: time, deadLetteredAt: time };
+		if (restore === 'append') await outbox.append(event);
+		else await outbox.requeue([event]);
+		await outbox.append({ ...event, id: 'future-marked', availableAt: '2999-01-01T00:00:00.000Z' });
+		await outbox.append({ ...event, id: 'deliverable', deadLetteredAt: undefined });
+		assert.deepEqual((await outbox.drain({ limit: 1 })).map((item) => item.id), ['deliverable']);
+		assert.deepEqual((await outbox.list()).map((item) => item.id), ['marked', 'future-marked']);
+		assert.deepEqual(await outbox.drain(), []);
+	});
+}
