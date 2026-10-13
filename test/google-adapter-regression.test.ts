@@ -16815,9 +16815,9 @@ test('Firestore fallback aggregates include id field in selected documents', asy
 	assert.deepEqual(selectedFields, ['id', 'score']);
 });
 
-test('Firestore numeric aggregates use SDK aggregate helpers when available', async () => {
+test('Firestore count aggregates use SDK aggregate helpers when available', async () => {
 	let aggregateSpec: Record<string, unknown> | undefined;
-	let sumCalls = 0;
+	let countCalls = 0;
 	const adapter = await createFirestoreStoreAdapter({
 		client: firestoreClient({
 			collection: () => ({
@@ -16834,11 +16834,8 @@ test('Firestore numeric aggregates use SDK aggregate helpers when available', as
 			getAll: async () => []
 		}),
 		aggregateField: {
-			count: () => ({ type: 'count' }),
-			sum: (field: string) => {
-				sumCalls++;
-				return { type: 'sum', field };
-			},
+			count: () => { countCalls++; return { type: 'count' }; },
+			sum: (field: string) => ({ type: 'sum', field }),
 			average: () => ({ type: 'average' })
 		}
 	});
@@ -16847,12 +16844,12 @@ test('Firestore numeric aggregates use SDK aggregate helpers when available', as
 		await adapter.aggregate!(meta, {
 			where: [],
 			or: [],
-		aggregates: [{ op: 'sum', field: 'score', as: 'total' }]
+		aggregates: [{ op: 'count', as: 'total' }]
 		}),
 		{ total: 10 }
 	);
-	assert.equal(sumCalls, 1);
-	assert.deepEqual(aggregateSpec, { total: { type: 'sum', field: 'score' } });
+	assert.equal(countCalls, 1);
+	assert.deepEqual(aggregateSpec, { total: { type: 'count' } });
 });
 
 test('Firestore aggregate scan fallback is disabled unless explicitly opted in', async () => {
@@ -17700,3 +17697,47 @@ test('Datastore model reads preserve symbol entity key metadata', async () => {
 	assert.deepEqual((loaded?.data as any)?.[ACTIVE_TS_ENTITY_KEY], datastoreKey);
 	assert.equal(Object.prototype.propertyIsEnumerable.call(loaded?.data ?? {}, ACTIVE_TS_ENTITY_KEY), false);
 });
+
+for (const useFallback of [false, true]) {
+	test(`Firestore portable aggregate semantics with scan opt-in ${useFallback}`, async () => {
+		let rows: Record<string, unknown>[] = [{ id: 1, a: 10 }, { id: 2, b: 20 }];
+		let nativeCalls = 0;
+		let scanCalls = 0;
+		const adapter = await createFirestoreStoreAdapter({
+			allowAggregateScanFallback: useFallback,
+			client: firestoreClient({ collection: () => ({
+				aggregate(specs: Record<string, any>) {
+					nativeCalls++;
+					const fields = Object.values(specs).flatMap((spec) => spec.field ? [spec.field] : []);
+					const intersection = rows.filter((row) => fields.every((field) => Object.hasOwn(row, field)));
+					const result = Object.fromEntries(Object.entries(specs).map(([as, spec]) => {
+						const values = intersection.map((row) => row[spec.field]).filter((value): value is number => typeof value === 'number');
+						const total = values.reduce((a, b) => a + b, 0);
+						return [as, spec.op === 'count' ? intersection.length : spec.op === 'sum' ? total : values.length ? total / values.length : null];
+					}));
+					return { get: async () => ({ data: () => result }) };
+				},
+				select() { return this; },
+				get: async () => {
+					scanCalls++;
+					return { docs: rows.map((row) => ({ id: `number:${row.id}`, data: () => row })), size: rows.length };
+				}
+			}) }),
+			aggregateField: { count: () => ({ op: 'count' }), sum: (field: string) => ({ op: 'sum', field }), average: (field: string) => ({ op: 'avg', field }) }
+		});
+		const combined = () => adapter.aggregate!(meta, { where: [], or: [], aggregates: [
+			{ op: 'count', as: 'count' }, { op: 'sum', field: 'a', as: 'sumA' }, { op: 'sum', field: 'b', as: 'sumB' }
+		] });
+		if (useFallback) assert.deepEqual(await combined(), { count: 2, sumA: 10, sumB: 20 });
+		else await assert.rejects(combined, /allowAggregateScanFallback/);
+		for (const op of ['sum', 'avg'] as const) {
+			rows = [{ id: 1, a: 10 }, { id: 2, a: 'bad' }];
+			await assert.rejects(() => adapter.aggregate!(meta, { where: [], or: [], aggregates: [{ op, field: 'a', as: 'result' }] }),
+				useFallback ? /number|numeric/ : /allowAggregateScanFallback/);
+		}
+		assert.equal(nativeCalls, 0);
+		assert.equal(scanCalls, useFallback ? 3 : 0);
+		assert.deepEqual(await adapter.aggregate!(meta, { where: [], or: [], aggregates: [{ op: 'count', as: 'count' }] }), { count: 2 });
+		assert.equal(nativeCalls, 1);
+	});
+}

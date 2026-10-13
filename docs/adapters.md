@@ -9,7 +9,7 @@ an `ActiveContext`; models select adapters by metadata or by context defaults.
 | --- | --- | --- | --- |
 | Memory | `active-ts/adapters/store/memory` | none | deterministic tests and local examples |
 | Datastore | `active-ts/adapters/store/datastore` | `@google-cloud/datastore` | preserves Datastore key metadata as a symbol; uses Datastore aggregation queries when available |
-| Firestore | `active-ts/adapters/store/firestore` | `@google-cloud/firestore` | validates paths; optimizes `count`, `sum`, and `avg` |
+| Firestore | `active-ts/adapters/store/firestore` | `@google-cloud/firestore` | validates paths; optimizes `count`; numeric aggregates require validated scans |
 | MongoDB | `active-ts/adapters/store/mongodb` | `mongodb` | validates names; pipelines count/sum/avg |
 | PostgreSQL | `active-ts/adapters/store/postgresql` | `pg` | stores row data in JSONB; optimizes aggregates with SQL |
 
@@ -1009,8 +1009,13 @@ Built-in optimized paths:
   five aggregate specs are accepted. Specs that would require more than one
   native backend request are rejected rather than combining different
   snapshots; a multi-spec scan requires an explicit `readTime` or transaction
-- Firestore uses aggregate queries for `count`, `sum`, and `avg`; `min` and
-  `max` use an ordered `limit(1)` lookup only for fields declared with
+- Firestore uses native aggregate queries for count-only plans. `sum` and
+  `avg`, including combined count/numeric plans, require
+  `allowAggregateScanFallback: true` and a validated scan. Firestore's native
+  numeric aggregates ignore invalid nonnumeric values and intersect the set
+  of documents containing every requested field, which differs from the
+  portable contract. No scan is started without the explicit opt-in. `min`
+  and `max` use an ordered `limit(1)` lookup only for fields declared with
   scalar `fieldType()` metadata
 
 Some backend SDKs cannot express every portable aggregate semantic natively.
