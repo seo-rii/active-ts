@@ -312,6 +312,45 @@ that `readAt()` point reads and aggregates still observe the pre-update
 snapshot. Fake-SDK regressions separately assert the exact read options passed
 to point, query, aggregate, min/max, and multi-page scan calls.
 
+## Seeded Search Fuzzing
+
+The Meilisearch integration target runs
+[`search-fuzz.mjs`](../test/integration/search-fuzz.mjs) against the real service
+after the shared search contract. Each of two fixed seeds exercises 100 random
+operations plus deterministic edge cases. An independent reference map checks
+full replacement, deletion, numeric/string IDs, custom ID fields, declared
+projection, result limits, marker queries and pagination after mutations.
+Meilisearch also rejects explicit write revisions because it cannot fence stale
+writes. Test indexes disable typo tolerance and prefix matching so the oracle
+compares exact marker membership without depending on search ranking.
+
+To run or replay a seed against your local Meilisearch server:
+
+```sh
+MEILISEARCH_URL=http://127.0.0.1:7700 \
+ACTIVE_TS_INTEGRATION_TARGETS=meilisearch \
+ACTIVE_TS_SEARCH_FUZZ_SEEDS=1592594996 \
+ACTIVE_TS_SEARCH_FUZZ_ITERATIONS=100 \
+pnpm test:integration:backends
+```
+
+When the server uses a master key, set `MEILISEARCH_API_KEY` to a fixture admin
+credential. The runner creates an expiring, index-scoped key with only the
+`search` action and verifies that adapter searches succeed while metadata reads
+and writes return HTTP 403. It removes the temporary key and indexes afterward.
+CI uses a public test-only master key on its disposable service and requires this
+probe; a missing admin key fails. Locally, set
+`ACTIVE_TS_MEILISEARCH_REQUIRE_AUTH=true` to require the same authenticated run.
+A local server without authentication can still run the search contract and
+fuzzing by omitting both variables.
+
+Failure output includes the backend, seed, operation and replay environment.
+The runner creates isolated indexes and removes them on completion. These are
+bounded, reproducible state-machine fuzz tests, not exhaustive input coverage,
+coverage-guided fuzzing, or evidence of production failover and load capacity.
+Task failures, cancellation, timeouts and malformed SDK responses are separately
+covered by injected-client regressions in the default suite.
+
 ## Capability Evidence
 
 The [store capability matrix](adapters.md#portable-store-capability-matrix)
@@ -347,7 +386,7 @@ query scan costs require their own designs and tests.
 
 ### Backend Coverage
 
-The integration and release workflows require all eight configured targets to
+The integration and release workflows require all nine configured targets to
 finish; the runner rejects unknown targets and fails if any requested target is
 missing from the completed set. Backend coverage is not interchangeable:
 
@@ -362,6 +401,7 @@ missing from the completed set. Backend coverage is not interchangeable:
 | Redis 7 | Real server in integration/release CI | Shared cache contract. |
 | Valkey 9.1.2 | Separate real server in integration/release CI | Shared cache contract, including TTL and versioned writes. `INFO server` must identify Valkey before cache operations; Redis cannot satisfy this target. |
 | Elasticsearch 8.15.3 | Real server in integration/release CI | Shared search/native paths and Datastore outbox integration. |
+| Meilisearch CE 1.55.0 | Real server in integration/release CI | Shared search/native paths, successful task completion, typed IDs, ancestor identity, projection and seeded mutation fuzzing. Revision-ordered writes are explicitly unsupported. |
 | Algolia | Injected SDK clients in the default suite | Shared search behavior; no live Algolia integration target. |
 
 [`aggregate-parity.mjs`](../test/integration/aggregate-parity.mjs) adds focused
@@ -419,7 +459,7 @@ pnpm test:integration:backends
 The GitHub `Backend Integration` workflow runs this script on schedule, manual
 dispatch, main pushes, and pull requests that touch adapter, core, testing harness,
 integration, package, or workflow files. It uses PostgreSQL, MongoDB,
-Redis, Valkey, and Elasticsearch service containers, then starts Datastore and
+Redis, Valkey, Elasticsearch, and Meilisearch service containers, then starts Datastore and
 Firestore emulators with Google Cloud CLI. The workflow pins the Elasticsearch
 client to the same major as its service container, pins the Google Cloud SDK
 used for emulator startup, waits for Datastore and Firestore SDK probes before
