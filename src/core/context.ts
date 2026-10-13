@@ -1804,7 +1804,7 @@ export class ActiveContext {
 				assertDirectIdReadAllowed(this.meta(model));
 				let loader = WEAKMAP_GET.call(this.loaders, model) as BatchLoader<any> | undefined;
 				if (!loader) {
-					loader = new BatchLoader<any>((ids) => this.loadManyNow(model, ids), this.maxBatchSize);
+					loader = new BatchLoader<any>((ids) => this.loadManyNow(model, ids), this.maxBatchSize, true);
 					WEAKMAP_SET.call(this.loaders, model, loader);
 				}
 				return (await loader.load(id)) as TModel | null;

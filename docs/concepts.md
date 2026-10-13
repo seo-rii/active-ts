@@ -145,7 +145,9 @@ const context = createActiveTs({
 ## Batch Loading and Cache
 
 `Model.find(id).load()` goes through a per-model batch loader. Loads scheduled in
-the same event-loop turn are coalesced into one `getMany()` store call.
+the same event-loop turn are coalesced into `getMany()` store calls. Each caller
+receives its own mutable model instance and its own `afterInstantiate` lifecycle;
+matching IDs share raw cache/store reads within a request chunk.
 Large batches are chunked before cache/store adapters see them. The default
 chunk size is `500`; set `batch.maxSize` on the context when a backend has a
 lower request limit.

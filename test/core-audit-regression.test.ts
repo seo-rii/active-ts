@@ -176,3 +176,29 @@ test('ordinary numeric version saves remain supported', async () => {
 	await row.save();
 	assert.deepEqual(await store.get(context.meta(VersionRecord), 1), { id: 1, version: 2, name: 'after' });
 });
+
+for (const cached of [false, true]) {
+	test(`concurrent point reads return independent mutable instances (cache=${cached})`, async () => {
+		class IsolatedRecord extends Model<{ id: number; value: { nested: number } }> {}
+		const name = `audit_isolated_${cached}`;
+		defineModel<IsolatedRecord['data']>({ name, ...(cached ? { cache: { ttl: 300 } } : {}) }).id('id')
+			.validate((data) => data as IsolatedRecord['data']).attach(IsolatedRecord);
+		const store = new MemoryStoreAdapter();
+		let hooks = 0;
+		const context = createActiveTs({ stores: { default: store }, caches: { default: new MemoryCacheAdapter() }, plugins: [{ name: 'isolated-hooks', hooks: {
+			afterInstantiate() { hooks++; }
+		} }] });
+		const Records = IsolatedRecord.use(context);
+		await store.seed(name, [{ id: 1, value: { nested: 1 } }]);
+		if (cached) await Records.find(1).load();
+		const beforeReads = store.stats.getMany;
+		hooks = 0;
+		const [left, right] = await Promise.all([Records.find(1).load(), Records.find(1).load()]);
+		assert.ok(left && right);
+		assert.notEqual(left, right);
+		left.data.value.nested = 99;
+		assert.equal(right.data.value.nested, 1);
+		assert.equal(hooks, 2);
+		assert.equal(store.stats.getMany - beforeReads, cached ? 0 : 1);
+	});
+}

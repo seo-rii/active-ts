@@ -17,7 +17,8 @@ export class BatchLoader<T> {
 
 	constructor(
 		private readonly loadMany: LoadMany<T>,
-		private readonly maxSize: number
+		private readonly maxSize: number,
+		private readonly distinctResults = false
 	) {}
 
 	load(id: EntityId) {
@@ -42,7 +43,7 @@ export class BatchLoader<T> {
 
 	private async flush() {
 		this.scheduled = false;
-		const batch = pendingBatches(this.pending);
+		const batch = pendingBatches(this.pending, this.distinctResults);
 		MAP_CLEAR.call(this.pending);
 		if (!batch.length) return;
 		for (const chunk of chunkItems(batch, this.maxSize)) {
@@ -67,10 +68,16 @@ export class BatchLoader<T> {
 	}
 }
 
-function pendingBatches<T>(pending: Map<string, PendingBatch<T>>) {
+function pendingBatches<T>(pending: Map<string, PendingBatch<T>>, distinctResults: boolean) {
 	const batch: Array<PendingBatch<T>> = [];
 	for (const item of MAP_VALUES.call(pending) as Iterable<PendingBatch<T>>) {
-		batch[batch.length] = item;
+		if (distinctResults) {
+			for (let index = 0; index < item.waiters.length; index++) {
+				batch[batch.length] = { id: item.id, waiters: [item.waiters[index]] };
+			}
+		} else {
+			batch[batch.length] = item;
+		}
 	}
 	return batch;
 }
