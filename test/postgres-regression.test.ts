@@ -401,7 +401,7 @@ test('PostgreSQL adapter direct array paths ignore patched Array transforms', as
 			unique: undefined
 		}
 	]);
-	const createIndexCall = calls.find((call) => call.text.startsWith('create index if not exists '));
+	const createIndexCall = calls.find((call) => call.text.startsWith('create index '));
 	assert.match(createIndexCall?.text ?? '', /ARRAY\['handle'\]/);
 	assert.match(createIndexCall?.text ?? '', /ARRAY\['profile', 'name'\]/);
 	assert.match(createIndexCall?.text ?? '', /\bdesc\b/i);
@@ -3774,9 +3774,9 @@ test('PostgreSQL schema apply shortens long generated index names without collis
 	await adapter.schema!.apply([longMeta], { mode: 'safe' });
 
 	const indexNames = calls
-		.filter((sql) => sql.startsWith('create index if not exists '))
+		.filter((sql) => sql.startsWith('create index '))
 		.map((sql) => {
-			const match = sql.match(/^create index if not exists (?:"([^"]+)"|([^\s]+))/);
+			const match = sql.match(/^create index (?:"([^"]+)"|([^\s]+))/);
 			assert.ok(match, `expected index identifier in SQL: ${sql}`);
 			return match[1] ?? match[2];
 		});
@@ -3809,8 +3809,8 @@ test('PostgreSQL unique schema indexes preserve JSON scalar types', async () => 
 
 	await adapter.schema!.apply([typedIndexMeta], { mode: 'safe' });
 
-	const uniqueSql = calls.find((sql) => sql.startsWith('create unique index if not exists '));
-	const lookupSql = calls.find((sql) => sql.startsWith('create index if not exists '));
+	const uniqueSql = calls.find((sql) => sql.startsWith('create unique index '));
+	const lookupSql = calls.find((sql) => sql.startsWith('create index '));
 	assert.ok(uniqueSql, 'expected unique index SQL');
 	assert.ok(lookupSql, 'expected non-unique index SQL');
 	assert.match(uniqueSql, /data #> ARRAY\['id'\]/);
@@ -3849,7 +3849,41 @@ test('PostgreSQL JSON field paths accept core-safe non-SQL-identifier segments',
 	calls.length = 0;
 	await adapter.schema!.apply([dashedFieldMeta], { mode: 'safe' });
 
-	const indexSql = calls.find((call) => call.text.startsWith('create index if not exists '));
+	const indexSql = calls.find((call) => call.text.startsWith('create index '));
 	assert.ok(indexSql, 'expected index SQL');
 	assert.match(indexSql.text, /data #>> ARRAY\['profile', 'first-name'\]/);
+});
+
+test('PostgreSQL new physical index names distinguish model and index boundaries', async () => {
+	const statements: string[] = [];
+	const adapter = await createPostgresStoreAdapter({ pool: { query: async (sql: string) => {
+		statements.push(sql);
+		return { rows: [] };
+	} } });
+	await adapter.schema!.apply([
+		{ ...meta, name: 'audit_user', indexes: [{ name: 'email', fields: ['handle'], unique: true }] },
+		{ ...meta, name: 'audit', indexes: [{ name: 'user_email', fields: ['handle'], unique: true }] }
+	], { mode: 'safe' });
+	const creates = statements.filter((sql) => sql.startsWith('create unique index '));
+	assert.equal(creates.length, 2);
+	const names = creates.map((sql) => sql.slice(0, sql.indexOf(' on ')));
+	assert.notEqual(names[0], names[1]);
+	assert.equal(creates.some((sql) => sql.includes('if not exists')), false);
+});
+
+test('PostgreSQL schema apply retains verified legacy physical index names', async () => {
+	const statements: string[] = [];
+	const name = `${meta.name}_handle_idx`;
+	const adapter = await createPostgresStoreAdapter({ pool: { query: async (sql: string) => {
+		statements.push(sql);
+		if (sql.includes('information_schema.tables')) return { rows: [{}] };
+		if (sql.includes('information_schema.columns')) return { rows: postgresActiveTableColumns };
+		if (sql.includes('from pg_index i')) return { rows: postgresActivePrimaryKey };
+		if (sql.includes('pg_indexes')) return { rows: [{ indexname: name,
+			indexdef: `CREATE UNIQUE INDEX ${name} ON public.${meta.name} USING btree (((data #> ARRAY['handle'::text])))` }] };
+		return { rows: [] };
+	} } });
+	const plan = await adapter.schema!.apply([{ ...meta, indexes: [{ name: 'handle_idx', fields: ['handle'], unique: true }] }], { mode: 'safe' });
+	assert.deepEqual(plan.changes, []);
+	assert.equal(statements.some((sql) => sql.startsWith('create unique index ')), false);
 });

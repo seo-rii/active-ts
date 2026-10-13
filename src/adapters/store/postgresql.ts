@@ -121,14 +121,18 @@ function tableName(options: PostgresStoreOptions, model: ResolvedModelMeta) {
 	return options.schema ? `${quote(options.schema)}.${quote(name)}` : quote(name);
 }
 
-function indexIdentifier(model: ResolvedModelMeta, indexName: string) {
+function indexIdentifier(model: ResolvedModelMeta, indexName: string, legacy = false) {
 	const table = assertSafePhysicalIdentifierLength(
 		assertSafeSchemaIdentifier(model.name, 'PostgreSQL table name'),
 		'PostgreSQL table name',
 		POSTGRES_IDENTIFIER_MAX_BYTES
 	);
 	const index = assertSafeSchemaIdentifier(indexName, 'PostgreSQL index name');
-	return shortenPostgresIdentifier(`${table}_${index}`);
+	if (legacy) return shortenPostgresIdentifier(`${table}_${index}`);
+	// A tuple hash disambiguates names such as ["audit_user", "email"] and
+	// ["audit", "user_email"], whose underscore-joined forms are identical.
+	const hash = createHash('sha256').update(JSON.stringify([table, index])).digest('hex').slice(0, 12);
+	return shortenPostgresIdentifier(`${table}_${index}_${hash}`);
 }
 
 function shortenPostgresIdentifier(identifier: string) {
@@ -1879,9 +1883,11 @@ async function createPostgresStoreAdapterInternal(
 					if (exists) await assertPostgresTableShape(pool, options, model);
 					const existingIndexes = exists ? await existingIndexDefinitions(pool, options, model) : new Map<string, string | undefined>();
 					for (const index of model.indexes) {
-						const existingIndex = MAP_GET.call(existingIndexes, indexIdentifier(model, index.name));
-						if (MAP_HAS.call(existingIndexes, indexIdentifier(model, index.name))) {
-							assertPostgresIndexDefinitionMatches(model, index, existingIndex);
+						const physicalName = indexIdentifier(model, index.name);
+						const legacyName = indexIdentifier(model, index.name, true);
+						const existingName = MAP_HAS.call(existingIndexes, physicalName) ? physicalName : legacyName;
+						if (MAP_HAS.call(existingIndexes, existingName)) {
+							assertPostgresIndexDefinitionMatches(model, index, MAP_GET.call(existingIndexes, existingName));
 							continue;
 						}
 						changes.push({
@@ -1908,9 +1914,14 @@ async function createPostgresStoreAdapterInternal(
 						`create table if not exists ${tableName(options, model)} (id text primary key, data jsonb not null, created_at timestamptz not null default now(), updated_at timestamptz not null default now())`
 					);
 					for (const index of model.indexes) {
+						let missing = false;
+						for (const change of plan.changes) {
+							if (change.type === 'create-index' && change.target === model.name && change.name === index.name) missing = true;
+						}
+						if (!missing) continue;
 						const unique = index.unique ? 'unique ' : '';
 						await pool.query(
-							`create ${unique}index if not exists ${quote(indexIdentifier(model, index.name))} on ${tableName(options, model)} (${postgresIndexFieldsSql(index)})`
+							`create ${unique}index ${quote(indexIdentifier(model, index.name))} on ${tableName(options, model)} (${postgresIndexFieldsSql(index)})`
 						);
 					}
 				}
