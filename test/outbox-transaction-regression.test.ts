@@ -5623,3 +5623,20 @@ test('outbox search sync rejects static modelName accessors without invocation',
 	);
 	assert.equal(modelNameReads, 0);
 });
+
+test('memory outbox dead-letter batch validates every id before publishing any event', async () => {
+	const outbox = new MemoryOutboxAdapter();
+	const time = '2026-10-13T00:00:00.000Z';
+	const failure = (id: string) => ({
+		identity: { id }, event: { id, model: 'outbox_transaction_account', modelId: 1,
+			operation: 'update' as const, createdAt: time },
+		attempt: 1, maxAttempts: 1, failedAt: time, error: 'delivery failed'
+	});
+	await outbox.deadLetter([failure('existing')]);
+	await assert.rejects(() => outbox.deadLetter([failure('new'), failure('existing')]), /already exists/);
+	assert.deepEqual((await outbox.listDeadLetters()).map((event) => event.id), ['existing']);
+	await outbox.deadLetter([failure('new')]);
+	assert.deepEqual((await outbox.listDeadLetters()).map((event) => event.id), ['existing', 'new']);
+	await assert.rejects(() => outbox.deadLetter([failure('duplicate'), failure('duplicate')]), /already exists/);
+	assert.deepEqual((await outbox.listDeadLetters()).map((event) => event.id), ['existing', 'new']);
+});

@@ -290,6 +290,7 @@ export class MemoryOutboxAdapter implements OutboxAdapter {
 
 	async deadLetter(failures: OutboxDeliveryFailure[]) {
 		const normalized = sanitizeOutboxDeliveryFailureBatch(failures, 'memory outbox dead-letter failures', true);
+		const events: OutboxEvent[] = [];
 		const existing = new Set<string>();
 		for (const event of this.deadLetters) SET_ADD.call(existing, event.id);
 		for (let index = 0; index < normalized.length; index++) {
@@ -298,8 +299,9 @@ export class MemoryOutboxAdapter implements OutboxAdapter {
 				throw new ActiveTsConflictError(`Memory outbox dead-letter event id "${event.id}" already exists.`);
 			}
 			SET_ADD.call(existing, event.id);
-			this.deadLetters[this.deadLetters.length] = event;
+			events[events.length] = event;
 		}
+		for (const event of events) this.deadLetters[this.deadLetters.length] = event;
 	}
 
 	private assertAvailableIds(events: readonly OutboxEvent[], context: string) {
