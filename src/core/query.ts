@@ -52,6 +52,7 @@ import {
 	entityIdKey,
 	isOperator,
 	portableScalarKey,
+	pickFields,
 	valueFor,
 	filterRows,
 	withIdField,
@@ -100,6 +101,8 @@ import {
 import { cloneNativePayload } from './native-payload.js';
 import { clonePlanMeta } from './plan-meta.js';
 import {
+	applyFieldCodecs,
+	fieldCodecProjectionFields,
 	copyFieldCodecQueryOperandMarker,
 	encodeAggregatePlanFieldCodecs,
 	encodeQueryPlanFieldCodecs,
@@ -1623,7 +1626,10 @@ export class QueryBuilder<TModel extends { data: any }, TData extends Record<str
 			);
 		}
 		const store = context.storeForQuery(meta, plan);
+		const selectedFields = fieldCodecProjectionFields(meta, plan.select);
+		const expandedProjection = selectedFields !== plan.select;
 		const adapterPlan = stripStoreNativeAdapterTag(cloneQueryBranch(plan));
+		adapterPlan.select = selectedFields === undefined ? undefined : [...selectedFields];
 		const rawQueryResult = await store.query(meta, adapterPlan, {
 			select: adapterPlan.select,
 			native: adapterPlan.native?.payload,
@@ -1645,8 +1651,10 @@ export class QueryBuilder<TModel extends { data: any }, TData extends Record<str
 			let relationInstantiationData: Record<string, any> | undefined;
 			const item = context.instantiate(
 				this.model,
-				raw.list[index],
-				{ partial: !!plan.select?.length },
+				expandedProjection
+					? pickFields(applyFieldCodecs(meta, raw.list[index], 'read'), plan.select!, meta.idField)
+					: raw.list[index],
+				{ partial: !!plan.select?.length, ...(expandedProjection ? { fieldCodecs: false } : {}) },
 				this.retainRelationInstantiationData
 					? (data) => {
 							relationInstantiationData = data;
@@ -1762,7 +1770,7 @@ export class QueryBuilder<TModel extends { data: any }, TData extends Record<str
 				aggregateFields[aggregateFields.length] = meta.datastore.ancestorFields[index];
 			}
 		}
-		const fields = uniqueStrings(aggregateFields);
+		const fields = fieldCodecProjectionFields(meta, uniqueStrings(aggregateFields))!;
 		const select = fields.length && storeCapability(store.capabilities, 'select') ? fields : undefined;
 		const fallbackPlan: QueryPlan<TData> = {
 			where: activePlan.where,

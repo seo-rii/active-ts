@@ -152,6 +152,20 @@ export function hasFieldCodecPathOverlap(meta: ResolvedModelMeta, field: string)
 	return !!findFieldCodecPathMatch(meta, field);
 }
 
+/** Fetch complete encoded parents before projecting domain child paths. */
+export function fieldCodecProjectionFields(meta: ResolvedModelMeta, fields: string[] | undefined) {
+	if (!fields) return fields;
+	const expanded: string[] = [];
+	let changed = false;
+	for (const field of fields) {
+		const match = findFieldCodecPathMatch(meta, field);
+		const selected = match?.relation === 'ancestor' ? match.field : field;
+		changed ||= selected !== field;
+		if (!expanded.includes(selected)) expanded.push(selected);
+	}
+	return changed ? expanded : fields;
+}
+
 export function markFieldCodecQueryOperandsEncoded<TPlan extends object>(plan: TPlan): TPlan {
 	const descriptor = Object.getOwnPropertyDescriptor(plan, FIELD_CODEC_QUERY_OPERANDS_ENCODED);
 	if (descriptor && !WEAKSET_HAS.call(trustedFieldCodecQueryOperandMarkers, plan)) {
