@@ -248,6 +248,10 @@ export class MemoryOutboxAdapter implements OutboxAdapter {
 		const now = new Date();
 		for (let index = 0; index < this.events.length; index++) {
 			const event = sanitizeOutboxEvent(this.events[index], { requireModelId: false });
+			if (event.deadLetteredAt !== undefined) {
+				retained[retained.length] = event;
+				continue;
+			}
 			const checkOrderKeys = outboxEntityOrderCheckKeys(event);
 			const blockOrderKeys = outboxEntityOrderBlockKeys(event);
 			if (
