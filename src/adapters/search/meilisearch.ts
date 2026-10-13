@@ -240,7 +240,7 @@ export async function createMeilisearchSearchAdapter(input: MeilisearchOptions =
 				...(fields.length ? { attributesToSearchOn: fields } : {}), attributesToRetrieve: retrieve }, 'Meilisearch search request');
 			if (!fields.length && searchOptions.native === undefined) return { list: [], more: false, count: 0 };
 			const index = indexMethods(name);
-			await assertPrimaryKey(name);
+			// Search-only API keys cannot read index metadata; validate each returned identity below.
 			const response = await index.search(safeQuery, request);
 			responseObject(response, 'Meilisearch search response');
 			const responsePage = unsigned(own(response, 'page', 'Meilisearch search response'), 'Meilisearch response page');

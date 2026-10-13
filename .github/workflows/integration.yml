@@ -89,6 +89,8 @@ jobs:
         env:
           MEILI_ENV: development
           MEILI_NO_ANALYTICS: 'true'
+          # Public fixture credential for this disposable CI service only.
+          MEILI_MASTER_KEY: active-ts-public-integration-only-master-key
         ports:
           - 7700:7700
         options: >-
@@ -103,6 +105,8 @@ jobs:
       VALKEY_URL: redis://127.0.0.1:6380
       ELASTICSEARCH_URL: http://127.0.0.1:9200
       MEILISEARCH_URL: http://127.0.0.1:7700
+      MEILISEARCH_API_KEY: active-ts-public-integration-only-master-key
+      ACTIVE_TS_MEILISEARCH_REQUIRE_AUTH: 'true'
       DATASTORE_EMULATOR_HOST: 127.0.0.1:8081
       FIRESTORE_EMULATOR_HOST: 127.0.0.1:8082
       GOOGLE_CLOUD_PROJECT: active-ts-emulator

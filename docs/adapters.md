@@ -898,7 +898,14 @@ index's searchable attributes for the declared search fields, and its displayed
 attributes to include those fields, the logical model ID, required Datastore
 ancestor fields and `active_ts_id`. The internal key keeps numeric and string
 IDs distinct; application results retain their original ID type and omit the
-internal key. Existing indexes with a different primary key are rejected.
+internal key. Writes check the index metadata and reject a different primary
+key. Reads validate the returned internal identities without fetching index
+metadata, so an index-scoped API key with only the `search` action can search.
+
+Indexing requires `indexes.get`, `documents.add` and `tasks.get`; deletion
+requires `indexes.get`, `documents.delete` and `tasks.get`. Give applications
+only the actions and index scopes they need. Index/settings provisioning and
+API-key administration remain separate setup responsibilities.
 
 Index writes replace the complete projected document, so fields removed from
 the next projection do not survive a replacement. Index and delete operations

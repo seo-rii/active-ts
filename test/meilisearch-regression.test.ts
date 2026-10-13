@@ -138,14 +138,36 @@ test('Meilisearch rejects failed, canceled, pending, mismatched and errored task
 	await assert.rejects(() => adapter.index(metadata(), 1, { slug: 1 }), (error) => error === timeout);
 });
 
-test('Meilisearch checks primary-key ownership before searches and mutations', async () => {
+test('Meilisearch checks primary-key ownership before mutations', async () => {
 	for (const info of [{ uid: 'meili_record', primaryKey: 'slug' }, { uid: 'wrong', primaryKey: 'active_ts_id' }, { uid: 'meili_record', primaryKey: null }]) {
 		const fixture = fake(); fixture.setInfo(info); const adapter = await createMeilisearchSearchAdapter({ client: fixture.client });
 		await assert.rejects(() => adapter.index(metadata(), 1, { slug: 1 }), /primary|index/i);
 		await assert.rejects(() => adapter.delete(metadata(), 1), /primary|index/i);
-		await assert.rejects(() => adapter.search(metadata(), 'x', {}), /primary|index/i);
 		assert.equal(fixture.requests.some((entry) => entry.operation !== 'info'), false);
 	}
+});
+
+test('Meilisearch searches with search-only credentials while retaining hit and write validation', async () => {
+	const fixture = fake(); const model = metadata();
+	const writer = await createMeilisearchSearchAdapter({ client: fixture.client });
+	await writer.index(model, 1, { slug: 1, title: 'shared number' });
+	await writer.index(model, '1', { slug: '1', title: 'shared string' });
+	fixture.requests.length = 0;
+	const forbidden = Object.assign(new Error('The API key lacks indexes.get permission.'), { code: 'invalid_api_key', status: 403 });
+	fixture.client.getRawIndex = async (name) => {
+		fixture.requests.push({ operation: 'info', value: name });
+		throw forbidden;
+	};
+	const reader = await createMeilisearchSearchAdapter({ client: fixture.client });
+	const result = await reader.search(model, 'shared', {});
+	assert.deepEqual(result.list, [{ slug: 1, title: 'shared number' }, { slug: '1', title: 'shared string' }]);
+	assert.equal(fixture.requests.some((entry) => entry.operation === 'info'), false);
+	fixture.setResponse((response) => ({ ...response, hits: [{ ...response.hits[0], slug: '1' }] }));
+	await assert.rejects(() => reader.search(model, 'shared', {}), ActiveTsValidationError);
+	assert.equal(fixture.requests.some((entry) => entry.operation === 'info'), false);
+	await assert.rejects(() => reader.index(model, 2, { slug: 2, title: 'forbidden' }), (error) => error === forbidden);
+	await assert.rejects(() => reader.delete(model, 1), (error) => error === forbidden);
+	assert.equal(fixture.requests.some((entry) => entry.operation === 'index' || entry.operation === 'delete'), false);
 });
 
 test('Meilisearch owns query, fields and pagination while forwarding native filter parameters', async () => {
