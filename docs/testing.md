@@ -333,6 +333,17 @@ after the real server responds. This supplies real row-state evidence for those
 failure boundaries; it does not simulate network partitions, process crashes,
 or database failover.
 
+[`postgres-concurrency.mjs`](../test/integration/postgres-concurrency.mjs) adds
+twelve PostgreSQL cases with explicitly ordered concurrent connections: stale
+unversioned READ COMMITTED writes, optimistic version conflicts, REPEATABLE
+READ/SERIALIZABLE update failures, statement/snapshot visibility, a row-lock
+timeout, commit/rollback/unknown model lifetimes, shared-cache invalidation, and
+same-ID isolation across schemas. Promise barriers order the schedules; the
+lock test uses the database statement timeout while the owner retains its lock.
+The test records the unversioned lost-update behavior as an explicit limitation,
+not conflict-detection support. Raw external writes are checked with explicit
+invalidation, and no distributed invalidation or automatic retry is assumed.
+
 ## Library Test Suite
 
 For active-ts itself:
