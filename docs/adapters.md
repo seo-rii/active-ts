@@ -823,11 +823,13 @@ const redisWithCodec = await createRedisValkeyCacheAdapter({
 | Native | `active-ts/adapters/search/native` | none | maps search fields to store `textContains` queries |
 | Algolia | `active-ts/adapters/search/algolia` | `algoliasearch` | validates writes; revision-ordered writes are unsupported |
 | Elasticsearch | `active-ts/adapters/search/elasticsearch` | `@elastic/elasticsearch` | supports persistent revision writes and delete tombstones |
+| Meilisearch | `active-ts/adapters/search/meilisearch` | `meilisearch` | waits for successful indexing tasks; revision-ordered writes are unsupported |
 
 Supported peer ranges:
 
 - `algoliasearch`: `^5.0.0`
 - `@elastic/elasticsearch`: `^8.0.0`
+- `meilisearch`: `^0.62.0` (Node.js 22.12+ on Node 22)
 
 Example:
 
@@ -872,6 +874,47 @@ index also deletes its retained fences. `requireRevisionWrites: true` rejects
 direct index and delete calls without a revision. Enable it only after stopping
 or draining older workers, and keep it enabled once all writers share the same
 durable revision allocator.
+
+### Meilisearch
+
+Install `meilisearch` alongside active-ts. The Community Edition can be
+self-hosted; the adapter uses the same HTTP API as hosted Meilisearch.
+
+```ts doc-test=typecheck
+import { createMeilisearchSearchAdapter } from 'active-ts/adapters/search/meilisearch';
+
+const search = await createMeilisearchSearchAdapter({
+  host: 'http://127.0.0.1:7700',
+  apiKey: process.env.MEILISEARCH_API_KEY,
+  indexPrefix: 'app_',
+  taskTimeoutMs: 5_000,
+  taskIntervalMs: 50
+});
+```
+
+Create each `${indexPrefix}${model.name}` index with primary key `active_ts_id`
+before using it. Schema operations return manual setup plans. Configure the
+index's searchable attributes for the declared search fields, and its displayed
+attributes to include those fields, the logical model ID, required Datastore
+ancestor fields and `active_ts_id`. The internal key keeps numeric and string
+IDs distinct; application results retain their original ID type and omit the
+internal key. Existing indexes with a different primary key are rejected.
+
+Index writes replace the complete projected document, so fields removed from
+the next projection do not survive a replacement. Index and delete operations
+wait for the returned task to succeed. Failed or canceled tasks reject; a wait
+timeout does not cancel the remote operation and leaves its outcome unresolved.
+
+Portable full-text queries, projected results and cursor pagination are
+supported. Native options can supply Meilisearch filters or sort settings when
+the corresponding index attributes have been configured. The adapter owns
+query, pagination and field-selection parameters and rejects conflicting native
+options. The server's configured result window still limits pagination.
+
+Portable `where` and revision-fenced writes are unsupported. In particular,
+waiting for a task does not reject older document revisions. Outbox search sync
+therefore retains its normal refusal to use an unfenced backend unless the
+application explicitly enables `allowUnsafeUnfencedSearchWrites`.
 
 ## Registering Adapters
 

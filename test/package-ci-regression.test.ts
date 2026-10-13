@@ -14,7 +14,7 @@ test('Elasticsearch peer range and integration smoke client stay aligned', () =>
 	assert.equal(packageJson.peerDependencies['@elastic/elasticsearch'], '^8.0.0');
 	assert.equal(packageJson.devDependencies['@elastic/elasticsearch'], '^8.19.1');
 	assert.match(integrationWorkflow, /image: docker\.elastic\.co\/elasticsearch\/elasticsearch:8\.15\.3/);
-	assert.match(integrationWorkflow, /ACTIVE_TS_INTEGRATION_TARGETS: postgres,mongodb,redis,elasticsearch,datastore,firestore,sqlite,valkey/);
+	assert.match(integrationWorkflow, /ACTIVE_TS_INTEGRATION_TARGETS: postgres,mongodb,redis,elasticsearch,datastore,firestore,sqlite,valkey,meilisearch/);
 	assert.match(adapterDocs, /@elastic\/elasticsearch`: `\^8\.0\.0`/);
 	assert.match(lockfile, /devDependencies:\n\s+'@elastic\/elasticsearch':\n\s+specifier: \^8\.19\.1\n\s+version: 8\.19\.1/);
 });
@@ -32,6 +32,7 @@ test('backend integration workflows use lockfile-installed optional peers', () =
 		['pg', packageJson.peerDependencies.pg],
 		['mongodb', packageJson.peerDependencies.mongodb],
 		['redis', packageJson.peerDependencies.redis],
+		['meilisearch', packageJson.peerDependencies.meilisearch],
 		['@google-cloud/datastore', packageJson.peerDependencies['@google-cloud/datastore']],
 		['@google-cloud/firestore', packageJson.peerDependencies['@google-cloud/firestore']]
 	] as const;
@@ -61,7 +62,7 @@ test('release workflow runs backend integration smoke before publish', () => {
 	assert.ok(integrationIndex < publishIndex, 'backend integration smoke must run before publish');
 	assert.ok(integrationIndex < packIndex, 'backend integration smoke must run before pack smoke');
 	assert.ok(packIndex < publishIndex, 'pack smoke must run before publish');
-	assert.match(releaseWorkflow, /ACTIVE_TS_INTEGRATION_TARGETS: postgres,mongodb,redis,elasticsearch,datastore,firestore,sqlite,valkey/);
+	assert.match(releaseWorkflow, /ACTIVE_TS_INTEGRATION_TARGETS: postgres,mongodb,redis,elasticsearch,datastore,firestore,sqlite,valkey,meilisearch/);
 	assert.doesNotMatch(releaseWorkflow, /git checkout -- package\.json pnpm-lock\.yaml/);
 });
 
@@ -203,7 +204,7 @@ test('backend integration workflow runs for adapter pull requests and main pushe
 	assert.match(integrationWorkflow, /'pnpm-workspace\.yaml'/);
 	assert.match(integrationWorkflow, /'\.github\/workflows\/release\.yml'/);
 	assert.match(integrationWorkflow, /pnpm test:integration:backends/);
-	assert.match(integrationWorkflow, /ACTIVE_TS_INTEGRATION_TARGETS: postgres,mongodb,redis,elasticsearch,datastore,firestore,sqlite,valkey/);
+	assert.match(integrationWorkflow, /ACTIVE_TS_INTEGRATION_TARGETS: postgres,mongodb,redis,elasticsearch,datastore,firestore,sqlite,valkey,meilisearch/);
 	assert.match(integrationWorkflow, /MONGODB_URL: mongodb:\/\/127\.0\.0\.1:27017\/\?replicaSet=active-ts-rs/);
 	assert.match(integrationWorkflow, /Start MongoDB replica set/);
 	assert.match(integrationWorkflow, /--replSet active-ts-rs --bind_ip_all/);
@@ -840,6 +841,7 @@ test('package adapter exports expose only documented public subpaths', async () 
 		'./adapters/cache/redis-valkey',
 		'./adapters/search/algolia',
 		'./adapters/search/elasticsearch',
+		'./adapters/search/meilisearch',
 		'./adapters/search/memory',
 		'./adapters/search/native',
 		'./adapters/store/datastore',
@@ -868,6 +870,7 @@ test('package adapter exports expose only documented public subpaths', async () 
 		'./adapters/cache/redis-valkey',
 		'./adapters/search/algolia',
 		'./adapters/search/elasticsearch',
+		'./adapters/search/meilisearch',
 		'./adapters/search/memory',
 		'./adapters/search/native',
 		'./testing'

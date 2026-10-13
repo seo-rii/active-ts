@@ -4,6 +4,7 @@ import { runPostgresOutcomeContract } from './postgres-outcome.mjs';
 import { runPostgresConcurrencyContract } from './postgres-concurrency.mjs';
 import { runPostgresSchemaContract } from './postgres-schema.mjs';
 import { runMongoAggregateParity, runFirestoreAggregateParity } from './aggregate-parity.mjs';
+import { runSearchAdapterFuzz } from './search-fuzz.mjs';
 import {
 	StoreOutboxAdapter,
 	createActiveTs,
@@ -23,6 +24,7 @@ import {
 } from '../../build/src/testing/index.js';
 import { createRedisValkeyCacheAdapter } from '../../build/src/adapters/cache/redis-valkey.js';
 import { createElasticsearchSearchAdapter } from '../../build/src/adapters/search/elasticsearch.js';
+import { createMeilisearchSearchAdapter } from '../../build/src/adapters/search/meilisearch.js';
 import {
 	applyDatastoreIdRepairManifest,
 	createDatastoreIdRepairManifest,
@@ -39,7 +41,7 @@ import {
 	storeTrustsDatastoreEntityKeyRows
 } from '../../build/src/core/store-options.js';
 
-const KNOWN_TARGETS = ['postgres', 'mongodb', 'redis', 'valkey', 'elasticsearch', 'datastore', 'firestore', 'sqlite'];
+const KNOWN_TARGETS = ['postgres', 'mongodb', 'redis', 'valkey', 'elasticsearch', 'meilisearch', 'datastore', 'firestore', 'sqlite'];
 const requestedTargets = (process.env.ACTIVE_TS_INTEGRATION_TARGETS ?? 'postgres,mongodb,redis,elasticsearch')
 	.split(',')
 	.map((item) => item.trim())
@@ -1423,6 +1425,79 @@ if (targets.has('firestore')) {
 	} finally {
 		await client.terminate().catch(() => undefined);
 	}
+}
+
+if (targets.has('meilisearch')) {
+	const { Meilisearch } = await import('meilisearch');
+	const client = new Meilisearch({ host: process.env.MEILISEARCH_URL ?? 'http://127.0.0.1:7700', timeout: 5_000 });
+	const prefix = `active_ts_meili_${randomUUID().replace(/-/g, '')}_`;
+	const indexes = new Set();
+	const waitTask = async (pending) => {
+		const task = await pending.waitTask({ timeout: 10_000, interval: 20 });
+		assert.equal(task.status, 'succeeded', `Meilisearch fixture task failed: ${task.error?.code ?? task.status}`);
+		return task;
+	};
+	const prepareModel = async (model) => {
+		const name = `${prefix}${model.name}`;
+		if (indexes.has(name)) return;
+		await waitTask(client.createIndex(name, { primaryKey: 'active_ts_id' }));
+		indexes.add(name);
+		await waitTask(client.index(name).updateSettings({
+			searchableAttributes: [...new Set(model.searchIndexes.flatMap((index) => index.fields))],
+			displayedAttributes: ['*'],
+			filterableAttributes: ['score', 'parentId'],
+			typoTolerance: { enabled: false },
+			prefixSearch: 'disabled',
+			pagination: { maxTotalHits: 1_000 }
+		}));
+	};
+	let meiliError;
+	try {
+		const version = await client.getVersion();
+		assert.equal(version.pkgVersion, '1.55.0', 'Meilisearch smoke must run the pinned server version.');
+		const adapter = await createMeilisearchSearchAdapter({ client, indexPrefix: prefix, taskIntervalMs: 20 });
+		// Only this fixture provisions indexes. Product schema hooks remain manual.
+		const contractAdapter = { ...adapter, schema: { ...adapter.schema, apply: async (models, options) => {
+			const plan = await adapter.schema.apply(models, options);
+			for (const model of models) await prepareModel(model);
+			return plan;
+		} } };
+		await runSearchAdapterContract(contractAdapter, {
+			settleMs: 1_000,
+			pollIntervalMs: 20,
+			nativeProbe: async ({ adapter, model }) => {
+				try {
+					await adapter.index(model, 900, { id: 900, title: 'nativefilterneedle', score: 90 });
+					await adapter.index(model, 901, { id: 901, title: 'nativefilterneedle', score: 10 });
+					const result = await adapter.search(model, 'nativefilterneedle', { native: { filter: 'score >= 80' } });
+					assert.deepEqual(result.list.map((row) => row.id), [900]);
+				} finally {
+					await adapter.delete(model, 900);
+					await adapter.delete(model, 901);
+				}
+			}
+		});
+		class IntegrationMeiliFuzzRecord extends Model {}
+		defineModel({ name: 'integration_meili_fuzz', search: 'meilisearch' })
+			.id('slug')
+			.validate((input) => input)
+			.search('meilisearch', ['title', 'subtitle', 'score'])
+			.attach(IntegrationMeiliFuzzRecord);
+		const context = createActiveTs({ stores: { default: new MemoryStoreAdapter() },
+			search: { meilisearch: adapter }, defaultSearch: 'meilisearch' });
+		await runSearchAdapterFuzz({ adapter, backend: 'meilisearch', meta: context.meta(IntegrationMeiliFuzzRecord),
+			prepareModel, settleMs: 0 });
+		console.log(`Meilisearch ${version.pkgVersion}: real SDK shared search contract, native filter and seeded differential fuzz passed.`);
+		ran++;
+		ranTargets.push('meilisearch');
+	} catch (error) {
+		meiliError = error;
+	}
+	const cleanup = await Promise.allSettled([...indexes].map((name) => waitTask(client.deleteIndex(name))));
+	const errors = cleanup.filter((result) => result.status === 'rejected').map((result) => result.reason);
+	if (meiliError) errors.unshift(meiliError);
+	if (errors.length === 1) throw errors[0];
+	if (errors.length > 1) throw new AggregateError(errors, 'Meilisearch smoke or index cleanup failed.');
 }
 
 if (targets.has('elasticsearch')) {

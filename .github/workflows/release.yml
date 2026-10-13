@@ -69,17 +69,30 @@ jobs:
           --health-interval 15s
           --health-timeout 5s
           --health-retries 10
+      meilisearch:
+        image: getmeili/meilisearch:v1.55.0@sha256:ff546679970126f8822e15d1b6a06bfbff1f2ce2e43f810cfb5258012f92de5c
+        env:
+          MEILI_ENV: development
+          MEILI_NO_ANALYTICS: 'true'
+        ports:
+          - 7700:7700
+        options: >-
+          --health-cmd "curl -fsS http://localhost:7700/health"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     env:
       POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/active_ts
       MONGODB_URL: mongodb://127.0.0.1:27017/?replicaSet=active-ts-rs
       REDIS_URL: redis://127.0.0.1:6379
       VALKEY_URL: redis://127.0.0.1:6380
       ELASTICSEARCH_URL: http://127.0.0.1:9200
+      MEILISEARCH_URL: http://127.0.0.1:7700
       DATASTORE_EMULATOR_HOST: 127.0.0.1:8081
       FIRESTORE_EMULATOR_HOST: 127.0.0.1:8082
       GOOGLE_CLOUD_PROJECT: active-ts-emulator
       GCLOUD_PROJECT: active-ts-emulator
-      ACTIVE_TS_INTEGRATION_TARGETS: postgres,mongodb,redis,elasticsearch,datastore,firestore,sqlite,valkey
+      ACTIVE_TS_INTEGRATION_TARGETS: postgres,mongodb,redis,elasticsearch,datastore,firestore,sqlite,valkey,meilisearch
     permissions:
       contents: read
     steps:
