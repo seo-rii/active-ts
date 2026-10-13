@@ -80,7 +80,7 @@ jobs:
         ports:
           - 9201:9200
         options: >-
-          --health-cmd "curl -fsS http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=1s"
+          --health-cmd "curl -fsS 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=1s'"
           --health-interval 15s
           --health-timeout 5s
           --health-retries 10
