@@ -98,6 +98,7 @@
 		"docs/security.md",
 		"docs/storage-compatibility.md",
 		"docs/testing.md",
+		"docs/datastore-bulk-mutations.md",
 		"README.md",
 		"LICENSE",
 		"CONTRIBUTING.md",
