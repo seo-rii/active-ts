@@ -173,7 +173,12 @@ try {
 	const packDir = path.join(temp, 'pack');
 	const installDir = path.join(temp, 'consumer');
 	await exec('mkdir', ['-p', packDir, installDir]);
-	const { stdout } = await exec('npm', ['pack', '--json', '--pack-destination', packDir], { cwd: root });
+	const suppliedTarball = process.env.ACTIVE_TS_PACKAGE_TARBALL;
+	if (suppliedTarball && !path.isAbsolute(suppliedTarball)) throw new Error('ACTIVE_TS_PACKAGE_TARBALL must be absolute.');
+	const packArgs = suppliedTarball
+		? ['pack', suppliedTarball, '--dry-run', '--ignore-scripts', '--json']
+		: ['pack', '--json', '--pack-destination', packDir];
+	const { stdout } = await exec('npm', packArgs, { cwd: root });
 	const [packResult] = JSON.parse(packJsonFromStdout(stdout));
 	const { filename, files } = packResult;
 	const packedPaths = new Set(files.map((file) => file.path));
@@ -191,7 +196,7 @@ try {
 	await assertPackedMarkdownLinksResolve(root, packedPaths, ['README.md', ...[...packedPaths].filter((file) => file.startsWith('docs/') && file.endsWith('.md'))]);
 	await assertPackedFilesAvoidSecrets(root, files);
 	await assertPackedSourceMapsResolve(root, packedPaths);
-	const tarball = path.join(packDir, filename);
+	const tarball = suppliedTarball ?? path.join(packDir, filename);
 
 	await writeFile(path.join(installDir, 'package.json'), JSON.stringify({ private: true, type: 'module' }));
 	await exec('npm', ['install', '--ignore-scripts', tarball], { cwd: installDir });
@@ -1446,6 +1451,7 @@ function isAllowedPackedPath(file) {
 			'docs/extensions.md',
 			'docs/plugins.md',
 			'docs/quickstart.md',
+			'docs/releases.md',
 			'docs/security.md',
 			'docs/testing.md',
 			'docs/typed-views.md',

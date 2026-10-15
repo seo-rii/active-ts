@@ -95,6 +95,7 @@
 		"docs/extensions.md",
 		"docs/plugins.md",
 		"docs/quickstart.md",
+		"docs/releases.md",
 		"docs/security.md",
 		"docs/testing.md",
 		"README.md",
@@ -112,7 +113,8 @@
 		"test": "pnpm build && node --test build/test/*.test.js",
 		"test:integration:backends": "pnpm build && node test/integration/backend-smoke.mjs",
 		"pack:smoke": "pnpm build && node test/pack-smoke.mjs",
-		"lint": "tsc -p tsconfig.json --noEmit"
+		"lint": "tsc -p tsconfig.json --noEmit",
+		"release:artifact": "node scripts/release-artifact.mjs"
 	},
 	"peerDependencies": {
 		"@elastic/elasticsearch": "^8.0.0",

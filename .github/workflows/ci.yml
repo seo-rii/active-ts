@@ -23,6 +23,7 @@ jobs:
         run: node scripts/setup-pnpm.mjs
       - run: pnpm install --frozen-lockfile
       - run: pnpm run audit
+      - run: node --test scripts/release-artifact.test.mjs
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm pack:smoke

@@ -213,7 +213,23 @@ jobs:
           }
           NODE
       - run: pnpm test:integration:backends
+      - name: Test release manifest verification
+        run: node --test scripts/release-artifact.test.mjs
+      - name: Prepare identifiable release artifact
+        id: artifact
+        run: |
+          node scripts/release-artifact.mjs create "$RUNNER_TEMP/active-ts-release" --require-clean
+          node -e 'const fs = require("node:fs"); const path = require("node:path"); const m = JSON.parse(fs.readFileSync(path.join(process.env.RUNNER_TEMP, "active-ts-release/release-manifest.json"))); fs.appendFileSync(process.env.GITHUB_OUTPUT, "filename=" + m.artifact.filename + "\n");'
       - run: pnpm pack:smoke
+        env:
+          ACTIVE_TS_PACKAGE_TARBALL: ${{ runner.temp }}/active-ts-release/${{ steps.artifact.outputs.filename }}
+      - name: Retain the tested tarball and source manifest
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: active-ts-release-${{ github.sha }}
+          path: ${{ runner.temp }}/active-ts-release/
+          if-no-files-found: error
+          retention-days: 14
 
   publish:
     needs: release
@@ -229,12 +245,17 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
-      - name: Test the locked package-manager bootstrap
-        run: node --test scripts/setup-pnpm.test.mjs
-      - name: Install and audit the exact package manager before executing it
-        run: node scripts/setup-pnpm.mjs
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm pack:smoke
-      - run: npm publish --provenance --access public
+      - name: Download the tested artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: active-ts-release-${{ github.sha }}
+          path: ${{ runner.temp }}/active-ts-release/
+      - name: Verify artifact identity before publishing
+        id: artifact
+        run: |
+          node scripts/release-artifact.mjs verify "$RUNNER_TEMP/active-ts-release" --require-clean
+          node -e 'const fs = require("node:fs"); const path = require("node:path"); const m = JSON.parse(fs.readFileSync(path.join(process.env.RUNNER_TEMP, "active-ts-release/release-manifest.json"))); fs.appendFileSync(process.env.GITHUB_OUTPUT, "filename=" + m.artifact.filename + "\n");'
+      - run: npm publish "$RELEASE_TARBALL" --provenance --access public
         env:
+          RELEASE_TARBALL: ${{ runner.temp }}/active-ts-release/${{ steps.artifact.outputs.filename }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
