@@ -50,7 +50,7 @@ test('backend integration workflows use lockfile-installed optional peers', () =
 
 test('release workflow runs backend integration smoke before publish', () => {
 	const releaseWorkflow = readFileSync('.github/workflows/release.yml', 'utf8');
-	const publishIndex = releaseWorkflow.indexOf('npm publish --provenance --access public');
+	const publishIndex = releaseWorkflow.indexOf('npm publish "$RELEASE_TARBALL" --provenance --access public');
 	const auditIndex = releaseWorkflow.indexOf('pnpm run audit');
 	const integrationIndex = releaseWorkflow.indexOf('pnpm test:integration:backends');
 	const packIndex = releaseWorkflow.indexOf('pnpm pack:smoke');
@@ -87,10 +87,10 @@ test('release publish is guarded to main and isolated from release checks', () =
 		'publish job must run only for main ref dispatches'
 	);
 	assert.doesNotMatch(releaseJob, /id-token: write/);
-	assert.doesNotMatch(releaseJob, /npm publish --provenance --access public/);
+	assert.doesNotMatch(releaseJob, /npm publish "\$RELEASE_TARBALL" --provenance --access public/);
 	assert.match(publishJob, /needs: release/);
 	assert.match(publishJob, /id-token: write/);
-	assert.match(publishJob, /npm publish --provenance --access public/);
+	assert.match(publishJob, /npm publish "\$RELEASE_TARBALL" --provenance --access public/);
 });
 
 test('read-only CI workflows declare least-privilege token permissions', () => {
@@ -268,6 +268,8 @@ test('workflow actions and service images use immutable references', () => {
 test('workflow actions use approved Node 24-compatible releases', () => {
 	const approvedActions = new Map<string, readonly [sha: string, release: string]>([
 		['actions/checkout', ['9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0', 'v7.0.0']],
+		['actions/upload-artifact', ['cf430e030ddbb5b0abf93d22962f4752f3646cd9', 'v7.0.2']],
+		['actions/download-artifact', ['9000827ccba6bdab643e8b6fd33ac0654aef8333', 'v8.0.2']],
 		['actions/setup-node', ['820762786026740c76f36085b0efc47a31fe5020', 'v7.0.0']],
 		['pnpm/action-setup', ['0ebf47130e4866e96fce0953f49152a61190b271', 'v6.0.9']],
 		['google-github-actions/setup-gcloud', ['aa5489c8933f4cc7a4f7d45035b3b1440c9c10db', 'v3.0.1']]
