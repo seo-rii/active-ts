@@ -4,7 +4,7 @@ Use one absolute deadline and request signal across adapter calls and applicatio
 retry attempts. `createExecutionBudget()` performs cooperative checks; it does
 not start retries or cancel an SDK request by itself.
 
-```ts
+```ts doc-test=fragment
 import {
   createActiveTs,
   createExecutionBudget,
@@ -58,7 +58,7 @@ native I/O cancellation is added or implied.
 `signal`, absolute `deadline`, and `remainingMs`. A custom SDK bridge can map
 these to the provider's documented cancellation and timeout options:
 
-```ts
+```ts doc-test=fragment
 const result = await budget.run(async ({ signal, remainingMs }) => {
   // providerRead is application/adapter bridge code, not an active-ts API.
   return await providerRead({ signal, timeoutMs: remainingMs });

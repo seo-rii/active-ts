@@ -93,6 +93,7 @@
 		"docs/adapters.md",
 		"docs/concepts.md",
 		"docs/extensions.md",
+		"docs/execution-budget.md",
 		"docs/plugins.md",
 		"docs/quickstart.md",
 		"docs/security.md",
