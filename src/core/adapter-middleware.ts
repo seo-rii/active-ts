@@ -17,6 +17,7 @@ import type {
 	StoreWriteOptions
 } from './types.js';
 import { ActiveTsConfigurationError, ActiveTsValidationError } from './errors.js';
+import { ExecutionBudget } from './execution-budget.js';
 import { inheritTransactionRollbackObservation } from './error-classification.js';
 import { normalizeAggregateRow } from './aggregate.js';
 import { searchCapability, storeCapability } from './capabilities.js';
@@ -171,14 +172,27 @@ export function createStoreMiddlewareAdapter(
 	return createStoreMiddlewareAdapterWithSource(adapter, middleware, kind);
 }
 
+/** Check a request budget before every store dispatch and transaction callback attempt. */
+export function createStoreExecutionBudgetAdapter(
+	adapter: StoreAdapter,
+	budget: ExecutionBudget,
+	kind?: string
+): StoreAdapter {
+	if (!(budget instanceof ExecutionBudget)) {
+		throw new ActiveTsConfigurationError('Store execution budget must be an ExecutionBudget.');
+	}
+	return createStoreMiddlewareAdapterWithSource(adapter, [], kind, undefined, budget);
+}
+
 function createStoreMiddlewareAdapterWithSource(
 	adapter: StoreAdapter,
 	middleware: StoreMiddleware[],
 	kind?: string,
-	sourceAdapter?: StoreAdapter
+	sourceAdapter?: StoreAdapter,
+	budget?: ExecutionBudget
 ): StoreAdapter {
 	const wrapped = normalizeStoreAdapter(adapter, 'store middleware adapter');
-	const adapterKind = normalizeAdapterKind(kind ?? `${wrapped.kind}+middleware`, 'store middleware adapter kind');
+	const adapterKind = normalizeAdapterKind(kind ?? `${wrapped.kind}+${budget ? 'budget' : 'middleware'}`, 'store middleware adapter kind');
 	const layers = normalizeMiddleware(middleware, 'store middleware');
 	const cacheScope = wrapped.cacheScope ?? sourceAdapter?.cacheScope;
 	const datastoreNamespace = wrapped.datastoreNamespace ?? sourceAdapter?.datastoreNamespace;
@@ -194,7 +208,10 @@ function createStoreMiddlewareAdapterWithSource(
 		runMiddlewareLayers(layers, context, leaf);
 	const runWrite = (context: StoreMiddlewareContext, leaf: () => Promise<any>) =>
 		runRequiredStoreWriteMiddleware(layers, context, leaf, adapterKind);
-	const track = <T>(operation: () => Promise<T>) => trackStoreTransactionOperation(adapter, operation);
+	const track = <T>(operation: () => Promise<T>) => trackStoreTransactionOperation(adapter, async () => {
+		budget?.assertActive();
+		return await operation();
+	});
 	const middlewareAdapter: StoreAdapter = {
 		kind: adapterKind,
 		cacheScope,
@@ -344,26 +361,28 @@ function createStoreMiddlewareAdapterWithSource(
 	};
 	const readTransaction = storeTransactionReader(wrapped);
 	if (readTransaction) {
-		const transaction = createStoreMiddlewareTransaction(readTransaction, layers, adapterKind, middlewareAdapter);
+		const transaction = createStoreMiddlewareTransaction(readTransaction, layers, adapterKind, middlewareAdapter, budget);
 		defineStoreTransactionReader(middlewareAdapter, () => readTransaction() ? transaction : undefined);
 	} else if (wrapped.transaction) {
 		middlewareAdapter.transaction = createStoreMiddlewareTransaction(
 			() => wrapped.transaction,
 			layers,
 			adapterKind,
-			middlewareAdapter
+			middlewareAdapter,
+			budget
 		);
 	}
 	const readSavepoint = storeSavepointReader(wrapped);
 	if (readSavepoint) {
-		const savepoint = createStoreMiddlewareSavepoint(readSavepoint, layers, adapterKind, middlewareAdapter);
+		const savepoint = createStoreMiddlewareSavepoint(readSavepoint, layers, adapterKind, middlewareAdapter, budget);
 		defineStoreSavepointReader(middlewareAdapter, () => readSavepoint() ? savepoint : undefined);
 	} else if (wrapped.savepoint) {
 		middlewareAdapter.savepoint = createStoreMiddlewareSavepoint(
 			() => wrapped.savepoint,
 			layers,
 			adapterKind,
-			middlewareAdapter
+			middlewareAdapter,
+			budget
 		);
 	}
 	const readCapabilities = storeCapabilityReader(wrapped);
@@ -379,9 +398,11 @@ function createStoreMiddlewareSavepoint(
 	readSavepoint: () => StoreAdapter['savepoint'],
 	layers: StoreMiddleware[],
 	adapterKind: string,
-	sourceAdapter: StoreAdapter
+	sourceAdapter: StoreAdapter,
+	budget?: ExecutionBudget
 ): NonNullable<StoreAdapter['savepoint']> {
 	return (fn) => trackStoreTransactionOperation(sourceAdapter, async () => {
+		budget?.assertActive();
 		assertTransactionCallback(fn, 'store middleware savepoint callback');
 		const savepoint = readSavepoint();
 		if (!savepoint) {
@@ -389,9 +410,12 @@ function createStoreMiddlewareSavepoint(
 				`Store adapter "${adapterKind}" does not expose savepoints in this context.`
 			);
 		}
-		return await savepoint((tx) =>
-			fn(createStoreMiddlewareAdapterWithSource(tx, layers, adapterKind, sourceAdapter))
-		);
+		return await savepoint(async (tx) => {
+			budget?.assertActive();
+			const result = await fn(createStoreMiddlewareAdapterWithSource(tx, layers, adapterKind, sourceAdapter, budget));
+			budget?.assertActive();
+			return result;
+		});
 	});
 }
 
@@ -399,9 +423,11 @@ function createStoreMiddlewareTransaction(
 	readTransaction: () => StoreAdapter['transaction'],
 	layers: StoreMiddleware[],
 	adapterKind: string,
-	sourceAdapter: StoreAdapter
+	sourceAdapter: StoreAdapter,
+	budget?: ExecutionBudget
 ): NonNullable<StoreAdapter['transaction']> {
 	return (fn, options) => trackAdapterTransactionOperation(sourceAdapter, async () => {
+		budget?.assertActive();
 		assertTransactionCallback(fn, 'store middleware transaction callback');
 		const transaction = readTransaction();
 		if (!transaction) {
@@ -412,8 +438,9 @@ function createStoreMiddlewareTransaction(
 		const transactionOptions = normalizeStoreTransactionOptions(options, 'store middleware transaction options');
 		return await transaction(
 			inheritTransactionRollbackObservation(fn, async (tx: StoreAdapter) => {
+				budget?.assertActive();
 				let closed: string | undefined;
-				const middlewareTx = createStoreMiddlewareAdapterWithSource(tx, layers, adapterKind, sourceAdapter);
+				const middlewareTx = createStoreMiddlewareAdapterWithSource(tx, layers, adapterKind, sourceAdapter, budget);
 				const guardedTx = createCloseGuardedStoreAdapter(
 					middlewareTx,
 					() => closed,
@@ -424,6 +451,7 @@ function createStoreMiddlewareTransaction(
 					const result = await fn(guardedTx.adapter);
 					closed = 'callback finished';
 					await guardedTx.waitForPendingOperations();
+					budget?.assertActive();
 					return result;
 				} catch (error) {
 					closed = 'rollback';
