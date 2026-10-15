@@ -101,7 +101,7 @@ const config :Workerd.Config = (
   services = [
     (name = "main", worker = (
       modules = [(name = "worker", esModule = embed "worker.mjs")],
-      compatibilityDate = "2026-10-15",
+      compatibilityDate = "2026-10-01",
       compatibilityFlags = ["nodejs_compat"]
     )),
     (name = "internet", network = (allow = []))
