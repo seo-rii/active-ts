@@ -46,6 +46,7 @@ import {
 	createCloseGuardedStoreAdapter,
 	createTransactionOperationTracker
 } from '../src/core/store-options.js';
+import { inheritTransactionRollbackObservation } from '../src/core/error-classification.js';
 
 type TransactionCacheData = {
 	id: number;
@@ -129,11 +130,11 @@ function createMalformedMemorySavepointStore(
 		delete: (model, id, options) => backing.delete(model, id, options),
 		transaction: async (fn, options) => {
 			try {
-				return await backing.transaction(async (tx) => fn({
+				return await backing.transaction(inheritTransactionRollbackObservation(fn, async (tx: StoreAdapter) => fn({
 					...tx,
 					capabilities: { ...(tx.capabilities ?? {}), transaction: false, savepoint: true },
 					savepoint: createSavepoint(tx)
-				}), options);
+				})), options);
 			} catch (error) {
 				onTransactionRollback?.();
 				throw error;
@@ -381,9 +382,8 @@ test('transaction afterRollback callbacks run after adapter rollback completes',
 		events: string[] = [];
 
 		override async transaction<T>(fn: (tx: StoreAdapter) => Promise<T>): Promise<T> {
-			const txStore = new MemoryStoreAdapter();
 			try {
-				return await fn(txStore);
+				return await super.transaction(fn);
 			} catch (error) {
 				this.events.push('adapter rollback');
 				throw error;

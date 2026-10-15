@@ -12,6 +12,15 @@ export class ActiveTsValidationError extends ActiveTsError {}
 export class ActiveTsNotFoundError extends ActiveTsError {}
 export class ActiveTsConflictError extends ActiveTsError {}
 
+/** An adapter's explicit confirmation that its transaction did not commit. */
+export class ActiveTsRolledBackTransactionError extends ActiveTsError {
+	readonly outcome = 'not_committed' as const;
+
+	constructor(message: string, readonly cause: unknown) {
+		super(message);
+	}
+}
+
 export class ActiveTsUnknownTransactionOutcomeError extends ActiveTsError {
 	readonly outcome = 'unknown' as const;
 

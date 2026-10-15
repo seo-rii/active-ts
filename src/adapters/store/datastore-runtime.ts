@@ -7,7 +7,7 @@ import {
 	ActiveTsValidationError,
 	safeErrorMessage
 } from '../../core/errors.js';
-import { markTransactionRollbackSkipped, ownErrorValue } from '../../core/error-classification.js';
+import { confirmTransactionRollback, markTransactionRollbackSkipped, ownErrorValue } from '../../core/error-classification.js';
 import {
 	ACTIVE_TS_ENTITY_KEY,
 	assertSafeCursor,
@@ -2686,9 +2686,13 @@ function createDatastoreAdapter(
 									);
 									continue;
 								}
+								confirmTransactionRollback(fn);
 								throw datastoreTransactionConflict(error);
 							}
-							if (isDatastoreDefiniteCommitFailure(error)) throw error;
+							if (isDatastoreDefiniteCommitFailure(error)) {
+								confirmTransactionRollback(fn);
+								throw error;
+							}
 							throw markTransactionRollbackSkipped(error);
 						}
 						try {
@@ -2699,6 +2703,7 @@ function createDatastoreAdapter(
 								`Datastore transaction failed and rollback failed: ${safeErrorMessage(error)}`
 							));
 						}
+						confirmTransactionRollback(fn);
 						throw error;
 					}
 				}

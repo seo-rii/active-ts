@@ -92,6 +92,7 @@
 		"src",
 		"docs/adapters.md",
 		"docs/concepts.md",
+		"docs/cache-transaction-contracts.md",
 		"docs/extensions.md",
 		"docs/plugins.md",
 		"docs/quickstart.md",
