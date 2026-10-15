@@ -16,9 +16,15 @@ export type RedisValkeyOptions = {
 	url?: string;
 	prefix?: string;
 	codec?: CacheCodec<string | Buffer>;
+	/** Maximum encoded payload bytes per entry, checked before writes and decoding. */
+	maxPayloadBytes?: number;
 };
-const REDIS_VALKEY_OPTION_KEYS = ['client', 'url', 'prefix', 'codec'] as const;
+const REDIS_VALKEY_OPTION_KEYS = ['client', 'url', 'prefix', 'codec', 'maxPayloadBytes'] as const;
 const CACHE_WRITE_OPTION_KEYS = ['ttl'] as const;
+const UTF8_BYTE_LENGTH = Buffer.byteLength;
+const TYPED_ARRAY_BYTE_LENGTH = Object.getOwnPropertyDescriptor(
+	Object.getPrototypeOf(Uint8Array.prototype), 'byteLength'
+)!.get!;
 // Missing-value revisions are fences, not durable data. CAS always rejects a missing
 // revision, so expiry can only cause a safe retry with a newly generated token.
 const VERSION_TOMBSTONE_TTL_SECONDS = 24 * 60 * 60;
@@ -117,17 +123,19 @@ export async function createRedisValkeyCacheAdapter(options: RedisValkeyOptions 
 	const versionKey = (raw: string) => redisValkeyVersionKey(key(raw));
 	const encode = async (entryKey: string, value: any) => {
 		const physicalKey = key(entryKey);
-		if (!codec) return pack(value);
-		return cloneRedisValkeyEncodedPayload(
+		const encoded = !codec ? pack(value) : normalizeRedisValkeyEncodedPayload(
 			await codec.encode(structuredClone(value), {
 				key: physicalKey,
 				adapter: 'redis-valkey',
 				operation: 'set'
 			})
 		);
+		assertRedisPayloadSize(encoded, options.maxPayloadBytes);
+		return cloneRedisValkeyEncodedPayload(encoded);
 	};
 	const decode = async (entryKey: string, value: string | Buffer | null) => {
 		if (value === null) return undefined;
+		assertRedisPayloadSize(value, options.maxPayloadBytes);
 		const physicalKey = key(entryKey);
 		const decoded = !codec
 			? unpack(value)
@@ -256,15 +264,19 @@ export async function createRedisValkeyCacheAdapter(options: RedisValkeyOptions 
 			entries = normalizeCacheVersionedEntries(entries, 'redis-valkey versioned cache entries');
 			writeOptions = normalizeCacheWriteOptions(writeOptions, 'redis-valkey versioned cache write options');
 			const ttl = assertSafeTtl(writeOptions.ttl, 'redis-valkey versioned cache ttl');
+			const encoded: Array<string | Buffer> = [];
+			for (let index = 0; index < entries.length; index++) {
+				encoded[index] = await encode(entries[index][0], entries[index][1]);
+			}
 			const tasks: Array<Promise<boolean>> = [];
 			for (let index = 0; index < entries.length; index++) {
-				const [entryKey, value, expectedVersion] = entries[index];
+				const [entryKey, , expectedVersion] = entries[index];
 				tasks[index] = (async () => {
 					const reply = await client.eval!(VERSIONED_SET_SCRIPT, {
 						keys: [key(entryKey), versionKey(entryKey)],
 						arguments: [
 							expectedVersion,
-							await encode(entryKey, value),
+							encoded[index],
 							ttl === undefined ? '' : String(Math.ceil(ttl)),
 							createRedisVersionToken(),
 							String(VERSION_TOMBSTONE_TTL_SECONDS)
@@ -469,6 +481,12 @@ function validateRedisValkeyOptions(options: RedisValkeyOptions) {
 	const url = ownFactoryOptionValue(record, 'url', 'redis-valkey cache option');
 	const prefix = ownFactoryOptionValue(record, 'prefix', 'redis-valkey cache option');
 	const codec = ownFactoryOptionValue(record, 'codec', 'redis-valkey cache option');
+	const maxPayloadBytes = ownFactoryOptionValue(record, 'maxPayloadBytes', 'redis-valkey cache option');
+	if (maxPayloadBytes !== undefined && (
+		typeof maxPayloadBytes !== 'number' || !Number.isSafeInteger(maxPayloadBytes) || maxPayloadBytes < 1
+	)) {
+		throw new ActiveTsValidationError('redis-valkey cache maxPayloadBytes must be a positive safe integer.');
+	}
 	if (url !== undefined && typeof url !== 'string') {
 		throw new ActiveTsValidationError('redis-valkey cache url must be a string.');
 	}
@@ -482,7 +500,15 @@ function validateRedisValkeyOptions(options: RedisValkeyOptions) {
 	if (codec !== undefined) {
 		normalizeRedisValkeyCodec(codec);
 	}
-	return { client, url, prefix, codec: codec === undefined ? undefined : normalizeRedisValkeyCodec(codec) } as RedisValkeyOptions;
+	return { client, url, prefix, codec: codec === undefined ? undefined : normalizeRedisValkeyCodec(codec), maxPayloadBytes } as RedisValkeyOptions;
+}
+
+function assertRedisPayloadSize(value: string | Buffer, maxPayloadBytes: number | undefined) {
+	if (maxPayloadBytes === undefined) return;
+	const bytes = typeof value === 'string' ? UTF8_BYTE_LENGTH(value, 'utf8') : TYPED_ARRAY_BYTE_LENGTH.call(value);
+	if (bytes > maxPayloadBytes) {
+		throw new ActiveTsValidationError(`redis-valkey cache payload exceeds maxPayloadBytes (${maxPayloadBytes} bytes).`);
+	}
 }
 
 function assertPlainFactoryOptions(options: object, context: string) {
