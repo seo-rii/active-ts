@@ -9,6 +9,7 @@ import {
 	createActiveTs,
 	createExecutionBudget,
 	createStoreExecutionBudgetAdapter,
+	datastoreKey,
 	defineModel,
 	MemoryStoreAdapter,
 	Model,
@@ -52,6 +53,27 @@ test('run exposes the original signal and remaining absolute budget to a provide
 		assert.equal(Object.isFrozen(state), true);
 		return 'provider result';
 	}), 'provider result');
+});
+
+test('run checks and forwards one deadline snapshot without dispatching a zero budget', async () => {
+	const budget = createExecutionBudget({ deadline: 1_000 });
+	const originalNow = Date.now;
+	let clockReads = 0;
+	let dispatches = 0;
+	Date.now = () => clockReads++ === 0 ? 999 : 1_000;
+	try {
+		await budget.run(async (state) => {
+			dispatches++;
+			assert.equal(state.remainingMs, 1);
+		});
+		assert.equal(clockReads, 1);
+		await assert.rejects(() => budget.run(async () => { dispatches++; }), {
+			reason: 'deadline', phase: 'before-dispatch'
+		});
+		assert.equal(dispatches, 1);
+	} finally {
+		Date.now = originalNow;
+	}
 });
 
 test('expired budgets reject dispatch and an excessive backoff never starts another attempt', async () => {
@@ -100,6 +122,88 @@ test('store budget rejects writes before the required middleware leaf is dispatc
 	await assert.rejects(() => store.get(meta, 1), aborted);
 	assert.deepEqual(await source.get(meta, 1), { id: 1, value: 'original' });
 	assert.equal(await source.get(meta, 2), null);
+});
+
+test('abort during a valid Datastore ancestor resolver prevents source writes', async () => {
+	for (const operation of ['create', 'update'] as const) {
+		const controller = new AbortController();
+		let resolutions = 0;
+		let writes = 0;
+		class AncestorRecord extends Model<{ id: number; parentId: number }> {}
+		defineModel<{ id: number; parentId: number }>(`budget_ancestor_${operation}`)
+			.id('id')
+			.datastore({
+				ancestor: ({ data }) => {
+					resolutions++;
+					controller.abort();
+					return datastoreKey('budget_parent', data!.parentId);
+				},
+				ancestorFields: ['parentId']
+			})
+			.attach(AncestorRecord);
+		const source: StoreAdapter = {
+			kind: 'budget-ancestor-source', capabilities: { datastoreAncestor: true },
+			get: async () => null,
+			getMany: async () => [],
+			query: async () => ({ list: [] }),
+			create: async () => { writes++; },
+			update: async () => { writes++; },
+			delete: async () => undefined
+		};
+		const meta = createActiveTs({ stores: { default: source } }).meta(AncestorRecord);
+		const store = createStoreExecutionBudgetAdapter(source, createExecutionBudget({ signal: controller.signal }));
+		await assert.rejects(() => store[operation](meta, 1, { id: 1, parentId: 2 }, {
+			meta: { datastoreAncestor: datastoreKey('budget_parent', 2) }
+		}), aborted);
+		assert.ok(resolutions > 0);
+		assert.equal(writes, 0, operation);
+	}
+});
+
+test('store operations recheck the deadline at source dispatch after validation', async () => {
+	const meta = metadata();
+	let sourceCalls = 0;
+	const source: StoreAdapter = {
+		kind: 'budget-deadline-source', capabilities: { aggregate: true, transaction: true, savepoint: true },
+		get: async () => { sourceCalls++; return null; },
+		getMany: async () => { sourceCalls++; return []; },
+		query: async () => { sourceCalls++; return { list: [] }; },
+		aggregate: async () => { sourceCalls++; return { total: 0 }; },
+		create: async () => { sourceCalls++; },
+		update: async () => { sourceCalls++; },
+		delete: async () => { sourceCalls++; },
+		transaction: async (fn) => { sourceCalls++; return await fn(source); },
+		savepoint: async (fn) => { sourceCalls++; return await fn(source); },
+		schema: {
+			plan: async () => { sourceCalls++; return { adapter: 'budget-deadline-source', changes: [] }; },
+			apply: async () => { sourceCalls++; return { adapter: 'budget-deadline-source', changes: [] }; }
+		}
+	};
+	const operations: Array<(store: StoreAdapter) => Promise<unknown>> = [
+		store => store.get(meta, 1),
+		store => store.getMany(meta, [1]),
+		store => store.query(meta, { where: [], or: [], sort: [], include: [] }),
+		store => store.aggregate!(meta, { where: [], or: [], aggregates: [{ op: 'count', as: 'total' }] }),
+		store => store.create(meta, 1, { id: 1, value: 'blocked' }),
+		store => store.update(meta, 1, { id: 1, value: 'blocked' }),
+		store => store.delete(meta, 1),
+		store => store.transaction!(async () => undefined),
+		store => store.savepoint!(async () => undefined),
+		store => store.schema!.plan([meta]),
+		store => store.schema!.apply([meta], { mode: 'safe' })
+	];
+	const originalNow = Date.now;
+	for (const operation of operations) {
+		const store = createStoreExecutionBudgetAdapter(source, createExecutionBudget({ deadline: 1_000 }));
+		let clockReads = 0;
+		Date.now = () => clockReads++ === 0 ? 999 : 1_000;
+		try {
+			await assert.rejects(() => operation(store), { reason: 'deadline', phase: 'before-dispatch' });
+		} finally {
+			Date.now = originalNow;
+		}
+	}
+	assert.equal(sourceCalls, 0);
 });
 
 test('budget integration prevents model writes through a request-local context', async () => {

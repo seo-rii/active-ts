@@ -58,8 +58,16 @@ export class ExecutionBudget {
 	}
 
 	assertActive(phase: ActiveTsExecutionBudgetError['phase'] = 'before-dispatch'): void {
-		if (this.signal?.aborted) throw new ActiveTsExecutionBudgetError('aborted', phase, this.signal.reason);
-		if (this.remainingMs === 0) throw new ActiveTsExecutionBudgetError('deadline', phase);
+		this.activeState(phase);
+	}
+
+	private activeState(phase: ActiveTsExecutionBudgetError['phase']): ExecutionBudgetState {
+		const signal = this.signal;
+		const deadline = this.deadline;
+		if (signal?.aborted) throw new ActiveTsExecutionBudgetError('aborted', phase, signal.reason);
+		const remainingMs = deadline === undefined ? undefined : Math.max(0, deadline - Date.now());
+		if (remainingMs === 0) throw new ActiveTsExecutionBudgetError('deadline', phase);
+		return { signal, deadline, remainingMs };
 	}
 
 	/** Dispatch once. This does not race the result against abort/deadline or retry it. */
@@ -67,8 +75,8 @@ export class ExecutionBudget {
 		if (typeof operation !== 'function') {
 			throw new ActiveTsConfigurationError('Execution budget operation must be a function.');
 		}
-		this.assertActive();
-		return await operation(Object.freeze({ signal: this.signal, deadline: this.deadline, remainingMs: this.remainingMs }));
+		const state = this.activeState('before-dispatch');
+		return await operation(Object.freeze(state));
 	}
 
 	/** Wait before an application-owned retry; reject if the full delay cannot fit. */
@@ -76,8 +84,7 @@ export class ExecutionBudget {
 		if (!Number.isSafeInteger(milliseconds) || milliseconds < 0) {
 			throw new ActiveTsConfigurationError('Execution budget backoff must be a non-negative safe integer.');
 		}
-		this.assertActive('backoff');
-		const remaining = this.remainingMs;
+		const { remainingMs: remaining } = this.activeState('backoff');
 		if (remaining !== undefined && milliseconds >= remaining) {
 			throw new ActiveTsExecutionBudgetError('deadline', 'backoff');
 		}

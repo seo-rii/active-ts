@@ -204,10 +204,14 @@ function createStoreMiddlewareAdapterWithSource(
 	const trustsDatastoreEntityKeyRows =
 		storeTrustsDatastoreEntityKeyRows(adapter) ||
 		(sourceAdapter ? storeTrustsDatastoreEntityKeyRows(sourceAdapter) : false);
+	const dispatch = <T>(operation: () => Promise<T>): Promise<T> => {
+		budget?.assertActive();
+		return operation();
+	};
 	const run = (context: StoreMiddlewareContext, leaf: () => Promise<any>) =>
-		runMiddlewareLayers(layers, context, leaf);
+		runMiddlewareLayers(layers, context, () => dispatch(leaf));
 	const runWrite = (context: StoreMiddlewareContext, leaf: () => Promise<any>) =>
-		runRequiredStoreWriteMiddleware(layers, context, leaf, adapterKind);
+		runRequiredStoreWriteMiddleware(layers, context, () => dispatch(leaf), adapterKind);
 	const track = <T>(operation: () => Promise<T>) => trackStoreTransactionOperation(adapter, async () => {
 		budget?.assertActive();
 		return await operation();
@@ -220,7 +224,7 @@ function createStoreMiddlewareAdapterWithSource(
 		datastoreDatabaseId,
 		datastoreKeyEncoding,
 		capabilities: wrapped.capabilities,
-		schema: wrapStoreMiddlewareSchema(wrapped.schema, adapterKind, track),
+		schema: wrapStoreMiddlewareSchema(wrapped.schema, adapterKind, track, dispatch),
 		get: (model: ResolvedModelMeta, id: EntityId, options?: StoreReadOptions) => track(async () => {
 			model = snapshotAdapterModel(model, 'store middleware model metadata');
 			const safeId = normalizeMiddlewareEntityId(id, 'store middleware get id');
@@ -410,6 +414,7 @@ function createStoreMiddlewareSavepoint(
 				`Store adapter "${adapterKind}" does not expose savepoints in this context.`
 			);
 		}
+		budget?.assertActive();
 		return await savepoint(async (tx) => {
 			budget?.assertActive();
 			const result = await fn(createStoreMiddlewareAdapterWithSource(tx, layers, adapterKind, sourceAdapter, budget));
@@ -436,6 +441,7 @@ function createStoreMiddlewareTransaction(
 			);
 		}
 		const transactionOptions = normalizeStoreTransactionOptions(options, 'store middleware transaction options');
+		budget?.assertActive();
 		return await transaction(
 			inheritTransactionRollbackObservation(fn, async (tx: StoreAdapter) => {
 				budget?.assertActive();
@@ -646,14 +652,15 @@ export function createSearchMiddlewareAdapter(
 function wrapStoreMiddlewareSchema(
 	schema: StoreAdapter['schema'],
 	adapterKind: string,
-	track: <T>(operation: () => Promise<T>) => Promise<T>
+	track: <T>(operation: () => Promise<T>) => Promise<T>,
+	dispatch: <T>(operation: () => Promise<T>) => Promise<T>
 ): StoreAdapter['schema'] {
 	if (!schema) return undefined;
 	return {
 		plan: (models) => track(async () => {
 			const safeModels = normalizeSchemaModels(models, 'store middleware schema models');
 			return normalizeSchemaPlan(
-				await schema.plan(safeModels),
+				await dispatch(() => schema.plan(safeModels)),
 				`store middleware adapter "${adapterKind}" schema plan`
 			);
 		}),
@@ -661,7 +668,7 @@ function wrapStoreMiddlewareSchema(
 			const safeModels = normalizeSchemaModels(models, 'store middleware schema models');
 			const safeOptions = normalizeStoreSchemaApplyOptions(options, 'store middleware schema apply options');
 			return normalizeSchemaPlan(
-				await schema.apply(safeModels, safeOptions),
+				await dispatch(() => schema.apply(safeModels, safeOptions)),
 				`store middleware adapter "${adapterKind}" schema apply plan`
 			);
 		})
