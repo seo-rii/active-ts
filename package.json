@@ -164,7 +164,7 @@
 		"@types/pg-format": "^1.0.5",
 		"esbuild": "0.28.2",
 		"typescript": "^5.9.3",
-		"workerd": "1.20261015.1"
+		"workerd": "1.20261014.1"
 	},
 	"engines": {
 		"node": ">=22"
