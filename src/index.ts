@@ -23,6 +23,7 @@ export * from './core/function-cache.js';
 export * from './core/cache-codec.js';
 export * from './core/field-types.js';
 export * from './core/adapter-middleware.js';
+export * from './core/execution-budget.js';
 export * from './core/outbox.js';
 export * from './core/validation-adapters.js';
 export * from './core/soft-delete.js';

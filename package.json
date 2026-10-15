@@ -94,6 +94,7 @@
 		"docs/concepts.md",
 		"docs/cache-transaction-contracts.md",
 		"docs/extensions.md",
+		"docs/execution-budget.md",
 		"docs/plugins.md",
 		"docs/quickstart.md",
 		"docs/security.md",
