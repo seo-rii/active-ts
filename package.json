@@ -81,6 +81,10 @@
 		"./testing": {
 			"types": "./build/src/testing/index.d.ts",
 			"import": "./build/src/testing/index.js"
+		},
+		"./adapters/store/datastore-injected": {
+			"types": "./build/src/adapters/store/datastore-injected.d.ts",
+			"import": "./build/src/adapters/store/datastore-injected.js"
 		}
 	},
 	"files": [
@@ -97,7 +101,8 @@
 		"LICENSE",
 		"CONTRIBUTING.md",
 		"SECURITY.md",
-		"docs/typed-views.md"
+		"docs/typed-views.md",
+		"docs/workers.md"
 	],
 	"scripts": {
 		"prepack": "pnpm build",
@@ -157,7 +162,9 @@
 		"@elastic/elasticsearch": "^8.19.1",
 		"@types/node": "^22.19.19",
 		"@types/pg-format": "^1.0.5",
-		"typescript": "^5.9.3"
+		"esbuild": "0.28.2",
+		"typescript": "^5.9.3",
+		"workerd": "1.20261015.1"
 	},
 	"engines": {
 		"node": ">=22"

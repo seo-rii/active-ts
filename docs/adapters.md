@@ -9,6 +9,7 @@ an `ActiveContext`; models select adapters by metadata or by context defaults.
 | --- | --- | --- | --- |
 | Memory | `active-ts/adapters/store/memory` | none | deterministic tests and local examples |
 | Datastore | `active-ts/adapters/store/datastore` | `@google-cloud/datastore` | preserves Datastore key metadata as a symbol; uses Datastore aggregation queries when available |
+| Datastore injected | `active-ts/adapters/store/datastore-injected` | injected SDK client | no runtime SDK loader; see [Workers](workers.md) for validation limits |
 | Firestore | `active-ts/adapters/store/firestore` | `@google-cloud/firestore` | validates paths; optimizes `count`; numeric aggregates require validated scans |
 | MongoDB | `active-ts/adapters/store/mongodb` | `mongodb` | validates names; pipelines count/sum/avg |
 | PostgreSQL | `active-ts/adapters/store/postgresql` | `pg` | stores row data in JSONB; optimizes aggregates with SQL |
