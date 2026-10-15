@@ -2,6 +2,7 @@ import { ActiveTsConfigurationError } from './errors.js';
 import { MAP_HAS, MAP_KEYS, MAP_SIZE } from './collection-intrinsics.js';
 import { assertNoOverlappingFieldPaths } from './query-utils.js';
 import { assertDenseArrayItems, assertSafeFieldPath } from './safe-keys.js';
+import { assertSafeDatastoreIndexExclusionPath, datastoreIndexExclusionOverlapsField } from './datastore-index-path.js';
 import type { DatastoreModelMeta, FieldCodec, FieldType, IndexMeta, SearchIndexMeta } from './types.js';
 
 export function validateModelFieldTransformMetadata(
@@ -75,8 +76,8 @@ export function validateDatastoreUnindexedMetadata<TData>(
 	}
 	assertDenseArrayItems(rawFields, `Datastore unindexed fields for ${modelName}`);
 	for (let index = 0; index < rawFields.length; index++) {
-		const field = assertSafeFieldPath(rawFields[index], `Datastore unindexed field for ${modelName}`);
-		if (fieldPathsOverlap(field, idField)) {
+		const field = assertSafeDatastoreIndexExclusionPath(rawFields[index], `Datastore unindexed field for ${modelName}`);
+		if (datastoreIndexExclusionOverlapsField(field, idField)) {
 			throw new ActiveTsConfigurationError(
 				`Datastore unindexed field "${field}" for ${modelName} cannot overlap id field "${idField}". Datastore id lookups require the id field to remain indexed.`
 			);
@@ -85,7 +86,7 @@ export function validateDatastoreUnindexedMetadata<TData>(
 			const schemaIndex = indexes[indexIndex];
 			for (let fieldIndex = 0; fieldIndex < schemaIndex.fields.length; fieldIndex++) {
 				const indexedField = schemaIndex.fields[fieldIndex];
-				if (!fieldPathsOverlap(field, indexedField)) continue;
+				if (!datastoreIndexExclusionOverlapsField(field, indexedField)) continue;
 				throw new ActiveTsConfigurationError(
 					`Datastore unindexed field "${field}" for ${modelName} overlaps indexed field "${indexedField}" in index "${schemaIndex.name}". Remove the field from datastore.unindexed or from the index.`
 				);

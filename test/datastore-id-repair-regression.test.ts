@@ -104,6 +104,18 @@ function keyWinsManifest(issues = [numericIssue(), namedIssue()]) {
 	});
 }
 
+test('Datastore ID repair exclusions validate array paths and cannot disguise the indexed ID', () => {
+	for (const field of ['id[]', 'id.*', 'constructor[]', 'details[0].note', 'details.*.note']) {
+		assert.throws(() => createDatastoreIdRepairManifest({
+			report: inventoryReport(),
+			issues: [numericIssue(), namedIssue()],
+			target: REPAIR_TARGET,
+			policy: 'key-wins',
+			excludeFromIndexes: [field]
+		}), /overlap ID field|Reserved|must use dotted fields/, field);
+	}
+});
+
 test('Datastore ID repair manifests preserve reviewed inventory and derive policy operations', () => {
 	const keyWins = createDatastoreIdRepairManifest({
 		report: inventoryReport(),

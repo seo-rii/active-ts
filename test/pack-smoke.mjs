@@ -1447,6 +1447,7 @@ function isAllowedPackedPath(file) {
 			'docs/plugins.md',
 			'docs/quickstart.md',
 			'docs/security.md',
+			'docs/storage-compatibility.md',
 			'docs/testing.md',
 			'docs/typed-views.md',
 			'docs/workers.md'

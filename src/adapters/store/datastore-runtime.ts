@@ -3741,10 +3741,11 @@ function createDatastoreAdapter(
 						);
 						}
 						MAP_SET.call(seenKeys, identity, index);
+						const storedData = cloneSafeDataObjectWithoutActiveEntityKey(clean, `${entryContext}.data`);
 						const estimatedEntityBytes = datastoreBulkValueBytes(
 							{
 								key: identity,
-								data: clean,
+								data: storedData,
 								excludeFromIndexes: model.datastore?.unindexed
 							},
 							entryContext
@@ -3752,7 +3753,7 @@ function createDatastoreAdapter(
 						if (estimatedEntityBytes > DATASTORE_MAX_ENTITY_BYTES) {
 							throw new ActiveTsValidationError(`${entryContext} exceeds the Datastore entity size limit.`);
 						}
-						entities[entities.length] = entityPayloadFromAncestor(model, id, clean, ancestor);
+						entities[entities.length] = entityPayloadFromAncestor(model, id, storedData, ancestor);
 						entityBytes[entityBytes.length] = estimatedEntityBytes + DATASTORE_BULK_MUTATION_OVERHEAD_BYTES;
 					}
 					await runBulkMutation(

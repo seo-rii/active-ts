@@ -96,6 +96,7 @@
 		"docs/plugins.md",
 		"docs/quickstart.md",
 		"docs/security.md",
+		"docs/storage-compatibility.md",
 		"docs/testing.md",
 		"README.md",
 		"LICENSE",
