@@ -847,6 +847,7 @@ test('package adapter exports expose only documented public subpaths', async () 
 		'./adapters/search/native',
 		'./adapters/search/opensearch',
 		'./adapters/store/datastore',
+		'./adapters/store/datastore-injected',
 		'./adapters/store/firestore',
 		'./adapters/store/memory',
 		'./adapters/store/mongodb',
@@ -863,6 +864,7 @@ test('package adapter exports expose only documented public subpaths', async () 
 	);
 	for (const name of [
 		'./adapters/store/datastore',
+		'./adapters/store/datastore-injected',
 		'./adapters/store/firestore',
 		'./adapters/store/memory',
 		'./adapters/store/mongodb',

@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { runWorkersStaticSmoke } from './workers-static-smoke.mjs';
 import { scanTextForForbiddenSecrets } from '../build/test/secret-scan-rules.js';
 
 const exec = promisify(execFile);
@@ -133,6 +134,7 @@ const PUBLIC_SUBPATH_SMOKE_EXPORTS = {
 		'inventoryDatastoreIds',
 		'isDatastoreInt64Id'
 	],
+	'./adapters/store/datastore-injected': ['createDatastoreStoreAdapter', 'createDatastoreNamespaceStoreFactory', 'inventoryDatastoreIds'],
 	'./adapters/store/firestore': ['createFirestoreStoreAdapter'],
 	'./adapters/store/memory': ['MemoryStoreAdapter'],
 	'./adapters/store/mongodb': ['createMongoStoreAdapter'],
@@ -1314,6 +1316,8 @@ export const models = [PackedCliRecord];
 	assert.match(diff.stdout, /packed_cli_record/);
 	assert.equal(diff.stderr, '');
 
+await runWorkersStaticSmoke(installDir);
+
 assert.ok(packageJson.files.includes('build/src'));
 assert.ok(packageJson.files.includes('src'));
 await readFile(path.join(installDir, 'node_modules', 'active-ts', 'src', 'index.ts'), 'utf8');
@@ -1444,7 +1448,8 @@ function isAllowedPackedPath(file) {
 			'docs/quickstart.md',
 			'docs/security.md',
 			'docs/testing.md',
-			'docs/typed-views.md'
+			'docs/typed-views.md',
+			'docs/workers.md'
 		].includes(file)
 	);
 }
