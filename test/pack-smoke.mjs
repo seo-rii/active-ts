@@ -20,6 +20,7 @@ const PUBLIC_ROOT_RUNTIME_EXPORTS = [
 	'ActiveTsConflictError',
 	'ActiveTsError',
 	'ActiveTsNotFoundError',
+	'ActiveTsRolledBackTransactionError',
 	'ActiveTsUnknownTransactionOutcomeError',
 	'ActiveTsValidationError',
 	'FindBuilder',
@@ -1443,6 +1444,7 @@ function isAllowedPackedPath(file) {
 		[
 			'docs/adapters.md',
 			'docs/concepts.md',
+			'docs/cache-transaction-contracts.md',
 			'docs/extensions.md',
 			'docs/plugins.md',
 			'docs/quickstart.md',

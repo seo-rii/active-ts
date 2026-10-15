@@ -22,6 +22,7 @@ import {
 } from '../../core/safe-keys.js';
 import { aggregateRows, assertAggregateSpecsCompatibleWithModel } from '../../core/aggregate.js';
 import { ActiveTsConfigurationError, ActiveTsConflictError, ActiveTsNotFoundError, ActiveTsValidationError } from '../../core/errors.js';
+import { confirmTransactionRollback } from '../../core/error-classification.js';
 import {
 	assertStoreDataMatchesId,
 	assertStoreDataHasModelId,
@@ -549,10 +550,12 @@ export class MemoryStoreAdapter implements StoreAdapter {
 		let closed: string | undefined;
 		const guardedTx = createCloseGuardedStoreAdapter(scopedTx, () => closed, 'memory store');
 		revisionSnapshot = this.beginTransactionSnapshot();
+		let commitStarted = false;
 		try {
 			const result = await fn(guardedTx.adapter);
 			closed = 'callback finished';
 			await guardedTx.waitForPendingOperations();
+			commitStarted = true;
 			this.applyDirty(dirty, pointReads, revisionSnapshot);
 			closed = 'commit';
 			return result;
@@ -562,6 +565,9 @@ export class MemoryStoreAdapter implements StoreAdapter {
 				await guardedTx.waitForPendingOperations();
 			} catch {
 				// Preserve the callback or operation error that triggered rollback.
+			}
+			if (!commitStarted || error instanceof ActiveTsConflictError || error instanceof ActiveTsNotFoundError) {
+				confirmTransactionRollback(fn);
 			}
 			throw error;
 		} finally {

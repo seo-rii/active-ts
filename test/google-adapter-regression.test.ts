@@ -15934,7 +15934,7 @@ test('Firestore commit transport failures report unknown outcomes without rollba
 	assert.deepEqual(deferred, []);
 });
 
-test('Firestore code-less post-callback failures retain rollback semantics', async () => {
+test('Firestore code-less post-callback failures suppress unproven rollback effects', async () => {
 	const deferred: string[] = [];
 	const localError = new Error('local Firestore transaction finalization failed');
 	const adapter = await createFirestoreStoreAdapter({
@@ -15965,7 +15965,12 @@ test('Firestore code-less post-callback failures retain rollback semantics', asy
 			}),
 		(error: unknown) => error === localError
 	);
-	assert.deepEqual(deferred, ['rollback']);
+	const outcome = await context.transactionResult(async (tx) => {
+		await tx.afterRollback(() => { deferred.push('rollback'); });
+	});
+	assert.equal(outcome.outcome, 'unknown');
+	assert.equal(outcome.error, localError);
+	assert.deepEqual(deferred, []);
 });
 
 test('Firestore completed write attempts stop opaque SDK callback retries as unknown', async () => {
