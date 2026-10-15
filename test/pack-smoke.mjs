@@ -1,15 +1,15 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
 import { runWorkersStaticSmoke } from './workers-static-smoke.mjs';
 import { scanTextForForbiddenSecrets } from '../build/test/secret-scan-rules.js';
 
 const exec = promisify(execFile);
 const root = process.cwd();
-const temp = await mkdtemp(path.join(tmpdir(), 'active-ts-pack-'));
 const PUBLIC_ROOT_RUNTIME_EXPORTS = [
 	'ACTIVE_TS_ENTITY_KEY',
 	'ActiveContext',
@@ -169,6 +169,8 @@ const PUBLIC_SUBPATH_SMOKE_EXPORTS = {
 	]
 };
 
+async function runPackSmoke() {
+	const temp = await mkdtemp(path.join(tmpdir(), 'active-ts-pack-'));
 try {
 	const packDir = path.join(temp, 'pack');
 	const installDir = path.join(temp, 'consumer');
@@ -181,22 +183,8 @@ try {
 	const { stdout } = await exec('npm', packArgs, { cwd: root });
 	const [packResult] = JSON.parse(packJsonFromStdout(stdout));
 	const { filename, files } = packResult;
-	const packedPaths = new Set(files.map((file) => file.path));
-	const packageJson = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
-	for (const peer of Object.keys(packageJson.peerDependencies ?? {})) {
-		assert.equal(packageJson.peerDependenciesMeta?.[peer]?.optional, true, `${peer} must remain an optional peer dependency`);
-		assert.equal(packageJson.dependencies?.[peer], undefined, `${peer} must not be a runtime dependency`);
-	}
-	assertPackageExportsAreStable(packageJson, packedPaths);
-	assertPackedPackageTargetsExist(packageJson, packedPaths);
-	assertPackedPathsStayInAllowedSurface(packedPaths);
-	assert.equal(packedPaths.has('docs/risk-register.md'), false);
-	assert.equal(packedPaths.has('docs/risk-register-archive.md'), false);
-	assert.equal(packedPaths.has('docs/quickstart.md'), true);
-	await assertPackedMarkdownLinksResolve(root, packedPaths, ['README.md', ...[...packedPaths].filter((file) => file.startsWith('docs/') && file.endsWith('.md'))]);
-	await assertPackedFilesAvoidSecrets(root, files);
-	await assertPackedSourceMapsResolve(root, packedPaths);
 	const tarball = suppliedTarball ?? path.join(packDir, filename);
+	const { packageJson } = await verifyPackedArtifact(tarball, files, path.join(temp, 'artifact'));
 
 	await writeFile(path.join(installDir, 'package.json'), JSON.stringify({ private: true, type: 'module' }));
 	await exec('npm', ['install', '--ignore-scripts', tarball], { cwd: installDir });
@@ -1328,6 +1316,45 @@ assert.ok(packageJson.files.includes('src'));
 await readFile(path.join(installDir, 'node_modules', 'active-ts', 'src', 'index.ts'), 'utf8');
 } finally {
 	await rm(temp, { recursive: true, force: true });
+}
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+	await runPackSmoke();
+}
+
+/** Inspect the same archive that the installed consumer will execute. */
+export async function verifyPackedArtifact(tarball, files, extractionDirectory) {
+	const packedPaths = new Set(files.map((file) => file.path));
+	for (const file of packedPaths) {
+		assert.equal(path.posix.isAbsolute(file), false, 'packed paths must be relative');
+		assert.equal(path.posix.normalize(file), file, 'packed paths must be normalized');
+		assert.equal(file.split('/').includes('..'), false, 'packed paths cannot escape the artifact');
+		assert.equal(file.includes('\\'), false, 'packed paths must use POSIX separators');
+	}
+	assertPackedPathsStayInAllowedSurface(packedPaths);
+	await mkdir(extractionDirectory, { recursive: true });
+	await exec('tar', ['-xzf', tarball, '-C', extractionDirectory, '--strip-components=1', '--no-same-owner', '--no-same-permissions']);
+	const artifactRoot = await realpath(extractionDirectory);
+	for (const file of packedPaths) {
+		const target = path.join(artifactRoot, file);
+		assert.equal((await lstat(target)).isFile(), true, `${file} must be a regular packed file`);
+		assert.equal((await realpath(target)).startsWith(`${artifactRoot}${path.sep}`), true, `${file} must stay inside the artifact`);
+	}
+	const packageJson = JSON.parse(await readFile(path.join(artifactRoot, 'package.json'), 'utf8'));
+	for (const peer of Object.keys(packageJson.peerDependencies ?? {})) {
+		assert.equal(packageJson.peerDependenciesMeta?.[peer]?.optional, true, `${peer} must remain an optional peer dependency`);
+		assert.equal(packageJson.dependencies?.[peer], undefined, `${peer} must not be a runtime dependency`);
+	}
+	assertPackageExportsAreStable(packageJson, packedPaths);
+	assertPackedPackageTargetsExist(packageJson, packedPaths);
+	assert.equal(packedPaths.has('docs/risk-register.md'), false);
+	assert.equal(packedPaths.has('docs/risk-register-archive.md'), false);
+	assert.equal(packedPaths.has('docs/quickstart.md'), true);
+	await assertPackedMarkdownLinksResolve(artifactRoot, packedPaths, ['README.md', ...[...packedPaths].filter((file) => file.startsWith('docs/') && file.endsWith('.md'))]);
+	await assertPackedFilesAvoidSecrets(artifactRoot, files);
+	await assertPackedSourceMapsResolve(artifactRoot, packedPaths);
+	return { packageJson, packedPaths, root: artifactRoot };
 }
 
 function installedPublicSubpathSmokeExports() {

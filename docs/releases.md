@@ -1,7 +1,10 @@
 # Release artifacts and verification levels
 
 Each release workflow packs once, tests that tarball in an installed consumer,
-and retains it with `release-manifest.json`. The publish job downloads and verifies
+and retains it with `release-manifest.json`. Static package metadata, secret,
+source-map and Markdown link checks read the extracted tarball contents, including
+when `ACTIVE_TS_PACKAGE_TARBALL` supplies a previously packed artifact. The publish
+job downloads and verifies
 the same bytes before `npm publish`; it does not rebuild from a second checkout.
 The manifest records the Git commit/tree, package version, SHA-256, SHA-512 npm
 integrity, byte count, Node/compiler/package-manager versions, module format and

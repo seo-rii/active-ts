@@ -26,4 +26,5 @@ jobs:
       - run: node --test scripts/release-artifact.test.mjs
       - run: pnpm typecheck
       - run: pnpm test
+      - run: node --test test/packed-artifact.test.mjs
       - run: pnpm pack:smoke
