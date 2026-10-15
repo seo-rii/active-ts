@@ -793,9 +793,21 @@ Example:
 import { createRedisValkeyCacheAdapter } from 'active-ts/adapters/cache/redis-valkey';
 
 const cache = await createRedisValkeyCacheAdapter({
-	url: process.env.REDIS_URL
+	url: process.env.REDIS_URL,
+	prefix: 'entity-cache:v2',
+	maxPayloadBytes: 1024 * 1024
 });
 ```
+
+`maxPayloadBytes` is an optional positive safe integer. It limits each encoded
+entry using UTF-8 bytes for strings and byte length for Buffers, including custom
+codec envelopes. Reads reject oversized payloads before JSON parsing or codec
+decoding. Writes check the encoded payload before sending it to Redis; encoding
+or size failures reject a prepared batch before any backend write, including
+versioned CAS batches. Backend failures can still produce partial writes.
+The default leaves payload size unrestricted for compatibility. This budget
+applies to encoded entries; codecs that expand compressed data also need their
+own decoded-size limits. It does not limit aggregate batch bytes or Redis RPCs.
 
 Cache codecs can wrap any cache adapter, or be passed directly to Redis/Valkey
 for encryption-style extensions:

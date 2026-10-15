@@ -6,7 +6,7 @@ import {
 	ActiveTsValidationError,
 	safeErrorMessage
 } from '../../core/errors.js';
-import { markTransactionRollbackSkipped, ownErrorValue } from '../../core/error-classification.js';
+import { confirmTransactionRollback, markTransactionRollbackSkipped, ownErrorValue } from '../../core/error-classification.js';
 import {
 	assertSafeEntityId,
 	assertSafeEntityIdArray,
@@ -693,6 +693,8 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 				passFirestoreTransactionOptions = true;
 			}
 			const callbackErrors = new WeakSet<object>();
+			let callbackFailed = false;
+			let callbackError: unknown;
 			let transactionRegisteredCreate = false;
 			let transactionRegisteredWrite = false;
 			let transactionCallbackCompleted = false;
@@ -707,6 +709,7 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 				transactionRegisteredCreate = false;
 				transactionRegisteredWrite = false;
 				transactionCallbackCompleted = false;
+				callbackFailed = false;
 				const transaction = normalizeFirestoreTransaction(rawTransaction);
 				const buffered = new Map<string, FirestoreTransactionMutation>();
 				const bufferedMutationTails = new Map<string, Promise<void>>();
@@ -960,6 +963,8 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 					if (error && (typeof error === 'object' || typeof error === 'function')) {
 						WEAKSET_ADD.call(callbackErrors, error);
 					}
+					callbackFailed = true;
+					callbackError = error;
 					throw error;
 				}
 				closed = 'callback finished';
@@ -967,6 +972,8 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 					await guardedTx.waitForPendingOperations();
 				} catch (error) {
 					closed = 'rollback';
+					callbackFailed = true;
+					callbackError = error;
 					throw error;
 				}
 				transactionCallbackCompleted = true;
@@ -977,10 +984,15 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 					? client.runTransaction(run, firestoreTransactionOptions)
 					: client.runTransaction(run));
 			} catch (error) {
+				if (callbackFailed && Object.is(callbackError, error)) {
+					confirmTransactionRollback(fn);
+					throw error;
+				}
 				if (error && (typeof error === 'object' || typeof error === 'function') && WEAKSET_HAS.call(callbackErrors, error)) {
 					throw error;
 				}
 				if (transactionRegisteredCreate && isFirestoreAlreadyExistsError(error)) {
+					confirmTransactionRollback(fn);
 					throw new ActiveTsConflictError('Cannot create Firestore transaction document because it already exists.');
 				}
 				if (
@@ -997,6 +1009,7 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 					});
 					throw markTransactionRollbackSkipped(uncertain);
 				}
+				if (isFirestoreDefiniteTransactionFailure(error)) confirmTransactionRollback(fn);
 				throw error;
 			}
 		},
@@ -1320,6 +1333,17 @@ function firestoreDocumentStorageId(document: object, context: string) {
 function isFirestoreAlreadyExistsError(error: unknown) {
 	const code = ownErrorValue(error, 'code');
 	return code === 6 || code === 'already-exists' || code === 'ALREADY_EXISTS';
+}
+
+function isFirestoreDefiniteTransactionFailure(error: unknown) {
+	const code = ownErrorValue(error, 'code');
+	return code === 3 || code === 5 || code === 6 || code === 7 || code === 8 || code === 9 || code === 10 ||
+		code === 11 || code === 12 || code === 16 ||
+		code === 'invalid-argument' || code === 'INVALID_ARGUMENT' || code === 'not-found' || code === 'NOT_FOUND' ||
+		code === 'already-exists' || code === 'ALREADY_EXISTS' || code === 'permission-denied' || code === 'PERMISSION_DENIED' ||
+		code === 'resource-exhausted' || code === 'RESOURCE_EXHAUSTED' || code === 'failed-precondition' || code === 'FAILED_PRECONDITION' ||
+		code === 'aborted' || code === 'ABORTED' || code === 'out-of-range' || code === 'OUT_OF_RANGE' ||
+		code === 'unimplemented' || code === 'UNIMPLEMENTED' || code === 'unauthenticated' || code === 'UNAUTHENTICATED';
 }
 
 function isFirestoreCommitOutcomeUnknownError(error: unknown) {

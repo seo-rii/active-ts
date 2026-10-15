@@ -12,12 +12,15 @@ import {
 } from '../../core/error-classification.js';
 import {
 	assertSafeEntityId,
-	assertSafeFieldPath,
 	assertSafePhysicalIdentifierLength,
 	assertSafeSchemaIdentifier,
 	assertSafeTopLevelField,
 	defineDataProperty
 } from '../../core/safe-keys.js';
+import {
+	assertSafeDatastoreIndexExclusionPath,
+	datastoreIndexExclusionOverlapsField
+} from '../../core/datastore-index-path.js';
 import { snapshotArrayInput } from '../../core/array-input.js';
 import { JSON_STRINGIFY } from '../../core/json-intrinsics.js';
 import {
@@ -1203,12 +1206,11 @@ function normalizeExcludeFromIndexes(
 	for (let index = 0; index < fields.length; index++) {
 		let field: string;
 		try {
-			field = assertSafeFieldPath(fields[index], `${context}[${index}]`);
+			field = assertSafeDatastoreIndexExclusionPath(fields[index], `${context}[${index}]`);
 		} catch (error) {
 			throw new ErrorType(safeErrorMessage(error));
 		}
-		if (field.includes('/')) throw new ErrorType(`${context}[${index}] "${field}" cannot contain "/".`);
-		if (field === idField || field.startsWith(`${idField}.`) || idField.startsWith(`${field}.`)) {
+		if (datastoreIndexExclusionOverlapsField(field, idField)) {
 			throw new ErrorType(`${context}[${index}] cannot overlap ID field "${idField}".`);
 		}
 		if (SET_HAS.call(seen, field)) throw new ErrorType(`${context}[${index}] duplicates "${field}".`);

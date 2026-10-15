@@ -8,7 +8,7 @@ import {
 	ActiveTsValidationError,
 	safeErrorMessage
 } from '../../core/errors.js';
-import { markTransactionRollbackSkipped, ownErrorValue } from '../../core/error-classification.js';
+import { confirmTransactionRollback, markTransactionRollbackSkipped, ownErrorValue } from '../../core/error-classification.js';
 import {
 	assertSafeEntityId,
 	assertSafeEntityIdArray,
@@ -876,12 +876,14 @@ export async function createMongoStoreAdapter(options: MongoStoreOptions): Promi
 							};
 							closed = 'failed';
 						} else {
+							if (isMongoTransactionConflict(error)) confirmTransactionRollback(fn);
 							primaryFailure = { error: normalizeMongoTransactionConflict(error) };
 							closed = 'rollback';
 						}
 					} else if (transactionStarted) {
 						try {
 							await session.abortTransaction(finalizationOptions);
+							confirmTransactionRollback(fn);
 							closed = 'rollback';
 						} catch (abortError) {
 							primaryFailure = {

@@ -4,6 +4,7 @@ import type { ResolvedModelMeta } from '../src/index.js';
 import {
 	createDatastoreNamespaceStoreFactory,
 	createDatastoreStoreAdapter,
+	DatastoreBulkMutationError,
 	type DatastoreBulkUpsertEntry
 } from '../src/adapters/store/datastore.js';
 
@@ -70,6 +71,92 @@ function datastoreClient(overrides: Record<string, unknown> = {}) {
 		...overrides
 	};
 }
+
+for (const operation of ['upsertMany', 'deleteMany'] as const) {
+	test(`Datastore ${operation} reports confirmed, unknown, and unattempted input ranges`, async () => {
+		const cause = Object.assign(new Error('backend response lost'), { code: 14 });
+		let calls = 0;
+		const mutate = async () => {
+			calls++;
+			if (calls === 2) throw cause;
+		};
+		const store = await createDatastoreStoreAdapter({
+			client: datastoreClient({ save: mutate, delete: mutate })
+		});
+		const ids = [1, 2, 3, 4, 5];
+		await assert.rejects(
+			() => operation === 'upsertMany'
+				? store.bulk.upsertMany(rootMeta, ids.map((id) => ({ id, data: { id, value: 'value' } })), { chunkSize: 2 })
+				: store.bulk.deleteMany(rootMeta, ids, { chunkSize: 2 }),
+			(error: unknown) => {
+				assert.ok(error instanceof DatastoreBulkMutationError);
+				assert.equal(error.operation, operation);
+				assert.equal(error.totalCount, 5);
+				assert.equal(error.completedCount, 2);
+				assert.equal(error.failedBatchOutcome, 'unknown');
+				assert.equal(error.cause, cause);
+				assert.deepEqual(error.completedRange, { startIndex: 0, endIndexExclusive: 2 });
+				assert.deepEqual(error.failedRange, { startIndex: 2, endIndexExclusive: 4 });
+				assert.deepEqual(error.notAttemptedRange, { startIndex: 4, endIndexExclusive: 5 });
+				assert.equal(Object.isFrozen(error.failedRange), true);
+				return true;
+			}
+		);
+		assert.equal(calls, 2);
+	});
+}
+
+test('Datastore bulk validation failures retain their original error before any chunk is sent', async () => {
+	let calls = 0;
+	const store = await createDatastoreStoreAdapter({
+		client: datastoreClient({ save: async () => { calls++; } })
+	});
+	await assert.rejects(() => store.bulk.upsertMany(rootMeta, [
+		{ id: 1, data: { id: 1, value: 'valid' } },
+		{ id: 2, data: { id: 3, value: 'invalid' } }
+	], { chunkSize: 1 }), (error: unknown) => {
+		assert.ok(error instanceof Error);
+		assert.equal(error instanceof DatastoreBulkMutationError, false);
+		assert.match(error.message, /must match/);
+		return true;
+	});
+	assert.equal(calls, 0);
+});
+
+test('Datastore bulk rejects an oversized late delete key before sending earlier chunks', async () => {
+	let calls = 0;
+	const store = await createDatastoreStoreAdapter({
+		client: datastoreClient({ delete: async () => { calls++; } })
+	});
+	await assert.rejects(() => store.bulk.deleteMany(ancestorMeta, [
+		{ id: 1, options: { meta: { datastoreAncestor: { path: [{ kind: 'parent', id: 1 }] } } } },
+		{
+			id: 2,
+			options: { meta: { datastoreAncestor: {
+				path: [{ kind: 'parent', id: 1 }],
+				namespace: 'x'.repeat(8 * 1024 * 1024)
+			} } }
+		}
+	], { chunkSize: 1 }), /item\[1\] exceeds the safe request budget/);
+	assert.equal(calls, 0);
+});
+
+test('Datastore atomic bulk failures preserve the original transaction error', async () => {
+	const cause = new Error('atomic enqueue failed');
+	const transaction = datastoreClient({
+		run: async () => undefined,
+		commit: async () => undefined,
+		rollback: async () => undefined,
+		upsert: async () => { throw cause; }
+	});
+	const store = await createDatastoreStoreAdapter({
+		client: datastoreClient({ transaction: () => transaction })
+	});
+	await assert.rejects(
+		() => store.bulk.upsertMany(rootMeta, [{ id: 1, data: { id: 1, value: 'value' } }], { atomic: true }),
+		(error: unknown) => error === cause
+	);
+});
 
 test('Datastore bulk upsert snapshots rows, preserves native ids, and applies model unindexed fields', async () => {
 	const calls: any[][] = [];

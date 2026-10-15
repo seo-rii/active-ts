@@ -2,6 +2,7 @@ import { BatchLoader } from './batch-loader.js';
 import {
 	ActiveTsCommittedTransactionError,
 	ActiveTsConfigurationError,
+	ActiveTsRolledBackTransactionError,
 	ActiveTsValidationError,
 	safeErrorMessage
 } from './errors.js';
@@ -9,8 +10,7 @@ import {
 	inheritTransactionRollbackObservation,
 	markSavepointRollbackUnconfirmed,
 	observeTransactionRollback,
-	savepointRollbackUnconfirmed,
-	transactionRollbackSkipped
+	savepointRollbackUnconfirmed
 } from './error-classification.js';
 import { runHookList, sanitizeHooks, toHookList } from './hooks.js';
 import { assertModelConstructor, getModelMetaVersion, resolveModelMeta } from './metadata.js';
@@ -175,6 +175,15 @@ type ReadOptions = {
 };
 
 type DeferredTask = () => Promise<void> | void;
+/** The observed outcome of one root transaction invocation. */
+export type TransactionResult<T> =
+	| { outcome: 'committed'; result: T; error?: unknown }
+	| { outcome: 'not_committed' | 'unknown'; error: unknown };
+
+type TransactionResultObservation = {
+	outcome: 'committed' | 'not_committed' | 'unknown';
+	result?: unknown;
+};
 type TransactionOperationTracker = ReturnType<typeof createTransactionOperationTracker>;
 type TransactionState = {
 	root: ActiveContext;
@@ -2547,13 +2556,42 @@ export class ActiveContext {
 		fn: (context: ActiveContext) => Promise<T>,
 		options: TransactionOptions = {}
 	): Promise<T> {
+		return this.executeTransaction(fn, options);
+	}
+
+	/** Capture commit evidence for a root transaction while preserving its original error. */
+	async transactionResult<T>(
+		fn: (context: ActiveContext) => Promise<T>,
+		options: TransactionOptions = {}
+	): Promise<TransactionResult<T>> {
+		const observation: TransactionResultObservation = { outcome: 'not_committed' };
+		try {
+			const scoped = this.transactionScopedContext('capture transaction results');
+			if (scoped.transactionState) {
+				throw new ActiveTsConfigurationError('transactionResult() requires a root transaction; nested work has no independent commit outcome.');
+			}
+			const result = await this.executeTransaction(fn, options, observation);
+			return { outcome: 'committed', result };
+		} catch (error) {
+			if (observation.outcome === 'committed') {
+				return { outcome: 'committed', result: observation.result as T, error };
+			}
+			return { outcome: observation.outcome, error };
+		}
+	}
+
+	private executeTransaction<T>(
+		fn: (context: ActiveContext) => Promise<T>,
+		options: TransactionOptions = {},
+		observation?: TransactionResultObservation
+	): Promise<T> {
 		try {
 			if (typeof fn !== 'function') {
 				throw new ActiveTsConfigurationError('transaction callback must be a function.');
 			}
 			const txOptions = normalizeTransactionOptions(options);
 			const scoped = this.transactionScopedContext('start transactions');
-			if (scoped !== this) return scoped.transaction(fn, txOptions);
+			if (scoped !== this) return scoped.executeTransaction(fn, txOptions, observation);
 			if (this.transactionState) {
 				const storeName = txOptions.store ?? this.transactionState.storeName;
 				if (storeName !== this.transactionState.storeName) {
@@ -3025,9 +3063,14 @@ export class ActiveContext {
 				const rollbackObservation = observeTransactionRollback(run);
 				let result: T;
 				try {
+					if (observation) observation.outcome = 'unknown';
 					result = await store.transaction(run, storeOptions);
 				} catch (error) {
 					if (error instanceof ActiveTsCommittedTransactionError && !WEAKSET_HAS.call(callbackErrors, error)) {
+						if (observation) {
+							observation.outcome = 'committed';
+							observation.result = error.result;
+						}
 						if (!attemptState) throw error;
 						attemptState.closed = 'committed';
 						rebindTransactionModels(error.result, attemptState, attemptState.root);
@@ -3038,8 +3081,12 @@ export class ActiveContext {
 						}
 						throw error;
 					}
+					const rollbackConfirmed = rollbackObservation.confirmed || (
+						error instanceof ActiveTsRolledBackTransactionError && !WEAKSET_HAS.call(callbackErrors, error)
+					);
+					if (observation && rollbackConfirmed) observation.outcome = 'not_committed';
 					if (attemptState) {
-						if (transactionRollbackSkipped(error) && !rollbackObservation.confirmed) {
+						if (!rollbackConfirmed) {
 							if (!attemptState.closed) attemptState.closed = 'failed';
 							markClosedTransactionModelInstances(attemptState);
 							const invalidationErrors: unknown[] = [];
@@ -3066,6 +3113,10 @@ export class ActiveContext {
 				}
 				if (!attemptState) {
 					throw new ActiveTsConfigurationError(`Store adapter "${store.kind}" completed transaction without running the callback.`);
+				}
+				if (observation) {
+					observation.outcome = 'committed';
+					observation.result = result;
 				}
 					attemptState.closed = 'committed';
 					rebindTransactionModels(result, attemptState, attemptState.root);

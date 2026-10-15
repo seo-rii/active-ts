@@ -7,7 +7,7 @@ import {
 	ActiveTsValidationError,
 	safeErrorMessage
 } from '../../core/errors.js';
-import { markTransactionRollbackSkipped, ownErrorValue } from '../../core/error-classification.js';
+import { confirmTransactionRollback, markTransactionRollbackSkipped, ownErrorValue } from '../../core/error-classification.js';
 import {
 	ACTIVE_TS_ENTITY_KEY,
 	assertSafeCursor,
@@ -82,6 +82,8 @@ import {
 } from '../../core/field-codecs.js';
 import { JSON_PARSE, JSON_STRINGIFY } from '../../core/json-intrinsics.js';
 import { validateDatastoreUnindexedMetadata } from '../../core/model-metadata-invariants.js';
+import { DatastoreBulkMutationError } from './datastore-bulk-error.js';
+export { DatastoreBulkMutationError, type DatastoreBulkMutationRange } from './datastore-bulk-error.js';
 import {
 	assertDatastoreQueryLimits,
 	assertGoogleMinMaxInequalityOrder,
@@ -2686,9 +2688,13 @@ function createDatastoreAdapter(
 									);
 									continue;
 								}
+								confirmTransactionRollback(fn);
 								throw datastoreTransactionConflict(error);
 							}
-							if (isDatastoreDefiniteCommitFailure(error)) throw error;
+							if (isDatastoreDefiniteCommitFailure(error)) {
+								confirmTransactionRollback(fn);
+								throw error;
+							}
 							throw markTransactionRollbackSkipped(error);
 						}
 						try {
@@ -2699,6 +2705,7 @@ function createDatastoreAdapter(
 								`Datastore transaction failed and rollback failed: ${safeErrorMessage(error)}`
 							));
 						}
+						confirmTransactionRollback(fn);
 						throw error;
 					}
 				}
@@ -3613,7 +3620,8 @@ function createDatastoreAdapter(
 			itemBytes: number[],
 			mutationOptions: ReturnType<typeof normalizeDatastoreBulkMutationOptions>,
 			mutate: (target: NormalizedDatastoreClient, batch: T[]) => Promise<void>,
-			context: string
+			context: string,
+			operation: 'upsertMany' | 'deleteMany'
 		) => {
 			if (!items.length) return;
 			if (items.length !== itemBytes.length) {
@@ -3667,22 +3675,29 @@ function createDatastoreAdapter(
 				}
 				return;
 			}
+			for (let index = 0; index < itemBytes.length; index++) {
+				if (DATASTORE_BULK_REQUEST_OVERHEAD_BYTES + itemBytes[index] > DATASTORE_SAFE_BULK_REQUEST_BYTES) {
+					throw new ActiveTsValidationError(`${context} item[${index}] exceeds the safe request budget.`);
+				}
+			}
 			const chunkSize = mutationOptions.chunkSize ?? Number.MAX_SAFE_INTEGER;
 			let offset = 0;
 			while (offset < items.length) {
+				const batchStartIndex = offset;
 				const batch: T[] = [];
 				let batchBytes = DATASTORE_BULK_REQUEST_OVERHEAD_BYTES;
 				while (offset < items.length && batch.length < chunkSize) {
 					const nextBytes = itemBytes[offset];
-					if (DATASTORE_BULK_REQUEST_OVERHEAD_BYTES + nextBytes > DATASTORE_SAFE_BULK_REQUEST_BYTES) {
-						throw new ActiveTsValidationError(`${context} item[${offset}] exceeds the safe request budget.`);
-					}
 					if (batch.length && batchBytes + nextBytes > DATASTORE_SAFE_BULK_REQUEST_BYTES) break;
 					batch[batch.length] = items[offset];
 					batchBytes += nextBytes;
 					offset++;
 				}
-				await mutate(client, batch);
+				try {
+					await mutate(client, batch);
+				} catch (error) {
+					throw new DatastoreBulkMutationError(operation, items.length, batchStartIndex, offset, error);
+				}
 			}
 		};
 		const bulk: DatastoreBulkOperations = {
@@ -3741,10 +3756,11 @@ function createDatastoreAdapter(
 						);
 						}
 						MAP_SET.call(seenKeys, identity, index);
+						const storedData = cloneSafeDataObjectWithoutActiveEntityKey(clean, `${entryContext}.data`);
 						const estimatedEntityBytes = datastoreBulkValueBytes(
 							{
 								key: identity,
-								data: clean,
+								data: storedData,
 								excludeFromIndexes: model.datastore?.unindexed
 							},
 							entryContext
@@ -3752,8 +3768,11 @@ function createDatastoreAdapter(
 						if (estimatedEntityBytes > DATASTORE_MAX_ENTITY_BYTES) {
 							throw new ActiveTsValidationError(`${entryContext} exceeds the Datastore entity size limit.`);
 						}
-						entities[entities.length] = entityPayloadFromAncestor(model, id, clean, ancestor);
+						entities[entities.length] = entityPayloadFromAncestor(model, id, storedData, ancestor);
 						entityBytes[entityBytes.length] = estimatedEntityBytes + DATASTORE_BULK_MUTATION_OVERHEAD_BYTES;
+					}
+					if (entities.length && !safeMutationOptions.atomic && !client.upsert) {
+						throw new ActiveTsConfigurationError('Datastore bulk upsert requires client.upsert() or client.save().');
 					}
 					await runBulkMutation(
 						entities,
@@ -3767,7 +3786,8 @@ function createDatastoreAdapter(
 						}
 						await target.upsert(batch);
 					},
-					'Datastore bulk upsert'
+					'Datastore bulk upsert',
+					'upsertMany'
 				);
 			},
 			deleteMany: async (model, entries, mutationOptions) => {
@@ -3827,7 +3847,8 @@ function createDatastoreAdapter(
 					async (target, batch) => {
 						await target.delete(batch);
 					},
-					'Datastore bulk delete'
+					'Datastore bulk delete',
+					'deleteMany'
 				);
 			}
 		};

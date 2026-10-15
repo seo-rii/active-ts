@@ -19,9 +19,12 @@ const PUBLIC_ROOT_RUNTIME_EXPORTS = [
 	'ActiveTsConfigurationError',
 	'ActiveTsConflictError',
 	'ActiveTsError',
+	'ActiveTsExecutionBudgetError',
 	'ActiveTsNotFoundError',
+	'ActiveTsRolledBackTransactionError',
 	'ActiveTsUnknownTransactionOutcomeError',
 	'ActiveTsValidationError',
+	'ExecutionBudget',
 	'FindBuilder',
 	'LazyRef',
 	'MemoryCacheAdapter',
@@ -52,10 +55,12 @@ const PUBLIC_ROOT_RUNTIME_EXPORTS = [
 	'createAesGcmCacheCodec',
 	'createCacheMiddlewareAdapter',
 	'createCodecCacheAdapter',
+	'createExecutionBudget',
 	'createFunctionCache',
 	'createOutboxPlugin',
 	'createSearchMiddlewareAdapter',
 	'createSoftDeletePlugin',
+	'createStoreExecutionBudgetAdapter',
 	'createStoreMiddlewareAdapter',
 	'cursorValues',
 	'datastoreAncestorOptions',
@@ -121,6 +126,7 @@ const PUBLIC_ROOT_RUNTIME_EXPORTS = [
 ];
 const PUBLIC_SUBPATH_SMOKE_EXPORTS = {
 	'./adapters/store/datastore': [
+		'DatastoreBulkMutationError',
 		'applyDatastoreIdRepairManifest',
 		'createDatastoreIdRepairManifest',
 		'createDatastoreIndexYaml',
@@ -134,7 +140,7 @@ const PUBLIC_SUBPATH_SMOKE_EXPORTS = {
 		'inventoryDatastoreIds',
 		'isDatastoreInt64Id'
 	],
-	'./adapters/store/datastore-injected': ['createDatastoreStoreAdapter', 'createDatastoreNamespaceStoreFactory', 'inventoryDatastoreIds'],
+	'./adapters/store/datastore-injected': ['createDatastoreStoreAdapter', 'createDatastoreNamespaceStoreFactory', 'inventoryDatastoreIds', 'DatastoreBulkMutationError'],
 	'./adapters/store/firestore': ['createFirestoreStoreAdapter'],
 	'./adapters/store/memory': ['MemoryStoreAdapter'],
 	'./adapters/store/mongodb': ['createMongoStoreAdapter'],
@@ -384,6 +390,7 @@ import {
 	isDatastoreInt64Id as isDatastoreSubpathInt64Id,
 	type DatastoreBulkDeleteEntry,
 	type DatastoreBulkMutationOptions,
+	type DatastoreBulkMutationRange,
 	type DatastoreBulkOperations,
 	type DatastoreBulkUpsertEntry,
 	type DatastoreIdInventoryIssue,
@@ -948,6 +955,7 @@ import {
 } from 'active-ts';
 import { createTestContext } from 'active-ts/testing';
 import {
+  DatastoreBulkMutationError,
   createDatastoreIdRepairManifest,
   createDatastoreIndexYaml,
   createDatastoreNamespaceStoreFactory,
@@ -957,12 +965,22 @@ import {
   inventoryDatastoreIds,
   isDatastoreInt64Id as isDatastoreSubpathInt64Id
 } from 'active-ts/adapters/store/datastore';
+import { DatastoreBulkMutationError as InjectedDatastoreBulkMutationError } from 'active-ts/adapters/store/datastore-injected';
 import { createPostgresStoreAdapter } from 'active-ts/adapters/store/postgresql';
 import { createSqliteStoreAdapter } from 'active-ts/adapters/store/sqlite';
 import { createRedisValkeyCacheAdapter } from 'active-ts/adapters/cache/redis-valkey';
 import { createNativeSearchAdapter } from 'active-ts/adapters/search/native';
 
 assert.equal('createTestContext' in activeTs, false);
+assert.equal(DatastoreBulkMutationError, InjectedDatastoreBulkMutationError);
+const bulkCause = new Error('provider response lost');
+const bulkFailure = new DatastoreBulkMutationError('upsertMany', 5, 2, 4, bulkCause);
+assert.equal(bulkFailure.cause, bulkCause);
+assert.equal(bulkFailure.failedBatchOutcome, 'unknown');
+assert.deepEqual(bulkFailure.failedRange, { startIndex: 2, endIndexExclusive: 4 });
+for (const range of [bulkFailure.completedRange, bulkFailure.failedRange, bulkFailure.notAttemptedRange]) {
+  assert.equal(Object.isFrozen(range), true);
+}
 assert.deepEqual(Object.keys(activeTs).sort(), ${JSON.stringify(PUBLIC_ROOT_RUNTIME_EXPORTS, null, 2)});
 
 class PackedUser extends Model {}
@@ -1475,12 +1493,16 @@ function isAllowedPackedPath(file) {
 		[
 			'docs/adapters.md',
 			'docs/concepts.md',
+			'docs/cache-transaction-contracts.md',
 			'docs/extensions.md',
+			'docs/execution-budget.md',
 			'docs/plugins.md',
 			'docs/quickstart.md',
 			'docs/releases.md',
 			'docs/security.md',
+			'docs/storage-compatibility.md',
 			'docs/testing.md',
+			'docs/datastore-bulk-mutations.md',
 			'docs/typed-views.md',
 			'docs/workers.md'
 		].includes(file)
