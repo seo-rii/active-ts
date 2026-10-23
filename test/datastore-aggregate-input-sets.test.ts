@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createDatastoreStoreAdapter, datastoreReadOptions } from '../src/adapters/store/datastore.js';
-import type { AggregateSpec, ResolvedModelMeta } from '../src/index.js';
+import { createDatastoreStoreAdapter } from '../src/adapters/store/datastore.js';
+import { datastoreReadOptions, type AggregateSpec, type ResolvedModelMeta } from '../src/index.js';
 
 const meta: ResolvedModelMeta = { model: class {}, name: 'aggregate_input_sets', store: 'default', idField: 'id',
  readValidation: 'off', indexes: [], searchIndexes: [], relations: new Map(), hooks: {}, views: new Map(), policies: new Map(),
