@@ -172,7 +172,7 @@ function elasticsearchMore(
 		if (pagination.searchAfter) return undefined;
 		return true;
 	}
-	if (total.value === undefined) return false;
+	if (total.value === undefined) return hitsLength === 0 ? false : undefined;
 	if (pagination.searchAfter) return hitsLength === 0 ? false : undefined;
 	return pagination.from + hitsLength < total.value;
 }
