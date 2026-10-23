@@ -60,6 +60,7 @@ import {
 } from './query-utils.js';
 import { ActiveTsConfigurationError, ActiveTsValidationError } from './errors.js';
 import { isPartialModel, markPartialModel, type PartialModel } from './partial-model.js';
+import { loadCompleteRelationQuery } from './relation-query.js';
 import {
 	snapshotRelationOwnerLocalKey,
 	snapshotRelationResult,
@@ -2049,7 +2050,7 @@ async function preloadIncludes(
 									);
 									if (select) query.select(...select);
 								}
-								for (const targetItem of (await query.load()).list) {
+								for (const targetItem of await loadCompleteRelationQuery(query)) {
 									const foreignValue = valueFor(targetItem.data, relation.foreignKey);
 									if (foreignValue === undefined || foreignValue === null) continue;
 									const { joinKey, targetJoinKey } = relationTargetJoinKeys(
@@ -2087,7 +2088,7 @@ async function preloadIncludes(
 								);
 								if (select) query.select(...select);
 							}
-							loaded.push(...(await query.load()).list);
+							loaded.push(...await loadCompleteRelationQuery(query));
 						}
 						const byForeign = new Map<any, any[]>();
 						for (const targetItem of loaded) {
