@@ -237,7 +237,10 @@ export function aggregateRows(rows: any[], specs: AggregateSpec[]) {
 	const safeRows = aggregateArrayValues(rows, 'Aggregate rows');
 	const safeSpecs = validateAggregateSpecs(specs);
 	const result = defaultAggregateResult(safeSpecs);
-	const avgState = new Map<string, { sum: number; count: number }>();
+	// Scaling by the row count bounds the sum without discarding small values
+	// merely because another row has a much larger exponent.
+	const averageScale = 2 ** Math.ceil(Math.log2(Math.max(1, safeRows.length)));
+	const avgState = new Map<string, { sum: number; correction: number; remainder: number; count: number }>();
 
 	for (const spec of safeSpecs) {
 		if (spec.op === 'count') {
@@ -251,11 +254,25 @@ export function aggregateRows(rows: any[], specs: AggregateSpec[]) {
 			if (spec.op === 'sum') {
 				result[spec.as] = Number(result[spec.as] ?? 0) + numberValue(value, spec);
 			} else if (spec.op === 'avg') {
-				const state = (MAP_GET.call(avgState, spec.as) as { sum: number; count: number } | undefined) ?? {
+				const state = (MAP_GET.call(avgState, spec.as) as {
+					sum: number; correction: number; remainder: number; count: number;
+				} | undefined) ?? {
 					sum: 0,
+					correction: 0,
+					remainder: 0,
 					count: 0
 				};
-				state.sum += numberValue(value, spec);
+				const numeric = numberValue(value, spec);
+				// Normalize before adding so finite inputs cannot overflow the sum.
+				const term = numeric / averageScale;
+				// Power-of-two division is exact except for subnormal rounding.
+				// Keep that residue in the original units until after cancellation.
+				state.remainder += numeric - term * averageScale;
+				const sum = state.sum + term;
+				state.correction += Math.abs(state.sum) >= Math.abs(term)
+					? (state.sum - sum) + term
+					: (term - sum) + state.sum;
+				state.sum = sum;
 				state.count++;
 				MAP_SET.call(avgState, spec.as, state);
 			} else if (spec.op === 'min') {
@@ -279,7 +296,10 @@ export function aggregateRows(rows: any[], specs: AggregateSpec[]) {
 	}
 
 	for (const [as, state] of MAP_ENTRIES.call(avgState)) {
-		result[as] = state.count ? state.sum / state.count : null;
+		const sum = (state.sum + state.correction) * averageScale;
+		result[as] = Number.isFinite(sum)
+			? (sum + state.remainder) / state.count
+			: (state.sum / state.count + state.correction / state.count) * averageScale + state.remainder / state.count;
 	}
 	return result;
 }
