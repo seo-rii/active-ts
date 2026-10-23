@@ -13,7 +13,7 @@ test('Firestore plans preserve declared ordering and cover the runtime ID tie br
  const query = { orderBy(field: string, direction: string) { sorts.push([field, direction]); return this; },
   limit() { return this; }, async get() { return { docs: [] }; } };
  const store = await createFirestoreStoreAdapter({ client: { collection: () => query, getAll: async () => [], runTransaction: async () => {} } });
- await store.query(meta, { where: [], or: [], sort: [{ field: 'score', direction: 'desc' }], limit: 5 });
+ await store.query(meta, { where: [], or: [], sort: [{ field: 'score', direction: 'desc' }], include: [], limit: 5 });
  const plan = await store.schema!.plan([meta]);
  assert.equal(plan.status, 'manual');
  assert.deepEqual(plan.changes, [
