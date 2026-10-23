@@ -8,7 +8,7 @@ const meta: ResolvedModelMeta = {
  indexes: [], searchIndexes: [], relations: new Map(), hooks: {}, views: new Map(), policies: new Map(),
  scopes: new Map(), fieldCodecs: new Map(), fieldTypes: new Map()
 };
-const plan: QueryPlan = { where: [], or: [], sort: [] };
+const plan: QueryPlan = { where: [], or: [], sort: [], include: [] };
 for (const reserved of ['*', '~', '/', '[', ']']) {
  test(`Firestore rejects ${reserved} field paths before reaching the SDK`, async () => {
   let calls = 0;
