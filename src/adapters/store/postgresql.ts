@@ -1489,7 +1489,7 @@ async function createPostgresStoreAdapterInternal(
 			const clean = clonePortableDataObject(data, `${model.name} stored data`);
 			assertStoreDataMatchesId(model, id, clean);
 			try {
-				await pool.query(`insert into ${tableName(options, model)} (id, data) values ($1, $2)`, [
+				await pool.query(`insert into ${tableName(options, model)} (id, data, created_at, updated_at) values ($1, $2, now(), now())`, [
 					entityIdKey(id),
 					clean
 				]);
