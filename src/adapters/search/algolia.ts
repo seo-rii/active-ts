@@ -118,7 +118,12 @@ function cursorFingerprint(value: unknown): string {
 			return `[${entries.join(',')}]`;
 		}
 		if (input && typeof input === 'object') {
-			return `{${Object.keys(input).sort().map((key) => `${JSON_STRINGIFY(key)}:${canonical(input[key])}`).join(',')}}`;
+			let entries = '';
+			for (const key of Object.keys(input).sort()) {
+				if (entries) entries += ',';
+				entries += `${JSON_STRINGIFY(key)}:${canonical(input[key])}`;
+			}
+			return `{${entries}}`;
 		}
 		throw new ActiveTsValidationError('Algolia search parameters must be JSON data.');
 	}
@@ -187,15 +192,13 @@ export async function createAlgoliaSearchAdapter(options: AlgoliaOptions = {}): 
 						}
 					: {})
 			};
-			const fingerprint = cursorFingerprint(cloneJsonTransportPayload({
-				index: indexName(model.name), idField, searchParams
-			}, 'Algolia cursor parameters'));
+			const request = cloneJsonTransportPayload({
+				indexName: indexName(model.name), searchParams
+			}, 'Algolia search request') as { indexName: string; searchParams: Record<string, unknown> };
+			const fingerprint = cursorFingerprint({ idField, request });
 			const requestedPage = pageFromCursor(searchOptions.cursor, fingerprint);
-			if (requestedPage !== undefined) searchParams.page = requestedPage;
-			const res = await client.searchSingleIndex(cloneJsonTransportPayload({
-				indexName: indexName(model.name),
-				searchParams
-			}, 'Algolia search request'));
+			if (requestedPage !== undefined) request.searchParams.page = requestedPage;
+			const res = await client.searchSingleIndex(request);
 			const page = algoliaOptionalNonNegativeInteger(ownResponseValue(res, 'page'), 'Algolia search response page');
 			const nbPages = algoliaOptionalNonNegativeInteger(ownResponseValue(res, 'nbPages'), 'Algolia search response nbPages');
 			if ((searchOptions.limit !== undefined || searchOptions.cursor !== undefined) && (page === undefined || nbPages === undefined)) {
