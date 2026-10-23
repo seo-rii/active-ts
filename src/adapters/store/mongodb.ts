@@ -420,10 +420,7 @@ async function mongoRawIndex(raw: Buffer, declared: ResolvedModelMeta['indexes']
 		position = end + 1;
 		const bytes = type === 16 ? 4 : type === 1 || type === 18 ? 8 : 0;
 		if (bytes === 0) {
-			// Preserve unrelated text/hashed indexes; their unsupported key types
-			// are rejected only if a declared index actually refers to them.
-			defineDataProperty(item, 'key', decodedKey, { enumerable: true, configurable: true, writable: true });
-			return item;
+			throw new ActiveTsValidationError(`MongoDB index.key.${field} must have direction 1 or -1.`);
 		}
 		if (position + bytes > key.length - 1) throw new ActiveTsValidationError('MongoDB index.key contains a malformed direction.');
 		const direction = mongoDocumentValue(decodedKey, field, 'MongoDB index.key');

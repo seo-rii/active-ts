@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { BSON } from 'mongodb';
-import type { ResolvedModelMeta } from '../src/index.js';
+import { ActiveTsValidationError, type ResolvedModelMeta } from '../src/index.js';
 import { createMongoStoreAdapter } from '../src/adapters/store/mongodb.js';
 
 const meta: ResolvedModelMeta = {
@@ -66,3 +66,33 @@ for (const fields of [['2', '1'], ['label', '2', '1']]) {
 		await assert.rejects(adapter.schema!.plan([declared]), /require raw BSON or an ordered Map/);
 	});
 }
+
+test('MongoDB raw declared indexes reject unsupported directions before duplicate fields collapse', async () => {
+	let raw: Buffer;
+	const adapter = await createMongoStoreAdapter({ dbName: 'test', client: { db() { return {
+		collection() { return {
+			async indexes() { return [raw]; },
+			async createIndex() { assert.fail('invalid index metadata must reject before DDL'); }
+		}; },
+		listCollections() { return { async toArray() { return [{ name: meta.name, type: 'collection' }]; } }; },
+		async createCollection() { assert.fail('invalid index metadata must reject before DDL'); }
+	}; } } });
+	for (const field of ['value', '2']) {
+		for (const invalid of ['hashed', 'text', true]) {
+			// A normal object cannot preserve duplicate BSON entries: deserialization
+			// overwrites the unsupported direction with the later valid direction.
+			const first = BSON.serialize({ [field]: invalid });
+			const second = BSON.serialize({ [field]: 1 });
+			const key = Buffer.concat([Buffer.alloc(4), first.subarray(4, -1), second.subarray(4, -1), Buffer.from([0])]);
+			key.writeInt32LE(key.length);
+			const original = BSON.serialize({ v: 2, name: 'ordered_idx', key: { [field]: 1 } });
+			const position = original.indexOf(Buffer.from('\x03key\0')) + 5;
+			raw = Buffer.concat([original.subarray(0, position), key, original.subarray(position + original.readInt32LE(position))]);
+			raw.writeInt32LE(raw.length);
+			assert.deepEqual(BSON.deserialize(raw).key, { [field]: 1 });
+			const declared = { ...meta, indexes: [{ name: 'ordered_idx', fields: [field] }] };
+			await assert.rejects(adapter.schema!.plan([declared]), ActiveTsValidationError);
+			await assert.rejects(adapter.schema!.apply([declared], { mode: 'safe' }), ActiveTsValidationError);
+		}
+	}
+});
