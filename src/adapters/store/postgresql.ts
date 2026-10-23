@@ -253,18 +253,16 @@ async function existingIndexDefinitions(pool: any, options: PostgresStoreOptions
 		model.name
 	]);
 	const indexes = new Map<string, string | undefined>();
+	const health = new Map<string, boolean>();
 	for (const row of postgresRows(res, 'PostgreSQL index lookup')) {
 		const indexName = postgresRowValue(row, 'indexname', 'PostgreSQL index row');
 		if (indexName === undefined) continue;
 		const name = postgresOptionalString(indexName, 'PostgreSQL index row.indexname');
 		for (const index of model.indexes) {
 			if (name !== indexIdentifier(model, index.name) && name !== indexIdentifier(model, index.name, true)) continue;
-			if (postgresRowValue(row, 'indisvalid', 'PostgreSQL index row') !== true ||
-				postgresRowValue(row, 'indisready', 'PostgreSQL index row') !== true) {
-				throw new ActiveTsConfigurationError(
-					`PostgreSQL index "${name}" on "${model.name}" is not valid and ready. Repair or rebuild the index before applying the schema.`
-				);
-			}
+			MAP_SET.call(health, name,
+				postgresRowValue(row, 'indisvalid', 'PostgreSQL index row') === true &&
+				postgresRowValue(row, 'indisready', 'PostgreSQL index row') === true);
 		}
 		const indexDef = postgresRowValue(row, 'indexdef', 'PostgreSQL index row');
 		MAP_SET.call(
@@ -272,6 +270,15 @@ async function existingIndexDefinitions(pool: any, options: PostgresStoreOptions
 			postgresOptionalString(indexName, 'PostgreSQL index row.indexname'),
 			indexDef === undefined ? undefined : postgresOptionalString(indexDef, 'PostgreSQL index row.indexdef')
 		);
+	}
+	for (const index of model.indexes) {
+		const physical = indexIdentifier(model, index.name);
+		const selected = MAP_HAS.call(indexes, physical) ? physical : indexIdentifier(model, index.name, true);
+		if (MAP_HAS.call(indexes, selected) && MAP_GET.call(health, selected) !== true) {
+			throw new ActiveTsConfigurationError(
+				`PostgreSQL index "${selected}" on "${model.name}" is not valid and ready. Repair or rebuild the index before applying the schema.`
+			);
+		}
 	}
 	return indexes;
 }

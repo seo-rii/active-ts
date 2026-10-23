@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { ResolvedModelMeta } from '../src/index.js';
 import { createPostgresStoreAdapter } from '../src/adapters/store/postgresql.js';
 
@@ -28,6 +28,22 @@ for (const health of [{ indisvalid: false, indisready: true }, { indisvalid: tru
 	});
 }
 
+test('PostgreSQL checks the selected physical index when an obsolete legacy index is invalid', async () => {
+	const hash = createHash('sha256').update(JSON.stringify([meta.name, 'value_idx'])).digest('hex').slice(0, 12);
+	const physical = `${name}_${hash}`;
+	const adapter = await createPostgresStoreAdapter({ pool: { async query(sql: string) {
+		if (sql.includes('information_schema.tables')) return { rows: [{}] };
+		if (sql.includes('information_schema.columns')) return { rows: ['id', 'data', 'created_at', 'updated_at'].map((column_name, index) => ({ column_name, udt_name: ['text', 'jsonb', 'timestamptz', 'timestamptz'][index], is_nullable: 'NO' })) };
+		if (sql.includes('from pg_index i')) return { rows: [{ column_name: 'id' }] };
+		if (sql.includes('pg_indexes')) return { rows: [name, physical].map((indexname) => ({
+			indexname, indisvalid: indexname === physical, indisready: indexname === physical,
+			indexdef: `CREATE UNIQUE INDEX ${indexname} ON public.${meta.name} USING btree (((data #> ARRAY['value'::text])))`
+		})) };
+		throw new Error(`Unexpected SQL: ${sql}`);
+	} } });
+	assert.deepEqual((await adapter.schema!.plan([meta])).changes, []);
+});
+
 test('PostgreSQL detects a real failed concurrent unique index and accepts its repaired replacement', {
 	skip: !process.env.ACTIVE_TS_TEST_POSTGRES_URL
 }, async () => {
@@ -41,7 +57,7 @@ test('PostgreSQL detects a real failed concurrent unique index and accepts its r
 		await adapter.schema!.apply([{ ...meta, indexes: [] }], { mode: 'safe' });
 		await adapter.create(meta, 1, { id: 1, value: 'duplicate' });
 		await adapter.create(meta, 2, { id: 2, value: 'duplicate' });
-		await assert.rejects(pool.query(`create unique index concurrently ${name} on ${schema}.${meta.name} (((data #> ARRAY['value'])))`), /duplicate/);
+		await assert.rejects(pool.query(`create unique index concurrently ${name} on ${schema}.${meta.name} (((data #> ARRAY['value'])))`), { code: '23505' });
 		await assert.rejects(adapter.schema!.plan([meta]), /not valid and ready/);
 		await assert.rejects(adapter.schema!.apply([meta], { mode: 'safe' }), /not valid and ready/);
 		await pool.query(`drop index ${schema}.${name}`);
