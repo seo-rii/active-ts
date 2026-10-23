@@ -1209,6 +1209,13 @@ Custom store adapters can omit `aggregate()` while prototyping by enabling the
 explicit fallback in test/dev contexts. Production adapters should implement
 native aggregate support or leave aggregate helpers unsupported.
 
+The core aggregate fallback requires a complete query result. If the store
+returns `more: true`, it throws before returning an aggregate, even when a
+continuation cursor is available. Use native aggregates or explicitly paginate
+the query and compute the aggregate with an application-owned read policy and
+execution budget. The fallback does not silently aggregate only the first page
+or start an unbounded scan.
+
 Datastore array properties have different scalar-filter semantics from the
 portable active-ts evaluator. For scalar fields without `fieldType()` metadata,
 the adapter therefore treats native `=`, `in`, `between`, and range filters only
