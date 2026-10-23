@@ -18,6 +18,7 @@ import {
 	defineDataProperty
 } from '../../core/safe-keys.js';
 import { snapshotArrayInput } from '../../core/array-input.js';
+import { JSON_STRINGIFY } from '../../core/json-intrinsics.js';
 import { aggregateRows, assertAggregateSpecsCompatibleWithModel, normalizeAggregateRow } from '../../core/aggregate.js';
 import { entityIdFromCanonicalKey, entityIdKey, limitWithLookahead, trimLookaheadRows } from '../../core/query-utils.js';
 import {
@@ -1043,11 +1044,25 @@ function firestoreSchemaChanges(models: ResolvedModelMeta[]) {
 	const changes: SchemaPlan['changes'] = [];
 	for (let modelIndex = 0; modelIndex < models.length; modelIndex++) {
 		const model = models[modelIndex];
+		const shapes = new Set<string>();
+		const names = new Set<string>();
+		for (const index of model.indexes) {
+			const directions: string[] = [];
+			for (let position = 0; position < index.fields.length; position++) {
+				directions[position] = index.directions?.[position] ?? 'asc';
+			}
+			SET_ADD.call(shapes, JSON_STRINGIFY([index.fields, directions]));
+			SET_ADD.call(names, index.name);
+		}
 		for (let indexIndex = 0; indexIndex < model.indexes.length; indexIndex++) {
 			const index = model.indexes[indexIndex];
 			const fields: string[] = [];
+			const directions: Array<'asc' | 'desc'> = [];
+			let includesId = false;
 			for (let fieldIndex = 0; fieldIndex < index.fields.length; fieldIndex++) {
 				fields[fieldIndex] = assertSafeFirestoreField(index.fields[fieldIndex], 'Firestore schema index field');
+				directions[fieldIndex] = index.directions?.[fieldIndex] ?? 'asc';
+				if (fields[fieldIndex] === model.idField) includesId = true;
 			}
 			changes[changes.length] = {
 				type: 'create-index' as const,
@@ -1056,6 +1071,22 @@ function firestoreSchemaChanges(models: ResolvedModelMeta[]) {
 				fields,
 				...(index.directions === undefined ? {} : { directions: index.directions }),
 				unique: index.unique
+			};
+			if (includesId) continue;
+			// Limited queries add the logical ID as an ascending tie breaker. Keep
+			// the declared shape as well for queries without that extra ordering.
+			const stableFields = [...fields, assertSafeFirestoreField(model.idField, 'Firestore id field')];
+			const stableDirections: Array<'asc' | 'desc'> = [...directions, 'asc'];
+			const shape = JSON_STRINGIFY([stableFields, stableDirections]);
+			if (SET_HAS.call(shapes, shape)) continue;
+			SET_ADD.call(shapes, shape);
+			let name = `${index.name}_stable_id`;
+			let suffix = 2;
+			while (SET_HAS.call(names, name)) name = `${index.name}_stable_id_${suffix++}`;
+			SET_ADD.call(names, name);
+			changes[changes.length] = {
+				type: 'create-index', target: model.name, name,
+				fields: stableFields, directions: stableDirections, unique: index.unique
 			};
 		}
 	}

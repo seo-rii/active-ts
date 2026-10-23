@@ -1039,7 +1039,12 @@ Adapters may implement:
 - `schema.apply(models, { mode: 'safe' })` - apply non-destructive changes
 
 PostgreSQL and MongoDB can create collections/tables and indexes. Firestore
-reports index intent but does not apply remote index configuration.
+reports index intent but does not apply remote index configuration. Firestore
+plans retain each declared index and add a variant ending in the logical model
+ID ascending when the declaration omits that field. This variant supports the
+stable ordering added to limited portable queries. Existing field directions
+are preserved, and an explicitly declared matching variant is reused. Deploy
+both query shapes when the application uses both limited and unlimited queries.
 
 ## Adapter Contract
 
