@@ -1061,6 +1061,13 @@ stable ordering added to limited portable queries. Existing field directions
 are preserved, and an explicitly declared matching variant is reused. Deploy
 both query shapes when the application uses both limited and unlimited queries.
 
+MongoDB preserves numeric field-name order in compound sorts and indexes with
+ordered SDK maps. Index discovery requests raw BSON because JavaScript objects
+reorder integer-like keys. Injected clients can return ordered `Map` keys; an
+ordinary object with compound numeric keys is rejected because it cannot prove
+the physical index order.
+
+
 ## Adapter Contract
 
 Adapter authors should run the shared contracts for every adapter kind they
