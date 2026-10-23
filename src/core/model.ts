@@ -114,6 +114,7 @@ export abstract class Model<TData extends Record<string, any> = Record<string, a
 	readonly data: TData;
 	protected readonly context: ActiveContext;
 	private persistedId?: EntityId;
+	private persistedVersion?: number;
 	private [MODEL_DATASTORE_WRITE_ANCESTOR]?: DatastoreKey;
 	private readonly plannedRelations = new Set<string>();
 	private readonly relationCache = new Map<string, LazyRef<any>>();
@@ -128,6 +129,8 @@ export abstract class Model<TData extends Record<string, any> = Record<string, a
 		this.data = data;
 		const meta = this.context.meta(this.constructor as ModelConstructor);
 		this.persistedId = options.persisted ? valueFor(data, meta.idField) as EntityId | undefined : undefined;
+		const version = options.persisted ? valueFor(data, 'version') : undefined;
+		this.persistedVersion = typeof version === 'number' ? version : undefined;
 		if (options.persisted && this.persistedId !== undefined && meta.datastore?.ancestor) {
 			const descriptor = Object.getOwnPropertyDescriptor(data, ACTIVE_TS_ENTITY_KEY);
 			if (descriptor !== undefined) {
@@ -505,7 +508,7 @@ export abstract class Model<TData extends Record<string, any> = Record<string, a
 		assertContextTransactionWritable(context, `save ${meta.name}`);
 		trackTransactionModel(context, this);
 		const safeData = cloneSafeDataObject(this.data, `${meta.name} update data`);
-		const originalVersion = typeof safeData.version === 'number' ? safeData.version : undefined;
+		const originalVersion = this.expectedWriteVersion(safeData, meta.name);
 		const before = await context.runHooks('beforeUpdate', {
 			model: meta,
 			target: this,
@@ -574,6 +577,7 @@ export abstract class Model<TData extends Record<string, any> = Record<string, a
 		);
 		replaceData(this.data, prepared.data);
 		this.persistedId = prepared.id;
+		this.persistedVersion = typeof prepared.data.version === 'number' ? prepared.data.version : undefined;
 		MAP_CLEAR.call(this.relationCache);
 	}
 
@@ -632,7 +636,7 @@ export abstract class Model<TData extends Record<string, any> = Record<string, a
 					throw new ActiveTsValidationError(`${meta.name} delete data id field "${meta.idField}" must match the loaded id.`);
 				}
 				const store = contextInternalStore(context, meta.store);
-				const expectedVersion = typeof safeData.version === 'number' ? safeData.version : undefined;
+				const expectedVersion = this.expectedWriteVersion(safeData, meta.name);
 				if (expectedVersion !== undefined && store.capabilities?.optimisticLock !== true) {
 					throw new ActiveTsConfigurationError(
 						`Store adapter "${store.kind}" does not support atomic optimistic locking.`
@@ -652,6 +656,7 @@ export abstract class Model<TData extends Record<string, any> = Record<string, a
 					() => store.delete(meta, id, writeOptions)
 				);
 				this.persistedId = undefined;
+				this.persistedVersion = undefined;
 				MAP_CLEAR.call(this.relationCache);
 				await afterStoreWrite(context, meta.name, 'delete', id, async () => {
 					await runCommittedWriteBoundaryEffects(context, meta, id, {
@@ -671,6 +676,16 @@ export abstract class Model<TData extends Record<string, any> = Record<string, a
 				});
 			}
 		);
+	}
+
+	private expectedWriteVersion(data: Record<string, any>, modelName: string) {
+		const version = valueFor(data, 'version');
+		if (this.persistedVersion !== undefined && version !== this.persistedVersion) {
+			throw new ActiveTsValidationError(
+				`Cannot change persisted version field on ${modelName}. Reload the model before writing.`
+			);
+		}
+		return this.persistedVersion ?? (typeof version === 'number' ? version : undefined);
 	}
 
 	protected assertFullModel(operation: string) {
