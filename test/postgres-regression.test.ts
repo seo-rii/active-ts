@@ -932,7 +932,7 @@ test('PostgreSQL schema planning rejects same-name index drift', async () => {
 		/PostgreSQL index "handle_idx" on "postgres_regression_record" does not match declared fields or uniqueness/
 	);
 
-	indexRows = [{ indexname: indexName }];
+	indexRows = [{ indexname: indexName, indisvalid: true, indisready: true }];
 	await assert.rejects(
 		() => adapter.schema!.plan([declared]),
 		/PostgreSQL index "handle_idx" on "postgres_regression_record" is missing definition metadata/
