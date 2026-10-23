@@ -3088,9 +3088,9 @@ test('postgres adapter parameterizes json paths and rejects unsafe field paths',
 		include: []
 	});
 	assert.match(calls[0].text, /jsonb_typeof\(data #> \$1::text\[\]\) = 'string'/);
-	assert.match(calls[0].text, /\(data #>> \$1::text\[\]\) = \$2::text/);
+	assert.match(calls[0].text, /\(\(data #>> \$1::text\[\]\) collate "C"\) = \$2::text/);
 	assert.match(calls[0].text, /jsonb_typeof\(data #> \$3::text\[\]\) = 'string'/);
-	assert.match(calls[0].text, /\(data #>> \$3::text\[\]\) = \$4::text/);
+	assert.match(calls[0].text, /\(\(data #>> \$3::text\[\]\) collate "C"\) = \$4::text/);
 	assert.deepEqual(calls[0].values, [['handle'], 'pg', ['name'], 'Postgres']);
 
 	calls.length = 0;
