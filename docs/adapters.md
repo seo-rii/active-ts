@@ -1218,3 +1218,9 @@ MongoDB portable `orderBy()` follows the same metadata requirement for non-id
 fields. MongoDB's native ordering for missing, null, arrays, objects, and mixed
 scalar values differs from active-ts' portable comparator, so declare sortable
 scalar fields with `fieldType()`.
+
+Datastore typed `min`/`max` with a non-null `!=` operand requires
+`allowAggregateScanFallback: true` unless another predicate already excludes
+null on the aggregate field. The scan preserves portable null handling without
+adding a second negative filter, which the backend does not support. An existing
+`!= null` predicate is reused by the optimized path.
