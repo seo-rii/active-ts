@@ -13676,7 +13676,7 @@ test('Datastore aggregate rejects SDK and min max combinations that would mix sn
 	assert.deepEqual(calls, []);
 });
 
-test('Datastore native aggregates combine different fields in one backend request', async () => {
+test('Datastore native aggregates reject different input fields before a backend request', async () => {
 	const aggregateGroups: string[][] = [];
 	const aggregateMeta: ResolvedModelMeta<any> = {
 		...meta,
@@ -13720,8 +13720,8 @@ test('Datastore native aggregates combine different fields in one backend reques
 		})
 	});
 
-	assert.deepEqual(
-		await datastore.aggregate!(aggregateMeta, {
+	await assert.rejects(
+		() => datastore.aggregate!(aggregateMeta, {
 			where: [],
 			or: [],
 			aggregates: [
@@ -13731,14 +13731,9 @@ test('Datastore native aggregates combine different fields in one backend reques
 				{ op: 'sum', field: 'right', as: 'rightTotal' }
 			]
 		}),
-		{ count: 2, leftTotal: 10, leftAverage: 10, rightTotal: 20 }
+		/preserve each aggregate input set/
 	);
-	assert.deepEqual(aggregateGroups, [[
-		'count:-:count',
-		'sum:left:leftTotal',
-		'avg:left:leftAverage',
-		'sum:right:rightTotal'
-	]]);
+	assert.deepEqual(aggregateGroups, []);
 });
 
 test('Datastore native aggregates keep compatible specs in one backend request', async () => {

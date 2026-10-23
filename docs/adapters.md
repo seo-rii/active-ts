@@ -1164,8 +1164,11 @@ Built-in optimized paths:
 - PostgreSQL emits `count`, `sum`, `avg`, `min`, and `max` SQL aggregates
 - MongoDB emits one aggregation pipeline with `$group` for `count`, `sum`, and
   `avg`
-- Datastore uses aggregation queries for `count`, `sum`, and `avg`; with
-  `allowAggregateScanFallback: true`, it can instead run a validated full-row
+- Datastore uses aggregation queries for count-only plans or `sum`/`avg` of
+  one common field. Combining count with numeric aggregates, or aggregating
+  different fields, requires `allowAggregateScanFallback: true` because native
+  aggregation intersects the entities containing all aggregate fields. With
+  this option it runs a validated full-row
   query scan. `min` and `max` use ordered `limit(1)` lookups for fields declared
   with scalar `fieldType()` metadata unless scan fallback is enabled. At most
   five aggregate specs are accepted. Specs that would require more than one
@@ -1218,3 +1221,9 @@ MongoDB portable `orderBy()` follows the same metadata requirement for non-id
 fields. MongoDB's native ordering for missing, null, arrays, objects, and mixed
 scalar values differs from active-ts' portable comparator, so declare sortable
 scalar fields with `fieldType()`.
+
+Datastore native numeric aggregates rely on the declared numeric field contract;
+use `allowAggregateScanFallback: true` to validate legacy or externally written
+values. The scan ignores missing/null aggregate values and rejects nonnumeric
+values. A multi-aggregate scan also requires `readAt()` or a Datastore transaction
+to keep all results on one snapshot.
