@@ -4862,7 +4862,8 @@ test('Google manual schema plans ignore patched Array transforms', async () => {
 		Object.defineProperty(Array.prototype, 'flatMap', { configurable: true, value: arrayFlatMap });
 	}
 	assert.deepEqual(firestorePlan?.changes, [
-		{ type: 'create-index', target: 'google_regression_record', name: 'idx_handle_score', fields: ['handle', 'score'], unique: undefined }
+		{ type: 'create-index', target: 'google_regression_record', name: 'idx_handle_score', fields: ['handle', 'score'], unique: undefined },
+		{ type: 'create-index', target: 'google_regression_record', name: 'idx_handle_score_stable_id', fields: ['handle', 'score', 'id'], directions: ['asc', 'asc', 'asc'], unique: undefined }
 	]);
 	assert.deepEqual(datastorePlan?.changes, [
 		{
@@ -4887,7 +4888,8 @@ test('Google manual schema plans ignore patched Array transforms', async () => {
 			fields: ['handle', 'score'],
 			directions: ['asc', 'desc'],
 			unique: undefined
-		}
+		},
+		{ type: 'create-index', target: 'google_regression_record', name: 'idx_handle_score_desc_stable_id', fields: ['handle', 'score', 'id'], directions: ['asc', 'desc', 'asc'], unique: undefined }
 	]);
 	assert.deepEqual((await datastore.schema!.plan([directionalMeta])).changes, [
 		{

@@ -73,7 +73,9 @@ async function main() {
 			cliConfigValue(defaultExport, 'dispose', 'Config default export'),
 			cliConfigValue(defaultExport, 'close', 'Config default export')
 		);
+		const isDefaultCleanup = dispose === undefined;
 		dispose = cliOptionalConfigFunction(cleanup, 'Config dispose/close must be a function.');
+		if (isDefaultCleanup && dispose) dispose = dispose.bind(defaultExport);
 		const namedContext = cliConfigEntry(mod, 'context', 'Config module');
 		const context = namedContext.exists
 			? namedContext.value

@@ -3968,7 +3968,7 @@ test('firestore adapter validates field paths, document ids, and write payloads'
 	assert.equal(applied.adapter, 'firestore');
 	assert.equal(applied.status, 'manual');
 	assert.match(applied.note ?? '', /must be applied/);
-	assert.deepEqual(applied.changes.map((change) => change.type), ['create-index']);
+	assert.deepEqual(applied.changes.map((change) => change.type), ['create-index', 'create-index']);
 	assert.equal((await adapter.schema!.plan([nonUniqueMeta])).status, 'manual');
 });
 

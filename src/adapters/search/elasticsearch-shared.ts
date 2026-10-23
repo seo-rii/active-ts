@@ -172,7 +172,7 @@ function elasticsearchMore(
 		if (pagination.searchAfter) return undefined;
 		return true;
 	}
-	if (total.value === undefined) return false;
+	if (total.value === undefined) return hitsLength === 0 ? false : undefined;
 	if (pagination.searchAfter) return hitsLength === 0 ? false : undefined;
 	return pagination.from + hitsLength < total.value;
 }
@@ -238,9 +238,26 @@ export async function createElasticsearchCompatibleSearchAdapter(
 			if (native === undefined && !fields.length) return { list: [], more: false, count: 0 };
 			const res = await client.search(cloneJsonTransportPayload({
 				index: indexName(model.name),
+				allow_partial_search_results: false,
 				...(searchOptions.limit === undefined ? {} : { size: searchOptions.limit }),
 				body: elasticsearchSearchBody(native, safeQuery, fields, sourceFields, searchOptions.limit !== undefined)
 			}, 'Elasticsearch search request'));
+			const timedOut = ownResponseValue(res, 'timed_out');
+			if (timedOut !== undefined && typeof timedOut !== 'boolean') {
+				throw new ActiveTsValidationError(`${backendName} search response.timed_out must be a boolean.`);
+			}
+			if (timedOut === true) {
+				throw new ActiveTsValidationError(`${backendName} search timed out; incomplete results cannot be returned.`);
+			}
+			const shards = ownResponseValue(res, '_shards');
+			if (shards !== undefined) {
+				const failed = elasticsearchNonNegativeNumber(
+					ownResponseValue(shards, 'failed'), `${backendName} search response._shards.failed`
+				);
+				if (failed > 0) {
+					throw new ActiveTsValidationError(`${backendName} search has failed shards; incomplete results cannot be returned.`);
+				}
+			}
 			const hits = elasticsearchHits(res);
 			const total = elasticsearchTotal(res);
 			const more = elasticsearchMore(total, hits.length, nativePagination);
@@ -420,6 +437,9 @@ function elasticsearchSearchHit(hit: any, model: ResolvedModelMeta, adapterKind:
 		: clean;
 	const logicalId = row[model.idField];
 	assertSafeEntityId(logicalId, `Elasticsearch hit ${model.idField}`);
+	if (!model.datastore?.ancestor && idFromElasticsearchHit(hit, model) !== logicalId) {
+		throw new ActiveTsValidationError('Elasticsearch hit _id does not match its logical model id.');
+	}
 	return markSearchDocumentIdentity(
 		projectSearchDocument(model, adapterKind, logicalId, row),
 		documentIdentityFromElasticsearchHit(hit, model)

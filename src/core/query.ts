@@ -1437,9 +1437,9 @@ export class QueryBuilder<TModel extends { data: any }, TData extends Record<str
 					const scopedAncestor = this.plan.meta?.datastoreAncestor === undefined
 						? undefined
 						: normalizeDatastoreKey(this.plan.meta.datastoreAncestor, 'query datastore ancestor');
+					const safePatch = cloneSafeDataObject(patch, `${meta.name} query find update patch`);
 					const item = await load({ select: false, include: false });
 					if (!item) return null;
-					const safePatch = cloneSafeDataObject(patch, `${meta.name} query find update patch`);
 					const patchId = safePatch[meta.idField];
 					if (patchId !== undefined) {
 						assertSafeEntityId(patchId, `${meta.name}.${meta.idField}`);
