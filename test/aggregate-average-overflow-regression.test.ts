@@ -33,3 +33,18 @@ test('portable averages handle both signs, extreme differences, tiny values and 
 		assert.equal(aggregateRows(values.map((value) => ({ value })), [{ op: 'avg', field: 'value', as: 'avg' }]).avg, expected);
 	}
 });
+
+test('averages retain tiny residuals after extreme values cancel in every input position', () => {
+	for (const residual of [1e-100, 3 * Number.MIN_VALUE, -1e-100, -3 * Number.MIN_VALUE]) {
+		for (const values of [
+			[1e308, -1e308, residual],
+			[residual, 1e308, -1e308],
+			[1e308, residual, -1e308]
+		]) {
+			assert.equal(
+				aggregateRows(values.map((value) => ({ value })), [{ op: 'avg', field: 'value', as: 'avg' }]).avg,
+				residual / values.length
+			);
+		}
+	}
+});
