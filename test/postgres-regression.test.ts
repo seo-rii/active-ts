@@ -1283,7 +1283,7 @@ test('PostgreSQL scalar filters guard JSON value types', async () => {
 	});
 
 	assert.match(calls[0].text, /jsonb_typeof\(data #> \$1::text\[\]\) = 'string'/);
-	assert.match(calls[0].text, /\(data #>> \$1::text\[\]\) = \$2::text/);
+	assert.match(calls[0].text, /\(\(data #>> \$1::text\[\]\) collate "C"\) = \$2::text/);
 	assert.deepEqual(calls[0].values, [['handle'], '1']);
 	assert.match(calls[1].text, /jsonb_typeof\(data #> \$1::text\[\]\) = 'number'/);
 	assert.match(calls[1].text, /\(data #>> \$1::text\[\]\)::double precision = \$2::double precision/);
