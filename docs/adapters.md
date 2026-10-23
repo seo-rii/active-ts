@@ -1218,3 +1218,11 @@ MongoDB portable `orderBy()` follows the same metadata requirement for non-id
 fields. MongoDB's native ordering for missing, null, arrays, objects, and mixed
 scalar values differs from active-ts' portable comparator, so declare sortable
 scalar fields with `fieldType()`.
+
+Firestore portable field paths use dot-separated map segments. The adapter rejects
+`*`, `~`, `/`, `[` and `]` in model field declarations, query paths, schema indexes,
+and stored property names before calling SDK query or write methods. This keeps
+created data addressable by the same portable query API, including nested objects
+and arrays. For existing Firestore fields containing these characters, use the
+native Firestore SDK with `FieldPath` objects; portable queries do not escape or
+silently rename those fields.
