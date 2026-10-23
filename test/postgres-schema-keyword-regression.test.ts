@@ -28,7 +28,7 @@ test('PostgreSQL schema matches quoted keyword fields while rejecting actual ind
 				] };
 				if (sql.includes('from pg_index i')) return { rows: [{ column_name: 'id' }] };
 				if (sql.includes('pg_indexes')) return { rows: [{
-					indexname: 'keyword_record_keyword_idx', indexdef: definition + suffix
+					indisvalid: true, indisready: true, indexname: 'keyword_record_keyword_idx', indexdef: definition + suffix
 				}] };
 				throw new Error(`Unexpected SQL: ${sql}`);
 			}
