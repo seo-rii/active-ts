@@ -499,6 +499,9 @@ function postgresIndexDefinitionKeys(definition: string): string[] | undefined {
 }
 
 function hasUnsupportedPostgresIndexDefinitionOptions(definition: string, directions: readonly SortDirection[] | undefined) {
+	// Catalog definitions quote JSON keys and identifiers; their contents are not
+	// index options. Keep complete key matching separate from this clause check.
+	definition = stripPostgresSqlLiteralsAndComments(definition, false);
 	if (!/\busing\s+btree\b/i.test(definition)) return true;
 	if (/\bwhere\b/i.test(definition)) return true;
 	if (/\bcollate\b/i.test(definition)) return true;
