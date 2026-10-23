@@ -429,6 +429,9 @@ function stripAlgoliaHit(hit: any, model: ResolvedModelMeta) {
 	}
 	const logicalId = clean[model.idField];
 	assertSafeEntityId(logicalId, `Algolia hit ${model.idField}`);
+	if (!model.datastore?.ancestor && idFromAlgoliaObjectID(objectID, model) !== logicalId) {
+		throw new ActiveTsValidationError('Algolia hit objectID does not match its logical model id.');
+	}
 	return markSearchDocumentIdentity(
 		projectSearchDocument(model, 'algolia', logicalId, clean),
 		documentIdentityFromAlgoliaObjectID(objectID, model)

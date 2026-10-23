@@ -4105,13 +4105,7 @@ test('algolia and elasticsearch search lifecycle uses typed ids and projected do
 			deleteObject: async () => undefined
 		}
 	});
-	assert.deepEqual(await mismatchedAlgoliaHitId.search(meta, 'safe', {}), {
-		list: [{ id: 2, title: 'logical id wins' }],
-		cursor: undefined,
-		more: false,
-		count: 1,
-		total: 1
-	});
+	await assert.rejects(mismatchedAlgoliaHitId.search(meta, 'safe', {}), /objectID does not match its logical model id/);
 	const noncanonicalAlgoliaObjectId = await createAlgoliaSearchAdapter({
 		client: {
 			searchSingleIndex: async () => ({
@@ -4598,12 +4592,7 @@ test('algolia and elasticsearch search lifecycle uses typed ids and projected do
 			delete: async () => undefined
 		}
 	});
-	assert.deepEqual(await mismatchedElasticHitId.search(meta, 'safe', {}), {
-		list: [{ id: 8, title: 'logical id wins' }],
-		count: 1,
-		total: 1,
-		more: false
-	});
+	await assert.rejects(mismatchedElasticHitId.search(meta, 'safe', {}), /_id does not match its logical model id/);
 	const noncanonicalElasticHitId = await createElasticsearchSearchAdapter({
 		client: {
 			search: async () => ({

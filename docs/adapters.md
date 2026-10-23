@@ -857,9 +857,11 @@ const search = await createElasticsearchSearchAdapter({
 ```
 
 Built-in search adapters keep the projected document's id field as the logical
-model id. For ancestor-backed Datastore search sync they may use a separate
-bounded backend document key, so remote `objectID`/`_id` values are not required
-to decode to the same logical id when the stored document includes the id field.
+model id. Algolia, Elasticsearch, and OpenSearch require each ordinary hit's
+canonical backend `objectID`/`_id` to agree with that logical id, including its
+string/number type. Missing, malformed, or conflicting identities reject the
+response. For ancestor-backed Datastore search sync, the separate bounded
+backend document key follows the Datastore identity rules.
 
 Search adapters can advertise `capabilities.revisionWrites: true` and accept a
 monotonic write fence:
