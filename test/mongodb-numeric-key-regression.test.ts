@@ -49,7 +49,12 @@ for (const fields of [['2', '1'], ['label', '2', '1']]) {
 		// Ordinary JS deserialization would reorder these keys and lose the proof.
 		assert.notDeepEqual(Object.keys(BSON.deserialize(indexes[0] as Buffer).key), fields);
 		assert.deepEqual((await adapter.schema!.plan([declared])).changes, []);
-		indexes.push(BSON.serialize({ v: 2, name: 'unrelated_hashed', key: { other: 'hashed' } }));
+		indexes.push(
+			BSON.serialize({ v: 2, name: 'unrelated_hashed', key: { other: 'hashed' } }),
+			BSON.serialize({ v: 2, name: 'unrelated_wildcard', key: { '$**': 1 } }),
+			BSON.serialize({ v: 2, name: 'unrelated_text', key: { _fts: 'text', _ftsx: 1 }, weights: { title: 1 } }),
+			BSON.serialize({ v: 2, name: 'unrelated_custom', key: { other: 2 } })
+		);
 		assert.deepEqual((await adapter.schema!.plan([declared])).changes, []);
 		indexes = [BSON.serialize({ v: 2, name: 'ordered_idx', key: new Map([...fields].reverse().map((field) => [field, 1])), unique: true })];
 		await assert.rejects(adapter.schema!.plan([declared]), /does not match declared fields or uniqueness/);

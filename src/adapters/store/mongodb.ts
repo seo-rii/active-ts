@@ -383,10 +383,10 @@ function mongoIntegerFieldName(field: string) {
 	return Number.isInteger(value) && value >= 0 && value < 0xffff_ffff && String(value) === field;
 }
 
-async function mongoExistingIndexes(indexes: readonly unknown[]) {
+async function mongoExistingIndexes(indexes: readonly unknown[], declared: ResolvedModelMeta['indexes']) {
 	const result = new Map<string, unknown>();
 	for (let index = 0; index < indexes.length; index++) {
-		const item = Buffer.isBuffer(indexes[index]) ? await mongoRawIndex(indexes[index] as Buffer) : indexes[index];
+		const item = Buffer.isBuffer(indexes[index]) ? await mongoRawIndex(indexes[index] as Buffer, declared) : indexes[index];
 		const name = mongoDocumentValue(item, 'name', 'MongoDB index');
 		if (name === undefined) continue;
 		MAP_SET.call(result, mongoOptionalString(name, 'MongoDB index.name'), item);
@@ -394,11 +394,17 @@ async function mongoExistingIndexes(indexes: readonly unknown[]) {
 	return result;
 }
 
-async function mongoRawIndex(raw: Buffer) {
+async function mongoRawIndex(raw: Buffer, declared: ResolvedModelMeta['indexes']) {
 	// Ordinary BSON deserialization loses numeric property order. Decode scalar
 	// metadata normally but retain and inspect the raw ordered index-key document.
 	const { BSON } = await optionalImport('mongodb', 'MongoStoreAdapter schema');
 	const item = BSON.deserialize(raw, { raw: true });
+	const name = mongoDocumentValue(item, 'name', 'MongoDB index');
+	let selected = false;
+	for (const index of declared) if (index.name === name) selected = true;
+	// Unrelated indexes may legitimately have wildcard, text, geo, or hashed keys.
+	// Only declared indexes need portable field and direction validation.
+	if (!selected) return item;
 	const key = mongoDocumentValue(item, 'key', 'MongoDB index');
 	if (!Buffer.isBuffer(key) || key.length < 5 || key.readInt32LE(0) !== key.length || key[key.length - 1] !== 0) {
 		throw new ActiveTsValidationError('MongoDB index.key must be a BSON document.');
@@ -1017,7 +1023,8 @@ export async function createMongoStoreAdapter(options: MongoStoreOptions): Promi
 								mongoArrayResult(
 									await mongoMethod(collection(model), 'indexes', 'MongoDB collection.indexes')({ raw: true }),
 									'MongoDB collection.indexes'
-								)
+								),
+								model.indexes
 							)
 							: new Map<string, unknown>();
 						for (const index of model.indexes) {
