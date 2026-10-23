@@ -5905,11 +5905,11 @@ test('Datastore ID inventory classifies native key and payload drift across page
 		pages: 2,
 		counts: {
 			match: 1,
-			'type-mismatch': 2,
+			'type-mismatch': 3,
 			'value-mismatch': 1,
 			'missing-payload-id': 1,
 			'invalid-payload-id': 1,
-			'unsupported-key': 1
+			'unsupported-key': 0
 		}
 	});
 	assert.match(report.inventoryId, /^[0-9a-f-]{36}$/);
@@ -5928,7 +5928,7 @@ test('Datastore ID inventory classifies native key and payload drift across page
 		'value-mismatch',
 		'missing-payload-id',
 		'invalid-payload-id',
-		'unsupported-key'
+		'type-mismatch'
 	]);
 	assert.equal(issues.every((issue) => issue.inventoryId === report.inventoryId), true);
 	assert.deepEqual(issues.map((issue) => issue.issueIndex), [0, 1, 2, 3, 4, 5]);

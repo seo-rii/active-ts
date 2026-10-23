@@ -1261,3 +1261,12 @@ use `allowAggregateScanFallback: true` to validate legacy or externally written
 values. The scan ignores missing/null aggregate values and rejects nonnumeric
 values. A multi-aggregate scan also requires `readAt()` or a Datastore transaction
 to keep all results on one snapshot.
+
+Datastore ID inventory and repair preserve all supported native numeric keys,
+including negative safe integers and both signed-int64 boundaries. Inventory
+payloads represent branded IDs explicitly as `{ type: 'int64', value: '<decimal>' }`;
+physical key paths retain canonical decimal strings. Repair manifests survive a
+JSON round trip without converting these IDs through JavaScript numbers. Applying
+an int64 source, target, or ancestor requires the Datastore client's `int()` method.
+Key-wins repairs keep the branded logical ID in the entity payload; payload-wins
+repairs preserve the distinction between numeric IDs and decimal string names.

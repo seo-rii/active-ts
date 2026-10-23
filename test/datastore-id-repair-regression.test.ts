@@ -189,7 +189,7 @@ test('Datastore ID repair manifests preserve reviewed inventory and derive polic
 
 test('Datastore ID repair planning fails closed on incomplete, ambiguous, and colliding manifests', () => {
 	const duplicateSourceIssues = [numericIssue(), numericIssue(17, '17', 1)];
-	const negativeTargetIssues = [namedIssue('-1', -1, 0)];
+	const zeroTargetIssues = [namedIssue('0', 0, 0)];
 	const reviewedInventoryIdIssues = [numericIssue()];
 	const emptyNamespaceIssue = {
 		...numericIssue(),
@@ -307,16 +307,16 @@ test('Datastore ID repair planning fails closed on incomplete, ambiguous, and co
 		() => createDatastoreIdRepairManifest({
 			report: inventoryReport(
 				{ counts: inventoryCounts({ match: 0, 'type-mismatch': 1 }) },
-				negativeTargetIssues
+				zeroTargetIssues
 			),
-			issues: negativeTargetIssues,
+			issues: zeroTargetIssues,
 			target: REPAIR_TARGET,
 			policy: 'payload-wins',
 			allowKeyMoves: true,
 			descendantPolicy: 'verified-none',
 			excludeFromIndexes: []
 		}),
-		/target key ID must be a positive integer/
+		/cannot be zero/
 	);
 	assert.throws(
 		() => createDatastoreIdRepairManifest({
