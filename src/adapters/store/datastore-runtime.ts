@@ -3340,6 +3340,19 @@ function createDatastoreAdapter(
 									'Datastore aggregate would require multiple backend queries with different snapshots; use allowAggregateScanFallback with readAt(), or run it in a Datastore transaction.'
 								);
 							}
+							let numericField: string | undefined;
+							let includesCount = false;
+							let differentFields = false;
+							for (const spec of sdkSpecs) {
+								if (spec.op === 'count') includesCount = true;
+								else if (numericField === undefined) numericField = spec.field;
+								else if (numericField !== spec.field) differentFields = true;
+							}
+							if (differentFields || (includesCount && numericField !== undefined)) {
+								throw new ActiveTsConfigurationError(
+									'Datastore aggregates combining count and numeric fields or different numeric fields require allowAggregateScanFallback: true and either readAt() or a Datastore transaction to preserve each aggregate input set.'
+								);
+							}
 							if (sdkSpecs.length) {
 							const kind = kindName(model);
 						const queryNamespace = ancestor?.namespace ?? options.namespace;
