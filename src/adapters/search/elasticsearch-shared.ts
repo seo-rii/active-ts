@@ -437,6 +437,9 @@ function elasticsearchSearchHit(hit: any, model: ResolvedModelMeta, adapterKind:
 		: clean;
 	const logicalId = row[model.idField];
 	assertSafeEntityId(logicalId, `Elasticsearch hit ${model.idField}`);
+	if (!model.datastore?.ancestor && idFromElasticsearchHit(hit, model) !== logicalId) {
+		throw new ActiveTsValidationError('Elasticsearch hit _id does not match its logical model id.');
+	}
 	return markSearchDocumentIdentity(
 		projectSearchDocument(model, adapterKind, logicalId, row),
 		documentIdentityFromElasticsearchHit(hit, model)
