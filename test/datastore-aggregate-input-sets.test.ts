@@ -14,7 +14,7 @@ for (const { aggregates, expected } of cases) {
  test(`Datastore preserves sparse input sets for ${aggregates.map(spec => spec.as).join(', ')}`, async () => {
   let nativeCalls = 0; const readOptions: unknown[] = [];
   const client = { KEY: Symbol('key'), key: (value: unknown) => value, get: async () => [undefined], save: async () => {},
-   update: async () => {}, delete: async () => {}, createQuery: () => ({}),
+   update: async () => {}, delete: async () => {}, createQuery: () => ({ limit() { return this; } }),
    runQuery: async (_query: unknown, options: unknown) => { readOptions.push(options); return [[{ id: 1, left: 10 }, { id: 2, right: 20 }, { id: 3 }], { moreResults: 'NO_MORE_RESULTS' }]; },
    createAggregationQuery() { nativeCalls++; throw new Error('native query intersects aggregate inputs'); }, runAggregationQuery: async () => [[]]
   };
@@ -32,7 +32,7 @@ for (const op of ['sum', 'avg'] as const) {
  test(`Datastore ${op} scan ignores missing and null fields and rejects nonnumeric data`, async () => {
   let rows: Array<Record<string, unknown>> = [{ id: 1, left: 10 }, { id: 2 }, { id: 3, left: null }];
   const client = { KEY: Symbol('key'), key: (value: unknown) => value, get: async () => [undefined], save: async () => {},
-   update: async () => {}, delete: async () => {}, createQuery: () => ({}),
+   update: async () => {}, delete: async () => {}, createQuery: () => ({ limit() { return this; } }),
    runQuery: async () => [rows, { moreResults: 'NO_MORE_RESULTS' }],
    createAggregationQuery() { throw new Error('explicit scan must not aggregate natively'); }, runAggregationQuery: async () => [[]]
   };
