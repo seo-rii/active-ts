@@ -427,7 +427,7 @@ test('PostgreSQL untyped sort follows active-ts null and mixed-type ordering', a
 
 	assert.match(
 		calls[0].text,
-		/then 0 when jsonb_typeof\(\(data #> \$1::text\[\]\)\) = 'boolean' then 1 when jsonb_typeof\(\(data #> \$1::text\[\]\)\) = 'number' then 2 when jsonb_typeof\(\(data #> \$1::text\[\]\)\) = 'string' then 3 else 4/
+		/then 0 when jsonb_typeof\(\(data #> \$1::text\[\]\)\) = 'boolean' then 1 when jsonb_typeof\(\(data #> \$1::text\[\]\)\) = 'number' then 2 when jsonb_typeof\(\(data #> \$1::text\[\]\)\) = 'string' then 3 else \('active-ts-invalid-sort:'/
 	);
 	assert.match(calls[0].text, /\(\(data #>> \$1::text\[\]\)\)::boolean/);
 	assert.match(calls[0].text, /jsonb_typeof\(\(data #> \$1::text\[\]\)\) = 'number'/);
