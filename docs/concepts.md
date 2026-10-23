@@ -215,6 +215,13 @@ Relation `preload` fields are translated into `select()` projections for both
 lazy and batched relation loads. active-ts also includes the target id and
 foreign key so relation matching remains stable.
 
+Relation arrays must contain the complete matching result. If a store returns
+`more: true` for a relation query, lazy loading and `include()` throw instead of
+caching an incomplete array. Load the related model through an explicitly
+paginated query when a relation spans multiple pages, and manage its read policy
+and execution budget in the application. Relation loading does not automatically
+start an unbounded scan.
+
 Decorator relation getters are supported:
 
 ```ts doc-test=fragment
