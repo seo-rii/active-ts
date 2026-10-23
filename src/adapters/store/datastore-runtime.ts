@@ -3292,6 +3292,7 @@ function createDatastoreAdapter(
 							}
 							if (
 								where.op === 'isNotNull' ||
+								(where.op === '!=' && where.value === null) ||
 								(where.op === '=' && where.value !== null) ||
 								where.op === '>' ||
 								where.op === '>=' ||
@@ -3299,6 +3300,14 @@ function createDatastoreAdapter(
 								where.op === '<=' ||
 								where.op === 'between'
 							) alreadyExcludesNull = true;
+						}
+						if (!onlyNull && !alreadyExcludesNull) {
+							for (const where of plan.where) {
+								if (where.op !== '!=' && where.op !== 'isNotNull') continue;
+								throw new ActiveTsConfigurationError(
+									`Datastore ${spec.op} with an existing negative filter requires allowAggregateScanFallback: true to exclude null values without a second negative filter.`
+								);
+							}
 						}
 						MAP_SET.call(minMaxQueryOptions, spec.as, { field, onlyNull, alreadyExcludesNull });
 					}
