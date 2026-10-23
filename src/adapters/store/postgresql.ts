@@ -293,13 +293,18 @@ function modelFieldType(model: ResolvedModelMeta, field: string) {
 	return MAP_GET.call(model.fieldTypes, field) as FieldType | undefined;
 }
 
-function typedJsonFieldParam(model: ResolvedModelMeta, field: string, params: any[], numeric = false) {
-	const raw = jsonFieldParam(field, params);
+function typedJsonFieldParam(model: ResolvedModelMeta, field: string, params: any[]) {
 	const type = modelFieldType(model, field);
-	if (numeric || type === 'number') return `(${raw})::double precision`;
-	if (type === 'boolean') return `(${raw})::boolean`;
-	if (type === 'date') return `(${raw})::timestamptz`;
-	return raw;
+	if (type === 'number') return numericAggregateSql(field, params);
+	const path = jsonPathParam(field, params);
+	const json = `(data #> ${path})`;
+	const raw = `(data #>> ${path})`;
+	if (type === 'date') {
+		return `(case when ${json} is null or jsonb_typeof(${json}) = 'null' then null when jsonb_typeof(${json}) = 'string' then ${raw} else 'active-ts-invalid-date-aggregate' end)::timestamptz`;
+	}
+	// The invalid branch depends on the row so PostgreSQL cannot constant-fold
+	// a failing cast even when every stored value has the declared type.
+	return `(case when ${json} is null or jsonb_typeof(${json}) = 'null' then null when jsonb_typeof(${json}) = 'string' then ${raw} else ('active-ts-invalid-string-aggregate:' || ${raw})::double precision::text end)`;
 }
 
 function jsonSortExpressions(model: ResolvedModelMeta, field: string, direction: 'asc' | 'desc', params: any[]) {
