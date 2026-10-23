@@ -1805,6 +1805,11 @@ export class QueryBuilder<TModel extends { data: any }, TData extends Record<str
 				trustedDatastoreEntityKeys: storeTrustsDatastoreEntityKeyRows(store)
 			}
 		);
+		if (raw.more === true) {
+			throw new ActiveTsConfigurationError(
+				'Aggregate fallback requires a complete query result. Use native aggregates or explicitly paginate the query before computing the aggregate.'
+			);
+		}
 		const rows: Array<Record<string, any>> = [];
 		for (let index = 0; index < raw.list.length; index++) {
 			rows[index] = context.validateRead(meta, raw.list[index], { partial: true });
