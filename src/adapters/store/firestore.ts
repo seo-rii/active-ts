@@ -252,6 +252,7 @@ function aggregateFieldAlreadyExcludesNull(plan: AggregatePlan, field: string) {
 		if (where.field !== field) continue;
 		if (
 			where.op === 'isNotNull' ||
+			where.op === '!=' ||
 			(where.op === '=' && where.value !== null) ||
 			(where.op === 'in' && Array.isArray(where.value) && where.value.length > 0 && !arrayHasNull(where.value)) ||
 			where.op === '>' ||
