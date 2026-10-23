@@ -85,7 +85,7 @@ test('MongoDB raw declared indexes reject unsupported directions before duplicat
 			const second = BSON.serialize({ [field]: 1 });
 			const key = Buffer.concat([Buffer.alloc(4), first.subarray(4, -1), second.subarray(4, -1), Buffer.from([0])]);
 			key.writeInt32LE(key.length);
-			const original = BSON.serialize({ v: 2, name: 'ordered_idx', key: { [field]: 1 } });
+			const original = Buffer.from(BSON.serialize({ v: 2, name: 'ordered_idx', key: { [field]: 1 } }));
 			const position = original.indexOf(Buffer.from('\x03key\0')) + 5;
 			raw = Buffer.concat([original.subarray(0, position), key, original.subarray(position + original.readInt32LE(position))]);
 			raw.writeInt32LE(raw.length);
