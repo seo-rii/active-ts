@@ -1041,6 +1041,13 @@ Adapters may implement:
 PostgreSQL and MongoDB can create collections/tables and indexes. Firestore
 reports index intent but does not apply remote index configuration.
 
+MongoDB preserves numeric field-name order in compound sorts and indexes with
+ordered SDK maps. Index discovery requests raw BSON because JavaScript objects
+reorder integer-like keys. Injected clients can return ordered `Map` keys; an
+ordinary object with compound numeric keys is rejected because it cannot prove
+the physical index order.
+
+
 ## Adapter Contract
 
 Adapter authors should run the shared contracts for every adapter kind they

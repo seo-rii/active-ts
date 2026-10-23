@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { runPostgresOutcomeContract } from './postgres-outcome.mjs';
 import { runPostgresConcurrencyContract } from './postgres-concurrency.mjs';
 import { runPostgresSchemaContract } from './postgres-schema.mjs';
+import { runMongoNumericFieldOrder } from './mongodb-numeric-fields.mjs';
 import { runMongoAggregateParity, runFirestoreAggregateParity } from './aggregate-parity.mjs';
 import { runSearchAdapterFuzz } from './search-fuzz.mjs';
 import {
@@ -344,6 +345,7 @@ if (targets.has('mongodb')) {
 		const context = createActiveTs({ stores: { default: adapter } });
 		const meta = context.meta(IntegrationMongoNativeRecord);
 		await runMongoAggregateParity({ adapter, meta });
+		await runMongoNumericFieldOrder({ adapter, meta });
 		try {
 			await adapter.create(meta, 1, { id: 1, handle: 'native-one', score: 11 });
 			const native = await adapter.query(meta, {

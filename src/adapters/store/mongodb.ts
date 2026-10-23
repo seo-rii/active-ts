@@ -49,6 +49,7 @@ import {
 } from '../../core/field-codecs.js';
 import {
 	MAP_GET,
+	MAP_ENTRIES,
 	MAP_HAS,
 	MAP_SET,
 	MAP_SIZE,
@@ -291,6 +292,13 @@ function mongoQueryDocumentsData(list: readonly unknown[], model: ResolvedModelM
 }
 
 function mongoSortSpec(sort: QueryPlan['sort']) {
+	let integerField = false;
+	for (const item of sort) if (mongoIntegerFieldName(item.field)) integerField = true;
+	if (integerField) {
+		const ordered = new Map<string, 1 | -1>();
+		for (const item of sort) MAP_SET.call(ordered, assertSafeMongoField(item.field), item.direction === 'asc' ? 1 : -1);
+		return ordered;
+	}
 	const spec: Record<string, 1 | -1> = {};
 	for (let index = 0; index < sort.length; index++) {
 		const item = sort[index];
@@ -350,6 +358,15 @@ function mongoIndexFields(fields: readonly string[]) {
 }
 
 function mongoIndexKeySpec(fields: readonly string[], directions?: readonly SortDirection[]) {
+	let integerField = false;
+	for (const field of fields) if (mongoIntegerFieldName(field)) integerField = true;
+	if (integerField) {
+		const ordered = new Map<string, 1 | -1>();
+		for (let index = 0; index < fields.length; index++) {
+			MAP_SET.call(ordered, assertSafeMongoField(fields[index]), directions?.[index] === 'desc' ? -1 : 1);
+		}
+		return ordered;
+	}
 	const spec: Record<string, 1 | -1> = {};
 	for (let index = 0; index < fields.length; index++) {
 		defineDataProperty(spec, assertSafeMongoField(fields[index]), directions?.[index] === 'desc' ? -1 : 1, {
@@ -361,15 +378,57 @@ function mongoIndexKeySpec(fields: readonly string[], directions?: readonly Sort
 	return spec;
 }
 
-function mongoExistingIndexes(indexes: readonly unknown[]) {
+function mongoIntegerFieldName(field: string) {
+	const value = Number(field);
+	return Number.isInteger(value) && value >= 0 && value < 0xffff_ffff && String(value) === field;
+}
+
+async function mongoExistingIndexes(indexes: readonly unknown[]) {
 	const result = new Map<string, unknown>();
 	for (let index = 0; index < indexes.length; index++) {
-		const item = indexes[index];
+		const item = Buffer.isBuffer(indexes[index]) ? await mongoRawIndex(indexes[index] as Buffer) : indexes[index];
 		const name = mongoDocumentValue(item, 'name', 'MongoDB index');
 		if (name === undefined) continue;
 		MAP_SET.call(result, mongoOptionalString(name, 'MongoDB index.name'), item);
 	}
 	return result;
+}
+
+async function mongoRawIndex(raw: Buffer) {
+	// Ordinary BSON deserialization loses numeric property order. Decode scalar
+	// metadata normally but retain and inspect the raw ordered index-key document.
+	const { BSON } = await optionalImport('mongodb', 'MongoStoreAdapter schema');
+	const item = BSON.deserialize(raw, { raw: true });
+	const key = mongoDocumentValue(item, 'key', 'MongoDB index');
+	if (!Buffer.isBuffer(key) || key.length < 5 || key.readInt32LE(0) !== key.length || key[key.length - 1] !== 0) {
+		throw new ActiveTsValidationError('MongoDB index.key must be a BSON document.');
+	}
+	const decodedKey = BSON.deserialize(key); // Validate the entire BSON document and UTF-8 before walking numeric entries.
+	const ordered = new Map<string, number>();
+	let position = 4;
+	while (position < key.length - 1) {
+		const type = key[position++];
+		const end = key.indexOf(0, position);
+		if (end < position || end >= key.length - 1) throw new ActiveTsValidationError('MongoDB index.key contains a malformed field.');
+		const field = assertSafeMongoField(key.toString('utf8', position, end));
+		position = end + 1;
+		const bytes = type === 16 ? 4 : type === 1 || type === 18 ? 8 : 0;
+		if (bytes === 0) {
+			// Preserve unrelated text/hashed indexes; their unsupported key types
+			// are rejected only if a declared index actually refers to them.
+			defineDataProperty(item, 'key', decodedKey, { enumerable: true, configurable: true, writable: true });
+			return item;
+		}
+		if (position + bytes > key.length - 1) throw new ActiveTsValidationError('MongoDB index.key contains a malformed direction.');
+		const direction = mongoDocumentValue(decodedKey, field, 'MongoDB index.key');
+		if ((direction !== 1 && direction !== -1) || MAP_HAS.call(ordered, field)) {
+			throw new ActiveTsValidationError(`MongoDB index.key.${field} must be a unique field with direction 1 or -1.`);
+		}
+		MAP_SET.call(ordered, field, direction);
+		position += bytes;
+	}
+	defineDataProperty(item, 'key', ordered, { enumerable: true, configurable: true, writable: true });
+	return item;
 }
 
 function mongoIndexFieldsMatch(existing: readonly string[], declared: readonly string[]) {
@@ -954,9 +1013,9 @@ export async function createMongoStoreAdapter(options: MongoStoreOptions): Promi
 						const collectionExists = existingCollection !== undefined;
 						if (!collectionExists) changes.push({ type: 'create-collection', target: model.name });
 						const existingIndexes = collectionExists
-							? mongoExistingIndexes(
+							? await mongoExistingIndexes(
 								mongoArrayResult(
-									await mongoMethod(collection(model), 'indexes', 'MongoDB collection.indexes')(),
+									await mongoMethod(collection(model), 'indexes', 'MongoDB collection.indexes')({ raw: true }),
 									'MongoDB collection.indexes'
 								)
 							)
@@ -1088,6 +1147,16 @@ function mongoIndexMetadataSupported(property: string) {
 }
 
 function mongoIndexKeyFields(key: unknown) {
+	if (key instanceof Map) {
+		const fields: string[] = [];
+		const directions: SortDirection[] = [];
+		for (const [field, direction] of MAP_ENTRIES.call(key)) {
+			if (direction !== 1 && direction !== -1) throw new ActiveTsValidationError('MongoDB index.key directions must be 1 or -1.');
+			fields.push(assertSafeMongoField(field));
+			directions.push(direction === -1 ? 'desc' : 'asc');
+		}
+		return { fields, directions };
+	}
 	if (!key || typeof key !== 'object' || Array.isArray(key)) {
 		throw new ActiveTsValidationError('MongoDB index.key must be a plain object.');
 	}
@@ -1113,6 +1182,13 @@ function mongoIndexKeyFields(key: unknown) {
 		}
 		fields.push(assertSafeMongoField(property));
 		directions[directions.length] = descriptor.value === -1 ? 'desc' : 'asc';
+	}
+	if (fields.length > 1) {
+		for (const field of fields) {
+			if (mongoIntegerFieldName(field)) {
+				throw new ActiveTsValidationError('MongoDB compound numeric index keys require raw BSON or an ordered Map to verify field order.');
+			}
+		}
 	}
 	return { fields, directions };
 }
