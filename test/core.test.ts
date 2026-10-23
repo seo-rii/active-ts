@@ -3370,8 +3370,8 @@ test('postgres min and max preserve nonnumeric field types', async () => {
 	});
 
 	assert.deepEqual(result, { earliest: '2026-05-01T00:00:00.000Z', lastHandle: 'seo' });
-	assert.match(calls[0].text, /min\(\(case .*jsonb_typeof\(\(data #> \$1::text\[\]\)\)\) = 'string'.*end\)::timestamptz\) as earliest/);
-	assert.match(calls[0].text, /max\(\(case .*jsonb_typeof\(\(data #> \$2::text\[\]\)\)\) = 'string'.*end\)\) as "lastHandle"/);
+	assert.match(calls[0].text, /min\(\(case .*jsonb_typeof\(\(data #> \$1::text\[\]\)\) = 'string'.*end\)::timestamptz\) as earliest/);
+	assert.match(calls[0].text, /max\(\(case .*jsonb_typeof\(\(data #> \$2::text\[\]\)\) = 'string'.*end\)\) as "lastHandle"/);
 	assert.deepEqual(calls[0].values, [['createdAt'], ['handle']]);
 });
 
