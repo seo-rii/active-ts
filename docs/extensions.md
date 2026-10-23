@@ -617,6 +617,12 @@ Models with a numeric `version` field use optimistic locking in `save()`. The
 current stored version must match the instance version; successful saves
 increment the field.
 
+Once a model is loaded or created with a numeric version, active-ts retains
+that version independently of mutable `data`. Removing it, changing its type,
+or assigning another version makes `save()` and instance `delete()` reject
+before writing. Reload the model to obtain a newer version; successful saves
+advance the retained version automatically.
+
 ```ts doc-test=fragment
 const record = await Document.find(1).load();
 record.data.title = 'Updated';
