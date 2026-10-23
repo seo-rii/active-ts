@@ -244,7 +244,11 @@ function assertPostgresColumnShape(
 }
 
 async function existingIndexDefinitions(pool: any, options: PostgresStoreOptions, model: ResolvedModelMeta) {
-	const res = await pool.query('select indexname, indexdef from pg_indexes where schemaname = coalesce($1, current_schema()) and tablename = $2', [
+	const res = await pool.query(`select p.indexname, p.indexdef, i.indisvalid, i.indisready from pg_indexes p
+		join pg_namespace n on n.nspname = p.schemaname
+		join pg_class c on c.relnamespace = n.oid and c.relname = p.indexname
+		join pg_index i on i.indexrelid = c.oid
+		where p.schemaname = coalesce($1, current_schema()) and p.tablename = $2`, [
 		options.schema ?? null,
 		model.name
 	]);
@@ -252,6 +256,16 @@ async function existingIndexDefinitions(pool: any, options: PostgresStoreOptions
 	for (const row of postgresRows(res, 'PostgreSQL index lookup')) {
 		const indexName = postgresRowValue(row, 'indexname', 'PostgreSQL index row');
 		if (indexName === undefined) continue;
+		const name = postgresOptionalString(indexName, 'PostgreSQL index row.indexname');
+		for (const index of model.indexes) {
+			if (name !== indexIdentifier(model, index.name) && name !== indexIdentifier(model, index.name, true)) continue;
+			if (postgresRowValue(row, 'indisvalid', 'PostgreSQL index row') !== true ||
+				postgresRowValue(row, 'indisready', 'PostgreSQL index row') !== true) {
+				throw new ActiveTsConfigurationError(
+					`PostgreSQL index "${name}" on "${model.name}" is not valid and ready. Repair or rebuild the index before applying the schema.`
+				);
+			}
+		}
 		const indexDef = postgresRowValue(row, 'indexdef', 'PostgreSQL index row');
 		MAP_SET.call(
 			indexes,

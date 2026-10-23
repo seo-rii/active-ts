@@ -860,7 +860,7 @@ test('PostgreSQL schema planning rejects same-name index drift', async () => {
 	let indexRows: unknown[] = [
 		{
 			indexname: indexName,
-			indexdef: `CREATE UNIQUE INDEX ${indexName} ON public.postgres_regression_record USING btree (((data #> ARRAY['handle'::text])))`
+			indisvalid: true, indisready: true, indexdef: `CREATE UNIQUE INDEX ${indexName} ON public.postgres_regression_record USING btree (((data #> ARRAY['handle'::text])))`
 		}
 	];
 	const adapter = await createPostgresStoreAdapter({
@@ -880,7 +880,7 @@ test('PostgreSQL schema planning rejects same-name index drift', async () => {
 	indexRows = [
 		{
 			indexname: indexName,
-			indexdef: `CREATE UNIQUE INDEX ${indexName} ON public.postgres_regression_record USING btree (((data #>> ARRAY['other'::text])))`
+			indisvalid: true, indisready: true, indexdef: `CREATE UNIQUE INDEX ${indexName} ON public.postgres_regression_record USING btree (((data #>> ARRAY['other'::text])))`
 		}
 	];
 	await assert.rejects(
@@ -891,7 +891,7 @@ test('PostgreSQL schema planning rejects same-name index drift', async () => {
 	indexRows = [
 		{
 			indexname: indexName,
-			indexdef: `CREATE INDEX ${indexName} ON public.postgres_regression_record USING btree (((data #>> ARRAY['handle'::text])))`
+			indisvalid: true, indisready: true, indexdef: `CREATE INDEX ${indexName} ON public.postgres_regression_record USING btree (((data #>> ARRAY['handle'::text])))`
 		}
 	];
 	await assert.rejects(
@@ -902,7 +902,7 @@ test('PostgreSQL schema planning rejects same-name index drift', async () => {
 	indexRows = [
 		{
 			indexname: indexName,
-			indexdef: `CREATE UNIQUE INDEX ${indexName} ON public.postgres_regression_record USING hash (((data #> ARRAY['handle'::text])))`
+			indisvalid: true, indisready: true, indexdef: `CREATE UNIQUE INDEX ${indexName} ON public.postgres_regression_record USING hash (((data #> ARRAY['handle'::text])))`
 		}
 	];
 	await assert.rejects(
@@ -913,7 +913,7 @@ test('PostgreSQL schema planning rejects same-name index drift', async () => {
 	indexRows = [
 		{
 			indexname: indexName,
-			indexdef: `CREATE UNIQUE INDEX ${indexName} ON public.postgres_regression_record USING btree (((data #> ARRAY['handle'::text]))) WHERE ((data ? 'handle'::text))`
+			indisvalid: true, indisready: true, indexdef: `CREATE UNIQUE INDEX ${indexName} ON public.postgres_regression_record USING btree (((data #> ARRAY['handle'::text]))) WHERE ((data ? 'handle'::text))`
 		}
 	];
 	await assert.rejects(
@@ -924,7 +924,7 @@ test('PostgreSQL schema planning rejects same-name index drift', async () => {
 	indexRows = [
 		{
 			indexname: indexName,
-			indexdef: `CREATE UNIQUE INDEX ${indexName} ON public.postgres_regression_record USING btree (((data #>> ARRAY['handle'::text])), ((data #>> ARRAY['other'::text])))`
+			indisvalid: true, indisready: true, indexdef: `CREATE UNIQUE INDEX ${indexName} ON public.postgres_regression_record USING btree (((data #>> ARRAY['handle'::text])), ((data #>> ARRAY['other'::text])))`
 		}
 	];
 	await assert.rejects(
@@ -948,7 +948,7 @@ test('PostgreSQL schema planning rejects index direction drift', async () => {
 	let indexRows: unknown[] = [
 		{
 			indexname: indexName,
-			indexdef: `CREATE INDEX ${indexName} ON public.postgres_regression_record USING btree (((data #>> ARRAY['handle'::text])), ((data #>> ARRAY['profile'::text, 'name'::text])) DESC)`
+			indisvalid: true, indisready: true, indexdef: `CREATE INDEX ${indexName} ON public.postgres_regression_record USING btree (((data #>> ARRAY['handle'::text])), ((data #>> ARRAY['profile'::text, 'name'::text])) DESC)`
 		}
 	];
 	const adapter = await createPostgresStoreAdapter({
@@ -968,7 +968,7 @@ test('PostgreSQL schema planning rejects index direction drift', async () => {
 	indexRows = [
 		{
 			indexname: indexName,
-			indexdef: `CREATE INDEX ${indexName} ON public.postgres_regression_record USING btree (((data #>> ARRAY['handle'::text])) DESC, ((data #>> ARRAY['profile'::text, 'name'::text])) DESC)`
+			indisvalid: true, indisready: true, indexdef: `CREATE INDEX ${indexName} ON public.postgres_regression_record USING btree (((data #>> ARRAY['handle'::text])) DESC, ((data #>> ARRAY['profile'::text, 'name'::text])) DESC)`
 		}
 	];
 	await assert.rejects(
@@ -979,7 +979,7 @@ test('PostgreSQL schema planning rejects index direction drift', async () => {
 	indexRows = [
 		{
 			indexname: indexName,
-			indexdef: `CREATE INDEX ${indexName} ON public.postgres_regression_record USING btree (((data #>> ARRAY['handle'::text])), ((data #>> ARRAY['profile'::text, 'name'::text])))`
+			indisvalid: true, indisready: true, indexdef: `CREATE INDEX ${indexName} ON public.postgres_regression_record USING btree (((data #>> ARRAY['handle'::text])), ((data #>> ARRAY['profile'::text, 'name'::text])))`
 		}
 	];
 	await assert.rejects(
@@ -1001,7 +1001,7 @@ test('PostgreSQL schema index drift preserves JSON literal case and whitespace',
 						rows: [
 							{
 								indexname: indexName,
-								indexdef: `CREATE INDEX ${indexName} ON public.postgres_regression_record USING btree (((data #>> ARRAY['handle'::text])))`
+								indisvalid: true, indisready: true, indexdef: `CREATE INDEX ${indexName} ON public.postgres_regression_record USING btree (((data #>> ARRAY['handle'::text])))`
 							}
 						]
 					};
@@ -1035,7 +1035,7 @@ test('PostgreSQL schema planning does not infer uniqueness from index names', as
 						rows: [
 							{
 								indexname: indexName,
-								indexdef: `CREATE INDEX ${indexName} ON public.postgres_regression_record USING btree (((data #>> ARRAY['handle'::text])))`
+								indisvalid: true, indisready: true, indexdef: `CREATE INDEX ${indexName} ON public.postgres_regression_record USING btree (((data #>> ARRAY['handle'::text])))`
 							}
 						]
 					};
@@ -3880,7 +3880,7 @@ test('PostgreSQL schema apply retains verified legacy physical index names', asy
 		if (sql.includes('information_schema.columns')) return { rows: postgresActiveTableColumns };
 		if (sql.includes('from pg_index i')) return { rows: postgresActivePrimaryKey };
 		if (sql.includes('pg_indexes')) return { rows: [{ indexname: name,
-			indexdef: `CREATE UNIQUE INDEX ${name} ON public.${meta.name} USING btree (((data #> ARRAY['handle'::text])))` }] };
+			indisvalid: true, indisready: true, indexdef: `CREATE UNIQUE INDEX ${name} ON public.${meta.name} USING btree (((data #> ARRAY['handle'::text])))` }] };
 		return { rows: [] };
 	} } });
 	const plan = await adapter.schema!.apply([{ ...meta, indexes: [{ name: 'handle_idx', fields: ['handle'], unique: true }] }], { mode: 'safe' });
@@ -3901,7 +3901,7 @@ for (const keys of [
 			if (sql.includes('information_schema.columns')) return { rows: postgresActiveTableColumns };
 			if (sql.includes('from pg_index i')) return { rows: postgresActivePrimaryKey };
 			if (sql.includes('pg_indexes')) return { rows: [{ indexname: name,
-				indexdef: `CREATE UNIQUE INDEX ${name} ON public.${meta.name} USING btree (${keys})` }] };
+				indisvalid: true, indisready: true, indexdef: `CREATE UNIQUE INDEX ${name} ON public.${meta.name} USING btree (${keys})` }] };
 			return { rows: [] };
 		} } });
 		await assert.rejects(() => adapter.schema!.plan([{ ...meta, indexes: [{ name: 'handle_idx', fields: ['handle'], unique: true }] }]), /does not match/);
