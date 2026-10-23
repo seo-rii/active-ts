@@ -200,7 +200,8 @@ export type DatastoreIdInventoryPayload =
 	| { readonly type: 'missing' }
 	| { readonly type: 'invalid'; readonly actualType: string }
 	| { readonly type: 'string'; readonly value: string }
-	| { readonly type: 'number'; readonly value: number };
+	| { readonly type: 'number'; readonly value: number }
+	| { readonly type: 'int64'; readonly value: string };
 export type DatastoreIdInventoryIssue = {
 	readonly inventoryId: string;
 	readonly issueIndex: number;
@@ -3292,6 +3293,7 @@ function createDatastoreAdapter(
 							}
 							if (
 								where.op === 'isNotNull' ||
+								(where.op === '!=' && where.value === null) ||
 								(where.op === '=' && where.value !== null) ||
 								where.op === '>' ||
 								where.op === '>=' ||
@@ -3299,6 +3301,14 @@ function createDatastoreAdapter(
 								where.op === '<=' ||
 								where.op === 'between'
 							) alreadyExcludesNull = true;
+						}
+						if (!onlyNull && !alreadyExcludesNull) {
+							for (const where of plan.where) {
+								if (where.op !== '!=' && where.op !== 'isNotNull') continue;
+								throw new ActiveTsConfigurationError(
+									`Datastore ${spec.op} with an existing negative filter requires allowAggregateScanFallback: true to exclude null values without a second negative filter.`
+								);
+							}
 						}
 						MAP_SET.call(minMaxQueryOptions, spec.as, { field, onlyNull, alreadyExcludesNull });
 					}
@@ -3329,6 +3339,19 @@ function createDatastoreAdapter(
 							if (nativeAggregateRequests > 1) {
 								throw new ActiveTsConfigurationError(
 									'Datastore aggregate would require multiple backend queries with different snapshots; use allowAggregateScanFallback with readAt(), or run it in a Datastore transaction.'
+								);
+							}
+							let numericField: string | undefined;
+							let includesCount = false;
+							let differentFields = false;
+							for (const spec of sdkSpecs) {
+								if (spec.op === 'count') includesCount = true;
+								else if (numericField === undefined) numericField = spec.field;
+								else if (numericField !== spec.field) differentFields = true;
+							}
+							if (differentFields || (includesCount && numericField !== undefined)) {
+								throw new ActiveTsConfigurationError(
+									'Datastore aggregates combining count and numeric fields or different numeric fields require allowAggregateScanFallback: true and either readAt() or a Datastore transaction to preserve each aggregate input set.'
 								);
 							}
 							if (sdkSpecs.length) {
@@ -4231,8 +4254,6 @@ type DatastoreIdInventoryClassificationResult =
 			classification: Exclude<DatastoreIdInventoryClassification, 'match'>;
 			reason: string;
 	  };
-const DATASTORE_MAX_NUMERIC_ID = 9223372036854775807n;
-const ACTIVE_TS_MAX_NUMERIC_ID = BigInt(Number.MAX_SAFE_INTEGER);
 
 function normalizeDatastoreIdInventoryOptions(options: unknown) {
 	if (!options || typeof options !== 'object' || Array.isArray(options)) {
@@ -4344,30 +4365,11 @@ function datastoreIdInventoryKey(
 			}
 			part = Object.freeze({ kind: rawKind, storage: 'name', value: rawName });
 		} else if (rawId !== undefined) {
-			let value: string;
-			if (typeof rawId === 'number') {
-				if (!Number.isSafeInteger(rawId) || rawId <= 0) {
-					throw new ActiveTsValidationError(
-						`${partContext}.id must be a positive safe integer when represented as a number.`
-					);
-				}
-				value = String(rawId);
-			} else if (typeof rawId === 'string') {
-				if (!/^[1-9]\d*$/.test(rawId) || rawId.length > 19) {
-					throw new ActiveTsValidationError(`${partContext}.id must be a canonical positive Datastore integer string.`);
-				}
-				const integer = BigInt(rawId);
-				if (integer > DATASTORE_MAX_NUMERIC_ID) {
-					throw new ActiveTsValidationError(`${partContext}.id exceeds the Datastore numeric ID range.`);
-				}
-				if (integer > ACTIVE_TS_MAX_NUMERIC_ID) {
-					activeTsCompatible = false;
-					unsupportedReason ??= `${partContext}.id exceeds the active-ts safe integer range.`;
-				}
-				value = rawId;
-			} else {
+			if (typeof rawId !== 'number' && typeof rawId !== 'string') {
 				throw new ActiveTsValidationError(`${partContext}.id must be a number or numeric string.`);
 			}
+			const id = datastoreEntityIdFromNativeNumeric(rawId, `${partContext}.id`);
+			const value = isDatastoreInt64Id(id) ? datastoreInt64IdValue(id) : String(id);
 			part = Object.freeze({ kind: rawKind, storage: 'id', value });
 		} else {
 			throw new ActiveTsValidationError(`${partContext} must contain a complete name or id.`);
@@ -4447,6 +4449,7 @@ function datastoreIdInventoryPayload(
 	} catch {
 		return Object.freeze({ type: 'invalid', actualType: typeof value });
 	}
+	if (isDatastoreInt64Id(value)) return Object.freeze({ type: 'int64', value: datastoreInt64IdValue(value) });
 	return Object.freeze({ type: typeof value, value }) as DatastoreIdInventoryPayload;
 }
 
@@ -4470,7 +4473,10 @@ function classifyDatastoreIdInventory(
 			reason: `Payload field "${idField}" is not a valid string or safe-integer entity ID.`
 		};
 	}
-	const expectedType = parsedKey.leaf.storage === 'id' ? 'number' : 'string';
+	const expectedId = parsedKey.leaf.storage === 'id'
+		? datastoreEntityIdFromNativeNumeric(parsedKey.leaf.value, 'Datastore inventory key ID')
+		: parsedKey.leaf.value;
+	const expectedType = isDatastoreInt64Id(expectedId) ? 'int64' : typeof expectedId;
 	const payloadText = String(payload.value);
 	if (payloadText !== parsedKey.leaf.value) {
 		return {

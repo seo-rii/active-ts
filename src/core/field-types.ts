@@ -12,7 +12,7 @@ import {
 	whereShapeToPlan
 } from './query-utils.js';
 import { snapshotArrayInput } from './array-input.js';
-import { dateIsoString, dateTime } from './date-intrinsics.js';
+import { dateIsoString, dateTime, isPortableDate } from './date-intrinsics.js';
 import { MAP_ENTRIES, MAP_GET, SET_ADD, SET_HAS } from './collection-intrinsics.js';
 import type { AggregatePlan, AggregateResult, AggregateSpec, FieldType, QueryPlan, ResolvedModelMeta, WhereShape } from './types.js';
 
@@ -366,6 +366,9 @@ function normalizeDateString(value: string, context: string) {
 function assertValidDate(value: Date, context: string) {
 	if (!Number.isFinite(dateTime(value))) {
 		throw new ActiveTsValidationError(`${context} must be a valid date.`);
+	}
+	if (!isPortableDate(value)) {
+		throw new ActiveTsValidationError(`${context} requires UTC years 0000 through 9999.`);
 	}
 	if (Object.getOwnPropertySymbols(value).length) {
 		throw new ActiveTsValidationError(`${context} Date value cannot contain symbol fields.`);

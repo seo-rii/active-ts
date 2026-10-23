@@ -4862,7 +4862,8 @@ test('Google manual schema plans ignore patched Array transforms', async () => {
 		Object.defineProperty(Array.prototype, 'flatMap', { configurable: true, value: arrayFlatMap });
 	}
 	assert.deepEqual(firestorePlan?.changes, [
-		{ type: 'create-index', target: 'google_regression_record', name: 'idx_handle_score', fields: ['handle', 'score'], unique: undefined }
+		{ type: 'create-index', target: 'google_regression_record', name: 'idx_handle_score', fields: ['handle', 'score'], unique: undefined },
+		{ type: 'create-index', target: 'google_regression_record', name: 'idx_handle_score_stable_id', fields: ['handle', 'score', 'id'], directions: ['asc', 'asc', 'asc'], unique: undefined }
 	]);
 	assert.deepEqual(datastorePlan?.changes, [
 		{
@@ -4887,7 +4888,8 @@ test('Google manual schema plans ignore patched Array transforms', async () => {
 			fields: ['handle', 'score'],
 			directions: ['asc', 'desc'],
 			unique: undefined
-		}
+		},
+		{ type: 'create-index', target: 'google_regression_record', name: 'idx_handle_score_desc_stable_id', fields: ['handle', 'score', 'id'], directions: ['asc', 'desc', 'asc'], unique: undefined }
 	]);
 	assert.deepEqual((await datastore.schema!.plan([directionalMeta])).changes, [
 		{
@@ -5903,11 +5905,11 @@ test('Datastore ID inventory classifies native key and payload drift across page
 		pages: 2,
 		counts: {
 			match: 1,
-			'type-mismatch': 2,
+			'type-mismatch': 3,
 			'value-mismatch': 1,
 			'missing-payload-id': 1,
 			'invalid-payload-id': 1,
-			'unsupported-key': 1
+			'unsupported-key': 0
 		}
 	});
 	assert.match(report.inventoryId, /^[0-9a-f-]{36}$/);
@@ -5926,7 +5928,7 @@ test('Datastore ID inventory classifies native key and payload drift across page
 		'value-mismatch',
 		'missing-payload-id',
 		'invalid-payload-id',
-		'unsupported-key'
+		'type-mismatch'
 	]);
 	assert.equal(issues.every((issue) => issue.inventoryId === report.inventoryId), true);
 	assert.deepEqual(issues.map((issue) => issue.issueIndex), [0, 1, 2, 3, 4, 5]);
@@ -13676,7 +13678,7 @@ test('Datastore aggregate rejects SDK and min max combinations that would mix sn
 	assert.deepEqual(calls, []);
 });
 
-test('Datastore native aggregates combine different fields in one backend request', async () => {
+test('Datastore native aggregates reject different input fields before a backend request', async () => {
 	const aggregateGroups: string[][] = [];
 	const aggregateMeta: ResolvedModelMeta<any> = {
 		...meta,
@@ -13720,8 +13722,8 @@ test('Datastore native aggregates combine different fields in one backend reques
 		})
 	});
 
-	assert.deepEqual(
-		await datastore.aggregate!(aggregateMeta, {
+	await assert.rejects(
+		() => datastore.aggregate!(aggregateMeta, {
 			where: [],
 			or: [],
 			aggregates: [
@@ -13731,14 +13733,9 @@ test('Datastore native aggregates combine different fields in one backend reques
 				{ op: 'sum', field: 'right', as: 'rightTotal' }
 			]
 		}),
-		{ count: 2, leftTotal: 10, leftAverage: 10, rightTotal: 20 }
+		/preserve each aggregate input set/
 	);
-	assert.deepEqual(aggregateGroups, [[
-		'count:-:count',
-		'sum:left:leftTotal',
-		'avg:left:leftAverage',
-		'sum:right:rightTotal'
-	]]);
+	assert.deepEqual(aggregateGroups, []);
 });
 
 test('Datastore native aggregates keep compatible specs in one backend request', async () => {

@@ -2,7 +2,7 @@ import type { EntityId, QueryPlan, WhereShape } from './types.js';
 import { assertSafeDataKeys, assertSafeEntityId, assertSafeFieldPath, assertSafeLimit, defineDataProperty } from './safe-keys.js';
 import { ActiveTsConfigurationError, ActiveTsValidationError } from './errors.js';
 import { snapshotArrayInput } from './array-input.js';
-import { dateIsoString, dateTime } from './date-intrinsics.js';
+import { dateIsoString, dateTime, isPortableDate } from './date-intrinsics.js';
 import { datastoreInt64Id, datastoreInt64IdValue, isDatastoreInt64Id } from './datastore-int64-id.js';
 import { SET_ADD, SET_HAS, WEAKSET_ADD, WEAKSET_HAS } from './collection-intrinsics.js';
 import {
@@ -788,6 +788,9 @@ export function portableScalarKey(value: unknown, context: string) {
 function assertPlainDateOperand(value: Date, context: string) {
 	if (!Number.isFinite(dateTime(value))) {
 		throw new ActiveTsValidationError(`${context} requires valid Date values.`);
+	}
+	if (!isPortableDate(value)) {
+		throw new ActiveTsValidationError(`${context} requires UTC years 0000 through 9999.`);
 	}
 	if (OBJECT_GET_OWN_PROPERTY_SYMBOLS(value).length) {
 		throw new ActiveTsValidationError(`${context} Date value cannot contain symbol fields.`);

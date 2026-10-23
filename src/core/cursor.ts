@@ -1,7 +1,7 @@
 import { ActiveTsConfigurationError } from './errors.js';
 import { valueFor } from './query-utils.js';
 import { assertDenseArrayItems, assertSafeCursor, assertSafeFieldPath, defineDataProperty } from './safe-keys.js';
-import { dateIsoString, dateTime } from './date-intrinsics.js';
+import { dateIsoString, dateTime, isPortableDate } from './date-intrinsics.js';
 import { JSON_PARSE, JSON_STRINGIFY } from './json-intrinsics.js';
 import type { QueryPlan, SortDirection } from './types.js';
 
@@ -94,6 +94,9 @@ function comparable(value: unknown): Comparable {
 function cursorDateComparable(value: Date) {
 	if (!Number.isFinite(dateTime(value))) {
 		throw new ActiveTsConfigurationError('Sort and cursor Date values must be valid.');
+	}
+	if (!isPortableDate(value)) {
+		throw new ActiveTsConfigurationError('Sort and cursor Date values require UTC years 0000 through 9999.');
 	}
 	if (Object.getOwnPropertySymbols(value).length) {
 		throw new ActiveTsConfigurationError('Sort and cursor Date values cannot contain symbol fields.');

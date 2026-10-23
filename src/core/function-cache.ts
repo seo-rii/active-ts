@@ -158,7 +158,7 @@ export class ActiveFunctionCache<TInput, TValue> {
 		if (this.options.singleFlight !== false) {
 			const flightKey = this.inFlightKey(key, getOptions, epoch, flightScope);
 			const active = MAP_GET.call(this.inFlight, flightKey) as Promise<TValue> | undefined;
-			if (active) return await active;
+			if (active) return cloneFunctionCacheValue(await active);
 			const pending = this.getAfterMemoryMiss(input, key, getOptions, epoch, bypassCache);
 			MAP_SET.call(this.inFlight, flightKey, pending);
 			try {

@@ -185,9 +185,6 @@ export async function createRedisValkeyCacheAdapter(options: RedisValkeyOptions 
 			entries = normalizeCacheEntries(entries, 'redis-valkey cache entries');
 			writeOptions = normalizeCacheWriteOptions(writeOptions, 'redis-valkey cache write options');
 			if (!entries.length) return;
-			for (const [, value] of entries) {
-				assertCacheableValue(value);
-			}
 			const ttl = assertSafeTtl(writeOptions.ttl, 'redis-valkey cache ttl');
 			if (client.eval) {
 				const encoded: Array<string | Buffer> = [];
@@ -340,7 +337,8 @@ function normalizeCacheEntries(entries: unknown, context: string): Array<[string
 			throw new ActiveTsValidationError(`${context} contains duplicate key "${key}".`);
 		}
 		SET_ADD.call(keys, key);
-		safeEntries[index] = [key, tuple[1]];
+		assertCacheableValue(tuple[1]);
+		safeEntries[index] = [key, structuredClone(tuple[1])];
 	}
 	return safeEntries;
 }

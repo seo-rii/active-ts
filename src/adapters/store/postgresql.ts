@@ -244,20 +244,41 @@ function assertPostgresColumnShape(
 }
 
 async function existingIndexDefinitions(pool: any, options: PostgresStoreOptions, model: ResolvedModelMeta) {
-	const res = await pool.query('select indexname, indexdef from pg_indexes where schemaname = coalesce($1, current_schema()) and tablename = $2', [
+	const res = await pool.query(`select p.indexname, p.indexdef, i.indisvalid, i.indisready from pg_indexes p
+		join pg_namespace n on n.nspname = p.schemaname
+		join pg_class c on c.relnamespace = n.oid and c.relname = p.indexname
+		join pg_index i on i.indexrelid = c.oid
+		where p.schemaname = coalesce($1, current_schema()) and p.tablename = $2`, [
 		options.schema ?? null,
 		model.name
 	]);
 	const indexes = new Map<string, string | undefined>();
+	const health = new Map<string, boolean>();
 	for (const row of postgresRows(res, 'PostgreSQL index lookup')) {
 		const indexName = postgresRowValue(row, 'indexname', 'PostgreSQL index row');
 		if (indexName === undefined) continue;
+		const name = postgresOptionalString(indexName, 'PostgreSQL index row.indexname');
+		for (const index of model.indexes) {
+			if (name !== indexIdentifier(model, index.name) && name !== indexIdentifier(model, index.name, true)) continue;
+			MAP_SET.call(health, name,
+				postgresRowValue(row, 'indisvalid', 'PostgreSQL index row') === true &&
+				postgresRowValue(row, 'indisready', 'PostgreSQL index row') === true);
+		}
 		const indexDef = postgresRowValue(row, 'indexdef', 'PostgreSQL index row');
 		MAP_SET.call(
 			indexes,
 			postgresOptionalString(indexName, 'PostgreSQL index row.indexname'),
 			indexDef === undefined ? undefined : postgresOptionalString(indexDef, 'PostgreSQL index row.indexdef')
 		);
+	}
+	for (const index of model.indexes) {
+		const physical = indexIdentifier(model, index.name);
+		const selected = MAP_HAS.call(indexes, physical) ? physical : indexIdentifier(model, index.name, true);
+		if (MAP_HAS.call(indexes, selected) && MAP_GET.call(health, selected) !== true) {
+			throw new ActiveTsConfigurationError(
+				`PostgreSQL index "${selected}" on "${model.name}" is not valid and ready. Repair or rebuild the index before applying the schema.`
+			);
+		}
 	}
 	return indexes;
 }
@@ -293,13 +314,18 @@ function modelFieldType(model: ResolvedModelMeta, field: string) {
 	return MAP_GET.call(model.fieldTypes, field) as FieldType | undefined;
 }
 
-function typedJsonFieldParam(model: ResolvedModelMeta, field: string, params: any[], numeric = false) {
-	const raw = jsonFieldParam(field, params);
+function typedJsonFieldParam(model: ResolvedModelMeta, field: string, params: any[]) {
 	const type = modelFieldType(model, field);
-	if (numeric || type === 'number') return `(${raw})::double precision`;
-	if (type === 'boolean') return `(${raw})::boolean`;
-	if (type === 'date') return `(${raw})::timestamptz`;
-	return raw;
+	if (type === 'number') return numericAggregateSql(field, params);
+	const path = jsonPathParam(field, params);
+	const json = `(data #> ${path})`;
+	const raw = `(data #>> ${path})`;
+	if (type === 'date') {
+		return `(case when ${json} is null or jsonb_typeof(${json}) = 'null' then null when jsonb_typeof(${json}) = 'string' then ${raw} else 'active-ts-invalid-date-aggregate' end)::timestamptz`;
+	}
+	// The invalid branch depends on the row so PostgreSQL cannot constant-fold
+	// a failing cast even when every stored value has the declared type.
+	return `(case when ${json} is null or jsonb_typeof(${json}) = 'null' then null when jsonb_typeof(${json}) = 'string' then ${raw} else ('active-ts-invalid-string-aggregate:' || ${raw})::double precision::text end)`;
 }
 
 // C collation compares Unicode code points, while the portable comparator uses
@@ -329,7 +355,7 @@ function jsonSortExpressions(model: ResolvedModelMeta, field: string, direction:
 		];
 	}
 	return [
-		`(case when ${json} is null or jsonb_typeof(${json}) = 'null' then 0 when jsonb_typeof(${json}) = 'boolean' then 1 when jsonb_typeof(${json}) = 'number' then 2 when jsonb_typeof(${json}) = 'string' then 3 else 4 end) ${direction}`,
+		`(case when ${json} is null or jsonb_typeof(${json}) = 'null' then 0 when jsonb_typeof(${json}) = 'boolean' then 1 when jsonb_typeof(${json}) = 'number' then 2 when jsonb_typeof(${json}) = 'string' then 3 else ('active-ts-invalid-sort:' || ${json}::text)::integer end) ${direction}`,
 		`(case when jsonb_typeof(${json}) = 'boolean' then (${text})::boolean end) ${direction}`,
 		`(case when jsonb_typeof(${json}) = 'number' then (${text})::double precision end) ${direction}`,
 		`(case when jsonb_typeof(${json}) = 'string' then ${postgresStringOrderKey(text)} end) ${direction}`,
@@ -511,6 +537,9 @@ function postgresIndexDefinitionKeys(definition: string): string[] | undefined {
 }
 
 function hasUnsupportedPostgresIndexDefinitionOptions(definition: string, directions: readonly SortDirection[] | undefined) {
+	// Catalog definitions quote JSON keys and identifiers; their contents are not
+	// index options. Keep complete key matching separate from this clause check.
+	definition = stripPostgresSqlLiteralsAndComments(definition, false);
 	if (!/\busing\s+btree\b/i.test(definition)) return true;
 	if (/\bwhere\b/i.test(definition)) return true;
 	if (/\bcollate\b/i.test(definition)) return true;
@@ -1509,7 +1538,7 @@ async function createPostgresStoreAdapterInternal(
 			const clean = clonePortableDataObject(data, `${model.name} stored data`);
 			assertStoreDataMatchesId(model, id, clean);
 			try {
-				await pool.query(`insert into ${tableName(options, model)} (id, data) values ($1, $2)`, [
+				await pool.query(`insert into ${tableName(options, model)} (id, data, created_at, updated_at) values ($1, $2, now(), now())`, [
 					entityIdKey(id),
 					clean
 				]);

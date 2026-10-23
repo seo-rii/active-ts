@@ -3278,7 +3278,7 @@ test('postgres schema apply escapes identifiers and rejects reserved index json 
 					return {
 						rows: [
 							{
-								indexname: 'account_handle',
+								indexname: 'account_handle', indisvalid: true, indisready: true,
 								indexdef: "CREATE UNIQUE INDEX account_handle ON public.account USING btree (((data #> ARRAY['handle'::text])))"
 							}
 						],
@@ -3334,7 +3334,7 @@ test('postgres aggregate uses native SQL aggregates and parameters', async () =>
 	assert.match(calls[0].text, /coalesce\(sum\(\(case when data #> \$1::text\[\] is null/);
 	assert.match(calls[0].text, /jsonb_typeof\(data #> \$1::text\[\]\) = 'number'/);
 	assert.match(calls[0].text, /active-ts-invalid-numeric-aggregate/);
-	assert.match(calls[0].text, /max\(\(\(data #>> \$2::text\[\]\)\)::double precision\) as highest/);
+	assert.match(calls[0].text, /max\(\(case .*jsonb_typeof\(data #> \$2::text\[\]\) = 'number'.*end\)::double precision\) as highest/);
 	assert.match(calls[0].text, /where coalesce\(\(jsonb_typeof\(data #> \$3::text\[\]\) = 'number'/);
 	assert.match(calls[0].text, /\(data #>> \$3::text\[\]\)::double precision >= \$4::double precision/);
 	assert.deepEqual(calls[0].values, [['score'], ['score'], ['score'], 20]);
@@ -3370,8 +3370,8 @@ test('postgres min and max preserve nonnumeric field types', async () => {
 	});
 
 	assert.deepEqual(result, { earliest: '2026-05-01T00:00:00.000Z', lastHandle: 'seo' });
-	assert.match(calls[0].text, /min\(\(\(data #>> \$1::text\[\]\)\)::timestamptz\) as earliest/);
-	assert.match(calls[0].text, /max\(\(regexp_replace\(replace\(\(\(data #>> \$2::text\[\]\)\) collate "C".*as "lastHandle"/);
+	assert.match(calls[0].text, /min\(\(case .*jsonb_typeof\(\(data #> \$1::text\[\]\)\) = 'string'.*end\)::timestamptz\) as earliest/);
+	assert.match(calls[0].text, /max\(\(regexp_replace\(replace\(\(\(case .*jsonb_typeof\(\(data #> \$2::text\[\]\)\) = 'string'.*end\)\) collate "C".*as "lastHandle"/);
 	assert.deepEqual(calls[0].values, [['createdAt'], ['handle']]);
 });
 
@@ -3968,7 +3968,7 @@ test('firestore adapter validates field paths, document ids, and write payloads'
 	assert.equal(applied.adapter, 'firestore');
 	assert.equal(applied.status, 'manual');
 	assert.match(applied.note ?? '', /must be applied/);
-	assert.deepEqual(applied.changes.map((change) => change.type), ['create-index']);
+	assert.deepEqual(applied.changes.map((change) => change.type), ['create-index', 'create-index']);
 	assert.equal((await adapter.schema!.plan([nonUniqueMeta])).status, 'manual');
 });
 
