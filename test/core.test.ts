@@ -3278,7 +3278,7 @@ test('postgres schema apply escapes identifiers and rejects reserved index json 
 					return {
 						rows: [
 							{
-								indexname: 'account_handle',
+								indexname: 'account_handle', indisvalid: true, indisready: true,
 								indexdef: "CREATE UNIQUE INDEX account_handle ON public.account USING btree (((data #> ARRAY['handle'::text])))"
 							}
 						],
