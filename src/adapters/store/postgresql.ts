@@ -302,6 +302,13 @@ function typedJsonFieldParam(model: ResolvedModelMeta, field: string, params: an
 	return raw;
 }
 
+// C collation compares Unicode code points, while the portable comparator uses
+// UTF-16 code units. Move supplementary code points between D7FF and E000, and
+// escape literal D7FF to make the mapping ordered and reversible.
+function postgresStringOrderKey(sql: string) {
+	return `(regexp_replace(replace((${sql}) collate "C", ${quoteLiteral('\uD7FF')}, ${quoteLiteral('\uD7FF\uD7FF')}), ${quoteLiteral('[\u{10000}-\u{10FFFF}]')}, ${quoteLiteral('\uD7FF\uE000\\&')}, 'g') collate "C")`;
+}
+
 function jsonSortExpressions(model: ResolvedModelMeta, field: string, direction: 'asc' | 'desc', params: any[]) {
 	const path = jsonPathParam(field, params);
 	const json = `(data #> ${path})`;
@@ -315,7 +322,7 @@ function jsonSortExpressions(model: ResolvedModelMeta, field: string, direction:
 					? `(${text})::boolean`
 					: type === 'date'
 						? `(${text})::timestamptz`
-						: text;
+						: postgresStringOrderKey(text);
 		return [
 			`(case when ${json} is null or jsonb_typeof(${json}) = 'null' then 0 else 1 end) ${direction}`,
 			`${value} ${direction}`
@@ -325,7 +332,7 @@ function jsonSortExpressions(model: ResolvedModelMeta, field: string, direction:
 		`(case when ${json} is null or jsonb_typeof(${json}) = 'null' then 0 when jsonb_typeof(${json}) = 'boolean' then 1 when jsonb_typeof(${json}) = 'number' then 2 when jsonb_typeof(${json}) = 'string' then 3 else 4 end) ${direction}`,
 		`(case when jsonb_typeof(${json}) = 'boolean' then (${text})::boolean end) ${direction}`,
 		`(case when jsonb_typeof(${json}) = 'number' then (${text})::double precision end) ${direction}`,
-		`(case when jsonb_typeof(${json}) = 'string' then ${text} end) ${direction}`,
+		`(case when jsonb_typeof(${json}) = 'string' then ${postgresStringOrderKey(text)} end) ${direction}`,
 	];
 }
 
@@ -372,7 +379,7 @@ function jsonAccessForComparison(field: string, type: JsonComparisonType, params
 	if (type === 'number') return { json, value: `(${text})::double precision`, guard: `jsonb_typeof(${json}) = 'number'` };
 	if (type === 'boolean') return { json, value: `(${text})::boolean`, guard: `jsonb_typeof(${json}) = 'boolean'` };
 	if (type === 'date') return { json, value: `(${text})::timestamptz`, guard: `jsonb_typeof(${json}) = 'string'` };
-	return { json, value: `(${text})`, guard: `jsonb_typeof(${json}) = 'string'` };
+	return { json, value: `((${text}) collate "C")`, guard: `jsonb_typeof(${json}) = 'string'` };
 }
 
 function jsonNullPredicate(field: string, params: any[]) {
@@ -398,14 +405,19 @@ function jsonRangePredicate(
 	const type = jsonComparisonType(model, field, value);
 	const access = jsonAccessForComparison(field, type, params);
 	params.push(sqlOperand(value, type));
-	return `coalesce((${access.guard} and ${access.value} ${operator} $${params.length}${sqlParamCast(type)}), false)`;
+	const left = type === 'string' ? postgresStringOrderKey(access.value) : access.value;
+	const right = `$${params.length}${sqlParamCast(type)}`;
+	return `coalesce((${access.guard} and ${left} ${operator} ${type === 'string' ? postgresStringOrderKey(right) : right}), false)`;
 }
 
 function jsonBetweenPredicate(model: ResolvedModelMeta, field: string, lower: unknown, upper: unknown, params: any[]) {
 	const type = jsonComparisonType(model, field, lower);
 	const access = jsonAccessForComparison(field, type, params);
 	params.push(sqlOperand(lower, type), sqlOperand(upper, type));
-	return `coalesce((${access.guard} and ${access.value} between $${params.length - 1}${sqlParamCast(type)} and $${params.length}${sqlParamCast(type)}), false)`;
+	const left = type === 'string' ? postgresStringOrderKey(access.value) : access.value;
+	const low = `$${params.length - 1}${sqlParamCast(type)}`;
+	const high = `$${params.length}${sqlParamCast(type)}`;
+	return `coalesce((${access.guard} and ${left} between ${type === 'string' ? postgresStringOrderKey(low) : low} and ${type === 'string' ? postgresStringOrderKey(high) : high}), false)`;
 }
 
 function jsonInPredicate(model: ResolvedModelMeta, field: string, values: readonly unknown[], params: any[]) {
@@ -653,7 +665,7 @@ function aggregateSql(model: ResolvedModelMeta, spec: AggregateSpec, params: any
 		return `avg(${numericValue})::double precision as ${alias}`;
 	}
 	const comparableValue = typedJsonFieldParam(model, spec.field!, params);
-	return `${spec.op}(${comparableValue}) as ${alias}`;
+	return `${spec.op}(${modelFieldType(model, spec.field!) === 'string' ? postgresStringOrderKey(comparableValue) : comparableValue}) as ${alias}`;
 }
 
 function assertTypedMinMaxAggregates(model: ResolvedModelMeta, specs: AggregateSpec[]) {
@@ -1480,7 +1492,15 @@ async function createPostgresStoreAdapterInternal(
 				'PostgreSQL aggregate'
 			);
 			const row = postgresRows(res, 'PostgreSQL aggregate')[0];
-			return normalizeAggregateRow(row === undefined ? defaultAggregateResult(specs) : row, specs, 'PostgreSQL aggregate');
+			const result = normalizeAggregateRow(row === undefined ? defaultAggregateResult(specs) : row, specs, 'PostgreSQL aggregate');
+			for (const spec of specs) {
+				const value = result[spec.as];
+				if ((spec.op === 'min' || spec.op === 'max') && modelFieldType(model, spec.field!) === 'string' && typeof value === 'string') {
+					result[spec.as] = value.replace(/\uD7FF(\uD7FF|\uE000([\u{10000}-\u{10FFFF}]))/gu,
+						(_match, escaped: string, supplementary: string | undefined) => supplementary ?? escaped);
+				}
+			}
+			return result;
 		},
 		async create(model, id, data, writeOptions = {}) {
 			model = snapshotAdapterModel(model, 'PostgreSQL model metadata');

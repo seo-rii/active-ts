@@ -49,6 +49,13 @@ metadata. Its aggregate capability depends on SDK aggregation support or an
 explicitly enabled scan fallback; a successful fallback is not evidence of a
 bounded backend scan. See [aggregate optimization](#aggregate-optimization).
 
+PostgreSQL portable string equality uses deterministic `C` collation. Ordering,
+range filters, and string min/max use reversible comparison keys that match
+JavaScript UTF-16 ordering, including supplementary Unicode characters, regardless
+of the database locale. The keys are computed in the query; existing JSON indexes
+and their uniqueness rules stay unchanged, and text ordering can require a sort
+rather than using those indexes. Native SQL keeps its chosen PostgreSQL collation.
+
 PostgreSQL portable projection is deliberately unsupported in this version.
 Both model `query().select()` and a direct store query with `plan.select` must
 reject; do not remove the selection or return full rows as a projection

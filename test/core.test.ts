@@ -3032,7 +3032,7 @@ test('postgres adapter parameterizes json paths and rejects unsafe field paths',
 	assert.match(calls[0].text, /data #>> \$1::text\[\]/);
 	assert.match(calls[0].text, /order by \(case when \(data #> \$3::text\[\]\) is null/);
 	assert.match(calls[0].text, /jsonb_typeof\(\(data #> \$3::text\[\]\)\) = 'number'/);
-	assert.match(calls[0].text, /\(data #>> \$3::text\[\]\) end\) asc/);
+	assert.match(calls[0].text, /regexp_replace\(replace\(\(\(data #>> \$3::text\[\]\)\) collate "C".*end\) asc/);
 	assert.deepEqual(calls[0].values, [['handle'], 'pg', ['name'], ['id']]);
 
 	calls.length = 0;
@@ -3045,7 +3045,7 @@ test('postgres adapter parameterizes json paths and rejects unsafe field paths',
 	});
 	assert.match(calls[0].text, /data #>> \$1::text\[\]/);
 	assert.match(calls[0].text, /order by \(case when \(data #> \$3::text\[\]\) is null/);
-	assert.match(calls[0].text, /\(data #>> \$3::text\[\]\) end\) asc/);
+	assert.match(calls[0].text, /regexp_replace\(replace\(\(\(data #>> \$3::text\[\]\)\) collate "C".*end\) asc/);
 	assert.deepEqual(calls[0].values, [['profile', 'first-name'], 'Ada', ['profile', 'last-name'], ['id']]);
 
 	calls.length = 0;
@@ -3371,7 +3371,7 @@ test('postgres min and max preserve nonnumeric field types', async () => {
 
 	assert.deepEqual(result, { earliest: '2026-05-01T00:00:00.000Z', lastHandle: 'seo' });
 	assert.match(calls[0].text, /min\(\(\(data #>> \$1::text\[\]\)\)::timestamptz\) as earliest/);
-	assert.match(calls[0].text, /max\(\(data #>> \$2::text\[\]\)\) as "lastHandle"/);
+	assert.match(calls[0].text, /max\(\(regexp_replace\(replace\(\(\(data #>> \$2::text\[\]\)\) collate "C".*as "lastHandle"/);
 	assert.deepEqual(calls[0].values, [['createdAt'], ['handle']]);
 });
 
