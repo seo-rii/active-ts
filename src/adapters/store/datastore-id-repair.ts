@@ -31,9 +31,11 @@ import {
 } from '../../core/collection-intrinsics.js';
 import {
 	assertNativeDatastoreEntityId,
+	datastoreEntityIdFromNativeNumeric,
 	datastoreKeyIdentity,
 	normalizeDatastoreKey
 } from '../../core/datastore-key.js';
+import { datastoreInt64Id, datastoreInt64IdValue, isDatastoreInt64Id } from '../../core/datastore-int64-id.js';
 import type { DatastoreKey, EntityId } from '../../core/types.js';
 import type {
 	DatastoreIdInventoryIssue,
@@ -48,7 +50,7 @@ export type DatastoreIdRepairPolicy = 'key-wins' | 'payload-wins';
 export type DatastoreIdRepairDescendantPolicy = 'verified-none' | 'migrated-separately';
 export type DatastoreIdRepairPayload = Extract<
 	DatastoreIdInventoryPayload,
-	{ readonly type: 'string' | 'number' }
+	{ readonly type: 'string' | 'number' | 'int64' }
 >;
 export type DatastoreIdRepairOperation = {
 	readonly issueIndex: number;
@@ -346,7 +348,17 @@ export async function applyDatastoreIdRepairManifest(
 			'Datastore ID repair client namespace must match the manifest namespace.'
 		);
 	}
-	const key = requiredMethod(rawClient, 'key', 'Datastore ID repair client.key');
+	const sdkKey = requiredMethod(rawClient, 'key', 'Datastore ID repair client.key');
+	const key = (options: ReturnType<typeof inventoryKeyToSdkOptions>) => {
+		const path: unknown[] = [];
+		for (let index = 0; index < options.path.length; index++) {
+			const part = options.path[index];
+			path[index] = isDatastoreInt64Id(part)
+				? requiredMethod(rawClient, 'int', 'Datastore ID repair client.int')(datastoreInt64IdValue(part))
+				: part;
+		}
+		return sdkKey({ ...options, path });
+	};
 	const get = requiredMethod(rawClient, 'get', 'Datastore ID repair client.get');
 	const transactionFactory = requiredMethod(
 		rawClient,
@@ -598,14 +610,7 @@ function normalizeInventoryKey(
 			throw new ActiveTsValidationError(`${partContext}.value must be a string.`);
 		}
 		if (storage === 'id') {
-			if (!/^[1-9]\d*$/.test(rawPartValue)) {
-				throw new ActiveTsValidationError(`${partContext}.value must be a canonical positive numeric ID.`);
-			}
-			const numericId = Number(rawPartValue);
-			assertNativeDatastoreEntityId(numericId, `${partContext}.value`);
-			if (String(numericId) !== rawPartValue) {
-				throw new ActiveTsValidationError(`${partContext}.value exceeds the active-ts safe integer range.`);
-			}
+			datastoreEntityIdFromNativeNumeric(rawPartValue, `${partContext}.value`);
 		} else {
 			assertNativeDatastoreEntityId(rawPartValue, `${partContext}.value`);
 		}
@@ -626,13 +631,19 @@ function normalizeRepairPayload(value: unknown, context: string): DatastoreIdRep
 	assertKnownKeys(record, PAYLOAD_KEYS, context, ActiveTsValidationError);
 	const type = ownDataValue(record, 'type', context, ActiveTsValidationError);
 	const payloadValue = ownDataValue(record, 'value', context, ActiveTsValidationError);
+	if (type === 'int64') {
+		if (typeof payloadValue !== 'string') throw new ActiveTsValidationError(`${context}.value must be a decimal string.`);
+		datastoreInt64Id(payloadValue);
+		return Object.freeze({ type, value: payloadValue });
+	}
 	if (type !== 'string' && type !== 'number') {
-		throw new ActiveTsValidationError(`${context}.type must be "string" or "number".`);
+		throw new ActiveTsValidationError(`${context}.type must be "string", "number", or "int64".`);
 	}
 	if (typeof payloadValue !== type) {
 		throw new ActiveTsValidationError(`${context}.value must match payload type "${type}".`);
 	}
 	assertSafeEntityId(payloadValue, `${context}.value`);
+	if (isDatastoreInt64Id(payloadValue)) throw new ActiveTsValidationError(`${context} must declare the int64 payload type.`);
 	return Object.freeze({ type, value: payloadValue }) as DatastoreIdRepairPayload;
 }
 
@@ -642,7 +653,8 @@ function assertTypeMismatch(
 	context: string
 ) {
 	const leaf = key.path[key.path.length - 1];
-	const keyType = leaf.storage === 'id' ? 'number' : 'string';
+	const keyId = leaf.storage === 'id' ? datastoreEntityIdFromNativeNumeric(leaf.value, context) : leaf.value;
+	const keyType = isDatastoreInt64Id(keyId) ? 'int64' : typeof keyId;
 	if (payload.type === keyType || String(payload.value) !== leaf.value) {
 		throw new ActiveTsValidationError(
 			`${context} must describe matching ID text with different physical-key and payload types.`
@@ -658,13 +670,10 @@ function buildRepairOperation(
 ): DatastoreIdRepairOperation {
 	const leaf = source.path[source.path.length - 1];
 	const replacementId = policy === 'key-wins'
-		? leaf.storage === 'id' ? Number(leaf.value) : leaf.value
-		: payload.value;
+		? leaf.storage === 'id' ? datastoreEntityIdFromNativeNumeric(leaf.value, 'Datastore ID repair key') : leaf.value
+		: payload.type === 'int64' ? datastoreInt64Id(payload.value) : payload.value;
 	assertSafeEntityId(replacementId, 'Datastore ID repair replacementId');
 	if (policy === 'payload-wins') {
-		if (typeof replacementId === 'number' && replacementId <= 0) {
-			throw new ActiveTsValidationError('Datastore ID repair target key ID must be a positive integer.');
-		}
 		assertNativeDatastoreEntityId(replacementId, 'Datastore ID repair target key ID');
 	}
 	const target = policy === 'key-wins'
@@ -701,8 +710,8 @@ function replaceInventoryKeyLeaf(
 	const leaf = path[path.length - 1];
 	path[path.length - 1] = Object.freeze({
 		kind: leaf.kind,
-		storage: typeof id === 'number' ? 'id' : 'name',
-		value: String(id)
+		storage: typeof id === 'number' || isDatastoreInt64Id(id) ? 'id' : 'name',
+		value: isDatastoreInt64Id(id) ? datastoreInt64IdValue(id) : String(id)
 	});
 	Object.freeze(path);
 	return Object.freeze({
@@ -759,7 +768,7 @@ function inventoryKeyToLogicalKey(key: DatastoreIdInventoryKey): DatastoreKey {
 		const part = key.path[index];
 		path[index] = {
 			kind: part.kind,
-			id: part.storage === 'id' ? Number(part.value) : part.value
+			id: part.storage === 'id' ? datastoreEntityIdFromNativeNumeric(part.value, 'Datastore ID repair key') : part.value
 		};
 	}
 	return normalizeDatastoreKey({
@@ -1007,8 +1016,7 @@ async function preflightRepairManifest(
 		);
 		const alreadyRepaired =
 			manifest.policy === 'key-wins' &&
-			currentPayload.type === typeof operation.replacementId &&
-			currentPayload.value === operation.replacementId;
+			sameRepairPayload(currentPayload, repairPayloadForId(operation.replacementId));
 		if (!alreadyRepaired && !sameRepairPayload(currentPayload, operation.expectedPayload)) {
 			throw new ActiveTsConflictError(
 				`Datastore ID repair preflight ${index} payload changed after inventory.`
@@ -1062,8 +1070,7 @@ async function applyRepairOperation(
 		const currentPayload = payloadFromEntity(source, manifest.idField, `Datastore ID repair operation ${index} source`);
 		if (
 			manifest.policy === 'key-wins' &&
-			currentPayload.type === typeof operation.replacementId &&
-			currentPayload.value === operation.replacementId
+			sameRepairPayload(currentPayload, repairPayloadForId(operation.replacementId))
 		) {
 			committing = true;
 			await commit(transactionOptions.commitGaxOptions);
@@ -1120,7 +1127,7 @@ function inventoryKeyToSdkOptions(key: DatastoreIdInventoryKey) {
 	for (let index = 0; index < key.path.length; index++) {
 		const part = key.path[index];
 		path[path.length] = part.kind;
-		path[path.length] = part.storage === 'id' ? Number(part.value) : part.value;
+		path[path.length] = part.storage === 'id' ? datastoreEntityIdFromNativeNumeric(part.value, 'Datastore ID repair key') : part.value;
 	}
 	return key.namespace === undefined ? { path } : { namespace: key.namespace, path };
 }
@@ -1154,7 +1161,13 @@ function payloadFromEntity(entity: Record<string, unknown>, idField: string, con
 	} catch {
 		return { type: 'invalid' as const };
 	}
-	return { type: typeof value, value } as DatastoreIdRepairPayload;
+	return repairPayloadForId(value);
+}
+
+function repairPayloadForId(value: EntityId): DatastoreIdRepairPayload {
+	return isDatastoreInt64Id(value)
+		? { type: 'int64', value: datastoreInt64IdValue(value) }
+		: { type: typeof value, value } as DatastoreIdRepairPayload;
 }
 
 function sameRepairPayload(

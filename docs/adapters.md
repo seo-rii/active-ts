@@ -1218,3 +1218,12 @@ MongoDB portable `orderBy()` follows the same metadata requirement for non-id
 fields. MongoDB's native ordering for missing, null, arrays, objects, and mixed
 scalar values differs from active-ts' portable comparator, so declare sortable
 scalar fields with `fieldType()`.
+
+Datastore ID inventory and repair preserve all supported native numeric keys,
+including negative safe integers and both signed-int64 boundaries. Inventory
+payloads represent branded IDs explicitly as `{ type: 'int64', value: '<decimal>' }`;
+physical key paths retain canonical decimal strings. Repair manifests survive a
+JSON round trip without converting these IDs through JavaScript numbers. Applying
+an int64 source, target, or ancestor requires the Datastore client's `int()` method.
+Key-wins repairs keep the branded logical ID in the entity payload; payload-wins
+repairs preserve the distinction between numeric IDs and decimal string names.
