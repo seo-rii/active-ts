@@ -77,6 +77,12 @@ defineModel<DocumentData>({ name: 'document' })
 hydrates it back to a `Date` on reads. Date query operands are normalized the
 same way so memory and JSON-backed adapters compare the same values.
 
+Portable typed dates, Date query operands and Date cursor values support UTC
+years 0000 through 9999, inclusive. Extended-year values are rejected because
+their ISO text does not preserve chronological ordering. This validation also
+applies when reading existing typed date fields; encode dates outside this range
+with an application-defined representation and comparison contract.
+
 Field codecs are not queryable by default because the stored representation may
 not preserve portable comparison semantics. If a codec is deterministic and
 safe to filter on, provide `encodeQuery(value, context)` alongside `encode` and
