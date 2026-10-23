@@ -51,6 +51,7 @@ import {
 } from './google-query-constraints.js';
 import {
 	MAP_DELETE,
+	MAP_KEYS,
 	MAP_GET,
 	MAP_SET,
 	MAP_VALUES,
@@ -112,7 +113,54 @@ function assertSafeFirestoreCollectionName(name: string) {
 function assertSafeFirestoreField(field: unknown, context = 'Firestore field') {
 	const safeField = assertSafeFieldPath(field, context);
 	if (safeField.includes('/')) throw new ActiveTsValidationError(`${context} "${safeField}" cannot contain "/".`);
+	if (/[*~\[\]]/.test(safeField)) {
+		throw new ActiveTsValidationError(`${context} "${safeField}" cannot contain "*", "~", "[", or "]".`);
+	}
 	return safeField;
+}
+
+function assertFirestoreModelFields(model: ResolvedModelMeta) {
+	assertSafeFirestoreField(model.idField, 'Firestore id field');
+	for (const fields of [model.fieldTypes, model.fieldCodecs]) {
+		for (const field of MAP_KEYS.call(fields)) assertSafeFirestoreField(field, 'Firestore model field');
+	}
+	for (const index of model.indexes) {
+		for (const field of index.fields) assertSafeFirestoreField(field, 'Firestore schema index field');
+	}
+}
+
+function snapshotFirestoreModel(model: ResolvedModelMeta, context: string) {
+	const snapshot = snapshotAdapterModel(model, context);
+	assertFirestoreModelFields(snapshot);
+	return snapshot;
+}
+
+function assertFirestorePlanFields(plan: QueryPlan | AggregatePlan) {
+	for (const where of plan.where) assertSafeFirestoreField(where.field, 'Firestore query field');
+	if ('sort' in plan) {
+		for (const sort of plan.sort) assertSafeFirestoreField(sort.field, 'Firestore sort field');
+		for (const field of plan.select ?? []) assertSafeFirestoreField(field, 'Firestore select field');
+	} else {
+		for (const spec of plan.aggregates) {
+			if (spec.field !== undefined) assertSafeFirestoreField(spec.field, 'Firestore aggregate field');
+		}
+	}
+}
+
+function cloneFirestoreDataObject(data: unknown, context: string) {
+	const snapshot = clonePortableDataObject(data, context);
+	const visit = (value: unknown) => {
+		if (Array.isArray(value)) {
+			for (const item of value) visit(item);
+		} else if (value && typeof value === 'object' && !(value instanceof Date) && !(value instanceof Uint8Array)) {
+			for (const key of Object.keys(value)) {
+				assertSafeFirestoreField(key, 'Firestore stored field');
+				visit((value as Record<string, unknown>)[key]);
+			}
+		}
+	};
+	visit(snapshot);
+	return snapshot;
 }
 
 function doc(client: ReturnType<typeof normalizeFirestoreClient>, model: ResolvedModelMeta, id: EntityId) {
@@ -313,7 +361,7 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 			native: true
 		},
 		async get(model, id, options) {
-			model = snapshotAdapterModel(model, 'Firestore model metadata');
+			model = snapshotFirestoreModel(model, 'Firestore model metadata');
 			rejectUnsupportedStoreReadOptions(options, 'Firestore store read options');
 			assertSafeEntityId(id, `${model.name} store id`);
 			const ref = doc(client, model, id);
@@ -325,7 +373,7 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 			return data;
 		},
 		async getMany(model, ids, options) {
-			model = snapshotAdapterModel(model, 'Firestore model metadata');
+			model = snapshotFirestoreModel(model, 'Firestore model metadata');
 			rejectUnsupportedStoreReadOptions(options, 'Firestore store read options');
 			ids = assertSafeEntityIdArray(ids, 'Firestore store ids');
 			if (!ids.length) return [];
@@ -371,7 +419,7 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 			return result;
 		},
 		async query(model, plan, options): Promise<QueryResult> {
-			model = snapshotAdapterModel(model, 'Firestore model metadata');
+			model = snapshotFirestoreModel(model, 'Firestore model metadata');
 			plan = normalizeStoreQueryPlan(plan, model.idField, 'Firestore query plan', {
 				limit: 'Firestore limit',
 				offset: 'Firestore offset',
@@ -391,6 +439,7 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 				{ cursor: adapter.capabilities?.cursor, adapterKind: adapter.kind }
 			);
 			if (plan.or.length) throw new ActiveTsConfigurationError('Firestore adapter does not support orWhere().');
+			assertFirestorePlanFields(plan);
 			assertFirestoreArrayContainsPlan(plan);
 			assertFirestoreQueryLimits(plan);
 			assertGoogleInequalitySortOrder('Firestore', plan, 'orderBy');
@@ -448,7 +497,7 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 			return result;
 		},
 		async aggregate(model, plan: AggregatePlan) {
-			model = snapshotAdapterModel(model, 'Firestore model metadata');
+			model = snapshotFirestoreModel(model, 'Firestore model metadata');
 			plan = normalizeStoreAggregatePlan(plan, 'Firestore aggregate plan');
 			plan = normalizeAggregatePlanFieldTypes(model, plan);
 			plan = encodeAggregatePlanFieldCodecs(model, plan);
@@ -462,6 +511,7 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 				'Firestore native function aggregate'
 			);
 			if (plan.or.length) throw new ActiveTsConfigurationError('Firestore adapter does not support orWhere().');
+			assertFirestorePlanFields(plan);
 			assertFirestoreArrayContainsPlan(plan);
 			assertFirestoreQueryLimits(plan);
 			if (
@@ -586,12 +636,12 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 			);
 		},
 		async create(model, id, data, options = {}) {
-			model = snapshotAdapterModel(model, 'Firestore model metadata');
+			model = snapshotFirestoreModel(model, 'Firestore model metadata');
 			rejectUnsupportedStoreWriteOptions(options, 'Firestore store create options');
 			assertSafeEntityId(id, `${model.name} store id`);
-			const ref = doc(client, model, id);
-			const clean = clonePortableDataObject(data, `${model.name} stored data`);
+			const clean = cloneFirestoreDataObject(data, `${model.name} stored data`);
 			assertStoreDataMatchesId(model, id, clean);
+			const ref = doc(client, model, id);
 			try {
 				await firestoreMethod(ref, 'create', 'Firestore document.create')(clean);
 			} catch (error) {
@@ -602,16 +652,16 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 			}
 		},
 		async update(model, id, data, options = {}) {
-			model = snapshotAdapterModel(model, 'Firestore model metadata');
+			model = snapshotFirestoreModel(model, 'Firestore model metadata');
 			rejectUnsupportedStoreWriteOptions(options, 'Firestore store write options');
 			assertSafeEntityId(id, `${model.name} store id`);
-			const clean = clonePortableDataObject(data, `${model.name} stored data`);
+			const clean = cloneFirestoreDataObject(data, `${model.name} stored data`);
 			assertStoreDataMatchesId(model, id, clean);
 			const ref = doc(client, model, id);
 			await replaceFirestoreDocument(client, model, id, ref, clean);
 		},
 		async delete(model, id, options = {}) {
-			model = snapshotAdapterModel(model, 'Firestore model metadata');
+			model = snapshotFirestoreModel(model, 'Firestore model metadata');
 			rejectUnsupportedStoreWriteOptions(options, 'Firestore store delete options');
 			assertSafeEntityId(id, `${model.name} store id`);
 			const ref = doc(client, model, id);
@@ -795,7 +845,7 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 					cacheScope: options.cacheScope,
 					capabilities: { ...adapter.capabilities, transaction: false, aggregate: false, native: false },
 					get: async (model, id, options) => {
-						model = snapshotAdapterModel(model, 'Firestore transaction model metadata');
+						model = snapshotFirestoreModel(model, 'Firestore transaction model metadata');
 						rejectUnsupportedStoreReadOptions(options, 'Firestore transaction read options');
 						assertSafeEntityId(id, `${model.name} store id`);
 						await waitForBufferedMutations([mutationKey(model, id)]);
@@ -807,7 +857,7 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 						return await readDocument(model, id, 'Firestore transaction get');
 					},
 					getMany: async (model, ids, options) => {
-						model = snapshotAdapterModel(model, 'Firestore transaction model metadata');
+						model = snapshotFirestoreModel(model, 'Firestore transaction model metadata');
 						rejectUnsupportedStoreReadOptions(options, 'Firestore transaction read options');
 						ids = assertSafeEntityIdArray(ids, 'Firestore transaction store ids');
 						const rows: Array<any | null> = [];
@@ -829,7 +879,7 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 						return rows;
 					},
 					query: async (model, plan, options): Promise<QueryResult> => {
-						model = snapshotAdapterModel(model, 'Firestore transaction model metadata');
+						model = snapshotFirestoreModel(model, 'Firestore transaction model metadata');
 						plan = normalizeStoreQueryPlan(plan, model.idField, 'Firestore transaction query plan', {
 							limit: 'Firestore limit',
 							offset: 'Firestore offset',
@@ -845,6 +895,7 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 							throw new ActiveTsConfigurationError('Firestore transaction native queries are not supported.');
 						}
 						if (plan.or.length) throw new ActiveTsConfigurationError('Firestore adapter does not support orWhere().');
+						assertFirestorePlanFields(plan);
 						assertFirestoreArrayContainsPlan(plan);
 						assertFirestoreQueryLimits(plan);
 						assertGoogleInequalitySortOrder('Firestore', plan, 'orderBy');
@@ -859,10 +910,10 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 						return firestoreQueryResult(model, plan, snap, 'Firestore transaction query snapshot');
 					},
 					create: async (model, id, data, options = {}) => {
-						model = snapshotAdapterModel(model, 'Firestore transaction model metadata');
+						model = snapshotFirestoreModel(model, 'Firestore transaction model metadata');
 						rejectUnsupportedStoreWriteOptions(options, 'Firestore transaction create options');
 						assertSafeEntityId(id, `${model.name} store id`);
-						const clean = clonePortableDataObject(data, `${model.name} stored data`);
+						const clean = cloneFirestoreDataObject(data, `${model.name} stored data`);
 						assertStoreDataMatchesId(model, id, clean);
 						const key = mutationKey(model, id);
 						return serializeBufferedMutation(key, async () => {
@@ -891,10 +942,10 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 						});
 					},
 					update: async (model, id, data, options = {}) => {
-						model = snapshotAdapterModel(model, 'Firestore transaction model metadata');
+						model = snapshotFirestoreModel(model, 'Firestore transaction model metadata');
 						rejectUnsupportedStoreWriteOptions(options, 'Firestore transaction write options');
 						assertSafeEntityId(id, `${model.name} store id`);
-						const clean = clonePortableDataObject(data, `${model.name} stored data`);
+						const clean = cloneFirestoreDataObject(data, `${model.name} stored data`);
 						assertStoreDataMatchesId(model, id, clean);
 						const key = mutationKey(model, id);
 						return serializeBufferedMutation(key, async () => {
@@ -917,7 +968,7 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 						});
 					},
 					delete: async (model, id, options = {}) => {
-						model = snapshotAdapterModel(model, 'Firestore transaction model metadata');
+						model = snapshotFirestoreModel(model, 'Firestore transaction model metadata');
 						rejectUnsupportedStoreWriteOptions(options, 'Firestore transaction delete options');
 						assertSafeEntityId(id, `${model.name} store id`);
 						const key = mutationKey(model, id);
@@ -1066,6 +1117,7 @@ function firestoreSchemaChanges(models: ResolvedModelMeta[]) {
 function assertFirestoreSchemaModelsSupported(models: ResolvedModelMeta[]) {
 	for (let modelIndex = 0; modelIndex < models.length; modelIndex++) {
 		const model = models[modelIndex];
+		assertSafeFirestoreField(model.idField, 'Firestore id field');
 		for (let indexIndex = 0; indexIndex < model.indexes.length; indexIndex++) {
 			const index = model.indexes[indexIndex];
 			if (index.unique !== true) continue;

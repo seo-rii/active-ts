@@ -1224,3 +1224,11 @@ Datastore typed `min`/`max` with a non-null `!=` operand requires
 null on the aggregate field. The scan preserves portable null handling without
 adding a second negative filter, which the backend does not support. An existing
 `!= null` predicate is reused by the optimized path.
+
+Firestore portable field paths use dot-separated map segments. The adapter rejects
+`*`, `~`, `/`, `[` and `]` in model field declarations, query paths, schema indexes,
+and stored property names before calling SDK query or write methods. This keeps
+created data addressable by the same portable query API, including nested objects
+and arrays. For existing Firestore fields containing these characters, use the
+native Firestore SDK with `FieldPath` objects; portable queries do not escape or
+silently rename those fields.
