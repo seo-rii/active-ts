@@ -237,7 +237,7 @@ export function aggregateRows(rows: any[], specs: AggregateSpec[]) {
 	const safeRows = aggregateArrayValues(rows, 'Aggregate rows');
 	const safeSpecs = validateAggregateSpecs(specs);
 	const result = defaultAggregateResult(safeSpecs);
-	const avgState = new Map<string, { sum: number; count: number }>();
+	const avgState = new Map<string, { scale: number; sum: number; correction: number; count: number }>();
 
 	for (const spec of safeSpecs) {
 		if (spec.op === 'count') {
@@ -251,11 +251,31 @@ export function aggregateRows(rows: any[], specs: AggregateSpec[]) {
 			if (spec.op === 'sum') {
 				result[spec.as] = Number(result[spec.as] ?? 0) + numberValue(value, spec);
 			} else if (spec.op === 'avg') {
-				const state = (MAP_GET.call(avgState, spec.as) as { sum: number; count: number } | undefined) ?? {
+				const state = (MAP_GET.call(avgState, spec.as) as {
+					scale: number; sum: number; correction: number; count: number;
+				} | undefined) ?? {
+					scale: 0,
 					sum: 0,
+					correction: 0,
 					count: 0
 				};
-				state.sum += numberValue(value, spec);
+				const numeric = numberValue(value, spec);
+				const magnitude = Math.abs(numeric);
+				if (magnitude > state.scale) {
+					// Power-of-two scaling preserves ordinary binary arithmetic exactly.
+					const scale = 2 ** Math.min(1023, Math.floor(Math.log2(magnitude)));
+					const ratio = state.scale / scale;
+					state.sum *= ratio;
+					state.correction *= ratio;
+					state.scale = scale;
+				}
+				// Normalize before adding so finite inputs cannot overflow the sum.
+				const term = state.scale === 0 ? 0 : numeric / state.scale;
+				const sum = state.sum + term;
+				state.correction += Math.abs(state.sum) >= Math.abs(term)
+					? (state.sum - sum) + term
+					: (term - sum) + state.sum;
+				state.sum = sum;
 				state.count++;
 				MAP_SET.call(avgState, spec.as, state);
 			} else if (spec.op === 'min') {
@@ -279,7 +299,7 @@ export function aggregateRows(rows: any[], specs: AggregateSpec[]) {
 	}
 
 	for (const [as, state] of MAP_ENTRIES.call(avgState)) {
-		result[as] = state.count ? state.sum / state.count : null;
+		result[as] = state.count ? (state.sum / state.count + state.correction / state.count) * state.scale : null;
 	}
 	return result;
 }
