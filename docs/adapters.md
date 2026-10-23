@@ -857,9 +857,17 @@ const search = await createElasticsearchSearchAdapter({
 ```
 
 Built-in search adapters keep the projected document's id field as the logical
-model id. For ancestor-backed Datastore search sync they may use a separate
-bounded backend document key, so remote `objectID`/`_id` values are not required
-to decode to the same logical id when the stored document includes the id field.
+model id. Algolia, Elasticsearch, and OpenSearch require each ordinary hit's
+canonical backend `objectID`/`_id` to agree with that logical id, including its
+string/number type. Missing, malformed, or conflicting identities reject the
+response. For ancestor-backed Datastore search sync, the separate bounded
+backend document key follows the Datastore identity rules.
+
+Algolia continuation cursors are opaque, versioned tokens bound to the physical
+index, logical ID field, query text, native filters, projection, and requested
+page size. Reuse a cursor only with the same search options; legacy numeric
+page strings are rejected. Cursors detect accidental query changes and are not
+authentication tokens or a snapshot of changing index contents/settings.
 
 Search adapters can advertise `capabilities.revisionWrites: true` and accept a
 monotonic write fence:
@@ -1039,7 +1047,12 @@ Adapters may implement:
 - `schema.apply(models, { mode: 'safe' })` - apply non-destructive changes
 
 PostgreSQL and MongoDB can create collections/tables and indexes. Firestore
-reports index intent but does not apply remote index configuration.
+reports index intent but does not apply remote index configuration. Firestore
+plans retain each declared index and add a variant ending in the logical model
+ID ascending when the declaration omits that field. This variant supports the
+stable ordering added to limited portable queries. Existing field directions
+are preserved, and an explicitly declared matching variant is reused. Deploy
+both query shapes when the application uses both limited and unlimited queries.
 
 ## Adapter Contract
 
@@ -1164,8 +1177,11 @@ Built-in optimized paths:
 - PostgreSQL emits `count`, `sum`, `avg`, `min`, and `max` SQL aggregates
 - MongoDB emits one aggregation pipeline with `$group` for `count`, `sum`, and
   `avg`
-- Datastore uses aggregation queries for `count`, `sum`, and `avg`; with
-  `allowAggregateScanFallback: true`, it can instead run a validated full-row
+- Datastore uses aggregation queries for count-only plans or `sum`/`avg` of
+  one common field. Combining count with numeric aggregates, or aggregating
+  different fields, requires `allowAggregateScanFallback: true` because native
+  aggregation intersects the entities containing all aggregate fields. With
+  this option it runs a validated full-row
   query scan. `min` and `max` use ordered `limit(1)` lookups for fields declared
   with scalar `fieldType()` metadata unless scan fallback is enabled. At most
   five aggregate specs are accepted. Specs that would require more than one
@@ -1193,6 +1209,13 @@ Custom store adapters can omit `aggregate()` while prototyping by enabling the
 explicit fallback in test/dev contexts. Production adapters should implement
 native aggregate support or leave aggregate helpers unsupported.
 
+The core aggregate fallback requires a complete query result. If the store
+returns `more: true`, it throws before returning an aggregate, even when a
+continuation cursor is available. Use native aggregates or explicitly paginate
+the query and compute the aggregate with an application-owned read policy and
+execution budget. The fallback does not silently aggregate only the first page
+or start an unbounded scan.
+
 Datastore array properties have different scalar-filter semantics from the
 portable active-ts evaluator. For scalar fields without `fieldType()` metadata,
 the adapter therefore treats native `=`, `in`, `between`, and range filters only
@@ -1218,6 +1241,26 @@ MongoDB portable `orderBy()` follows the same metadata requirement for non-id
 fields. MongoDB's native ordering for missing, null, arrays, objects, and mixed
 scalar values differs from active-ts' portable comparator, so declare sortable
 scalar fields with `fieldType()`.
+
+Datastore typed `min`/`max` with a non-null `!=` operand requires
+`allowAggregateScanFallback: true` unless another predicate already excludes
+null on the aggregate field. The scan preserves portable null handling without
+adding a second negative filter, which the backend does not support. An existing
+`!= null` predicate is reused by the optimized path.
+
+Firestore portable field paths use dot-separated map segments. The adapter rejects
+`*`, `~`, `/`, `[` and `]` in model field declarations, query paths, schema indexes,
+and stored property names before calling SDK query or write methods. This keeps
+created data addressable by the same portable query API, including nested objects
+and arrays. For existing Firestore fields containing these characters, use the
+native Firestore SDK with `FieldPath` objects; portable queries do not escape or
+silently rename those fields.
+
+Datastore native numeric aggregates rely on the declared numeric field contract;
+use `allowAggregateScanFallback: true` to validate legacy or externally written
+values. The scan ignores missing/null aggregate values and rejects nonnumeric
+values. A multi-aggregate scan also requires `readAt()` or a Datastore transaction
+to keep all results on one snapshot.
 
 Datastore ID inventory and repair preserve all supported native numeric keys,
 including negative safe integers and both signed-int64 boundaries. Inventory

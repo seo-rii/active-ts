@@ -3,7 +3,7 @@ import { defineDataProperty } from './safe-keys.js';
 
 export const PARTIAL_MODEL = Symbol.for('active-ts.partial-model');
 
-type BlockedPartialOperations = 'save' | 'include' | 'ref' | 'view' | 'can';
+type BlockedPartialOperations = 'save' | 'delete' | 'include' | 'ref' | 'view' | 'can';
 
 export type PartialModel<
 	TModel extends { data: Record<string, any> },

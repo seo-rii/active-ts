@@ -322,7 +322,7 @@ function jsonSortExpressions(model: ResolvedModelMeta, field: string, direction:
 		];
 	}
 	return [
-		`(case when ${json} is null or jsonb_typeof(${json}) = 'null' then 0 when jsonb_typeof(${json}) = 'boolean' then 1 when jsonb_typeof(${json}) = 'number' then 2 when jsonb_typeof(${json}) = 'string' then 3 else 4 end) ${direction}`,
+		`(case when ${json} is null or jsonb_typeof(${json}) = 'null' then 0 when jsonb_typeof(${json}) = 'boolean' then 1 when jsonb_typeof(${json}) = 'number' then 2 when jsonb_typeof(${json}) = 'string' then 3 else ('active-ts-invalid-sort:' || ${json}::text)::integer end) ${direction}`,
 		`(case when jsonb_typeof(${json}) = 'boolean' then (${text})::boolean end) ${direction}`,
 		`(case when jsonb_typeof(${json}) = 'number' then (${text})::double precision end) ${direction}`,
 		`(case when jsonb_typeof(${json}) = 'string' then ${text} end) ${direction}`,

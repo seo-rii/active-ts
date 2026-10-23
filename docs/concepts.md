@@ -77,6 +77,12 @@ defineModel<DocumentData>({ name: 'document' })
 hydrates it back to a `Date` on reads. Date query operands are normalized the
 same way so memory and JSON-backed adapters compare the same values.
 
+Portable typed dates, Date query operands and Date cursor values support UTC
+years 0000 through 9999, inclusive. Extended-year values are rejected because
+their ISO text does not preserve chronological ordering. This validation also
+applies when reading existing typed date fields; encode dates outside this range
+with an application-defined representation and comparison contract.
+
 Field codecs are not queryable by default because the stored representation may
 not preserve portable comparison semantics. If a codec is deterministic and
 safe to filter on, provide `encodeQuery(value, context)` alongside `encode` and
@@ -214,6 +220,13 @@ await Account.query().include({ posts: { comments: 'author' } }).load();
 Relation `preload` fields are translated into `select()` projections for both
 lazy and batched relation loads. active-ts also includes the target id and
 foreign key so relation matching remains stable.
+
+Relation arrays must contain the complete matching result. If a store returns
+`more: true` for a relation query, lazy loading and `include()` throw instead of
+caching an incomplete array. Load the related model through an explicitly
+paginated query when a relation spans multiple pages, and manage its read policy
+and execution budget in the application. Relation loading does not automatically
+start an unbounded scan.
 
 Decorator relation getters are supported:
 

@@ -1,6 +1,7 @@
 import { ActiveContext } from './context.js';
 import { ActiveTsValidationError } from './errors.js';
 import { QueryBuilder, relationPreloadSelectFields } from './query.js';
+import { loadCompleteRelationQuery } from './relation-query.js';
 import {
 	assertUnambiguousDatastoreRelationFallback,
 	relationAncestorForOwner,
@@ -248,9 +249,9 @@ export class LazyRef<TModel = any> implements PromiseLike<TModel | TModel[] | nu
 				assertUnambiguousDatastoreRelationFallback(ownerMeta, targetMeta, this.relation, ownerJoinKeys, list);
 				return list[0] ?? null;
 			}
-			return (await query.load()).list;
+			return await loadCompleteRelationQuery(query);
 		}
-		const list = (await query.load()).list.filter((targetItem) => {
+		const list = (await loadCompleteRelationQuery(query)).filter((targetItem) => {
 			const foreignValue = valueFor(targetItem.data, this.relation.foreignKey);
 			if (foreignValue === undefined || foreignValue === null) return false;
 			return relationTargetJoinKeys(

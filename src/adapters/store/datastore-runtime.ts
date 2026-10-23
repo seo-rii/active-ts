@@ -3293,6 +3293,7 @@ function createDatastoreAdapter(
 							}
 							if (
 								where.op === 'isNotNull' ||
+								(where.op === '!=' && where.value === null) ||
 								(where.op === '=' && where.value !== null) ||
 								where.op === '>' ||
 								where.op === '>=' ||
@@ -3300,6 +3301,14 @@ function createDatastoreAdapter(
 								where.op === '<=' ||
 								where.op === 'between'
 							) alreadyExcludesNull = true;
+						}
+						if (!onlyNull && !alreadyExcludesNull) {
+							for (const where of plan.where) {
+								if (where.op !== '!=' && where.op !== 'isNotNull') continue;
+								throw new ActiveTsConfigurationError(
+									`Datastore ${spec.op} with an existing negative filter requires allowAggregateScanFallback: true to exclude null values without a second negative filter.`
+								);
+							}
 						}
 						MAP_SET.call(minMaxQueryOptions, spec.as, { field, onlyNull, alreadyExcludesNull });
 					}
@@ -3330,6 +3339,19 @@ function createDatastoreAdapter(
 							if (nativeAggregateRequests > 1) {
 								throw new ActiveTsConfigurationError(
 									'Datastore aggregate would require multiple backend queries with different snapshots; use allowAggregateScanFallback with readAt(), or run it in a Datastore transaction.'
+								);
+							}
+							let numericField: string | undefined;
+							let includesCount = false;
+							let differentFields = false;
+							for (const spec of sdkSpecs) {
+								if (spec.op === 'count') includesCount = true;
+								else if (numericField === undefined) numericField = spec.field;
+								else if (numericField !== spec.field) differentFields = true;
+							}
+							if (differentFields || (includesCount && numericField !== undefined)) {
+								throw new ActiveTsConfigurationError(
+									'Datastore aggregates combining count and numeric fields or different numeric fields require allowAggregateScanFallback: true and either readAt() or a Datastore transaction to preserve each aggregate input set.'
 								);
 							}
 							if (sdkSpecs.length) {

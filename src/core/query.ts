@@ -60,6 +60,7 @@ import {
 } from './query-utils.js';
 import { ActiveTsConfigurationError, ActiveTsValidationError } from './errors.js';
 import { isPartialModel, markPartialModel, type PartialModel } from './partial-model.js';
+import { loadCompleteRelationQuery } from './relation-query.js';
 import {
 	snapshotRelationOwnerLocalKey,
 	snapshotRelationResult,
@@ -1437,9 +1438,9 @@ export class QueryBuilder<TModel extends { data: any }, TData extends Record<str
 					const scopedAncestor = this.plan.meta?.datastoreAncestor === undefined
 						? undefined
 						: normalizeDatastoreKey(this.plan.meta.datastoreAncestor, 'query datastore ancestor');
+					const safePatch = cloneSafeDataObject(patch, `${meta.name} query find update patch`);
 					const item = await load({ select: false, include: false });
 					if (!item) return null;
-					const safePatch = cloneSafeDataObject(patch, `${meta.name} query find update patch`);
 					const patchId = safePatch[meta.idField];
 					if (patchId !== undefined) {
 						assertSafeEntityId(patchId, `${meta.name}.${meta.idField}`);
@@ -1805,6 +1806,11 @@ export class QueryBuilder<TModel extends { data: any }, TData extends Record<str
 				trustedDatastoreEntityKeys: storeTrustsDatastoreEntityKeyRows(store)
 			}
 		);
+		if (raw.more === true) {
+			throw new ActiveTsConfigurationError(
+				'Aggregate fallback requires a complete query result. Use native aggregates or explicitly paginate the query before computing the aggregate.'
+			);
+		}
 		const rows: Array<Record<string, any>> = [];
 		for (let index = 0; index < raw.list.length; index++) {
 			rows[index] = context.validateRead(meta, raw.list[index], { partial: true });
@@ -2044,7 +2050,7 @@ async function preloadIncludes(
 									);
 									if (select) query.select(...select);
 								}
-								for (const targetItem of (await query.load()).list) {
+								for (const targetItem of await loadCompleteRelationQuery(query)) {
 									const foreignValue = valueFor(targetItem.data, relation.foreignKey);
 									if (foreignValue === undefined || foreignValue === null) continue;
 									const { joinKey, targetJoinKey } = relationTargetJoinKeys(
@@ -2082,7 +2088,7 @@ async function preloadIncludes(
 								);
 								if (select) query.select(...select);
 							}
-							loaded.push(...(await query.load()).list);
+							loaded.push(...await loadCompleteRelationQuery(query));
 						}
 						const byForeign = new Map<any, any[]>();
 						for (const targetItem of loaded) {
