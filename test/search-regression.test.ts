@@ -3815,7 +3815,7 @@ test('algolia sdk-shaped fake covers pagination object ids deletes and search op
 			{ id: 1, title: 'safe first' },
 			{ id: 2, title: 'safe second' }
 		],
-		cursor: '1',
+		cursor: firstPage.cursor,
 		more: true,
 		count: 2,
 		total: 3

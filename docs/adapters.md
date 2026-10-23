@@ -861,6 +861,12 @@ model id. For ancestor-backed Datastore search sync they may use a separate
 bounded backend document key, so remote `objectID`/`_id` values are not required
 to decode to the same logical id when the stored document includes the id field.
 
+Algolia continuation cursors are opaque, versioned tokens bound to the physical
+index, logical ID field, query text, native filters, projection, and requested
+page size. Reuse a cursor only with the same search options; legacy numeric
+page strings are rejected. Cursors detect accidental query changes and are not
+authentication tokens or a snapshot of changing index contents/settings.
+
 Search adapters can advertise `capabilities.revisionWrites: true` and accept a
 monotonic write fence:
 
