@@ -2450,6 +2450,7 @@ export class SearchBuilder<TModel extends { data: any }, TIncludes extends boole
 	private adapterName?: string;
 	private options: SearchOptions = {};
 	private includes: string[] = [];
+	private reloadFullModels = false;
 	private readonly text: string;
 
 	constructor(
@@ -2499,6 +2500,7 @@ export class SearchBuilder<TModel extends { data: any }, TIncludes extends boole
 
 	include(...relations: IncludeSpec[]) {
 		this.includes.push(...normalizeIncludeSpecs(relations));
+		this.reloadFullModels = true;
 		return this as unknown as SearchBuilder<TModel, true>;
 	}
 
@@ -2514,6 +2516,7 @@ export class SearchBuilder<TModel extends { data: any }, TIncludes extends boole
 				const meta = context.meta(this.model);
 				const adapterName = this.adapterName;
 				const includes = [...this.includes];
+				const reloadFullModels = this.reloadFullModels;
 				const searchOptions = cloneSearchOptions(this.options);
 				const before = await context.runHooks('beforeSearch', {
 					model: meta,
@@ -2548,7 +2551,7 @@ export class SearchBuilder<TModel extends { data: any }, TIncludes extends boole
 				);
 				let list: TModel[];
 				let staleHits = 0;
-				if (includes.length) {
+				if (reloadFullModels) {
 					const fullHits = await this.loadFullSearchHits(adapterMeta, raw.list, context, options.where);
 					list = fullHits.list;
 					staleHits = fullHits.staleHits;
@@ -2574,7 +2577,7 @@ export class SearchBuilder<TModel extends { data: any }, TIncludes extends boole
 						if (item) list[list.length] = item;
 					}
 				}
-				if (!includes.length) {
+				if (!reloadFullModels) {
 					const afterInstantiateTasks: Array<Promise<void> | void> = [];
 					for (let index = 0; index < list.length; index++) {
 						afterInstantiateTasks[index] = context.runAfterInstantiateHooks(meta, list[index] as any, 'search');
