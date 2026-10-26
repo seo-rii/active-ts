@@ -1,5 +1,5 @@
+import { searchPageFromCursor, searchCursorForPage, searchCursorFingerprint } from '../../core/search-cursor.js';
 import type { EntityId, QueryResult, ResolvedModelMeta, SchemaPlan, SearchAdapter, SearchOptions } from '../../core/types.js';
-import { createHash } from 'node:crypto';
 import { optionalImport } from '../../core/optional-import.js';
 import { ActiveTsConfigurationError, ActiveTsValidationError } from '../../core/errors.js';
 import { assertPlainDataObject, assertSafeCacheKey, assertSafeEntityId, assertSafeFieldPath, assertSafeSchemaIdentifier, cloneSafeData } from '../../core/safe-keys.js';
@@ -147,47 +147,6 @@ function unsigned(value: unknown, context: string) {
 	return value;
 }
 
-function pageFromCursor(cursor: string | undefined, fingerprint: string) {
-	if (cursor === undefined) return 1;
-	try {
-		if (!/^[A-Za-z0-9_-]+$/.test(cursor)) throw new Error();
-		const decoded = JSON_PARSE(Buffer.from(cursor, 'base64url').toString('utf8'));
-		responseObject(decoded, 'Meilisearch cursor');
-		const page = own(decoded, 'page', 'Meilisearch cursor');
-		if (own(decoded, 'v', 'Meilisearch cursor') !== 1 || own(decoded, 'kind', 'Meilisearch cursor') !== 'meilisearch' ||
-			own(decoded, 'fingerprint', 'Meilisearch cursor') !== fingerprint ||
-			typeof page !== 'number' || !Number.isSafeInteger(page) || page < 1) throw new Error();
-		return page;
-	} catch {
-		throw new ActiveTsValidationError('Meilisearch cursor is invalid or belongs to a different search.');
-	}
-}
-
-function cursorForPage(page: number, fingerprint: string) {
-	return Buffer.from(JSON_STRINGIFY(cloneJsonTransportPayload({ v: 1, kind: 'meilisearch', page, fingerprint })), 'utf8').toString('base64url');
-}
-
-function cursorFingerprint(value: unknown): string {
-	function canonical(input: any): string {
-		if (input === null || typeof input === 'string' || typeof input === 'boolean' ||
-			(typeof input === 'number' && Number.isFinite(input))) return JSON_STRINGIFY(input);
-		if (Array.isArray(input)) {
-			const entries: string[] = [];
-			for (let index = 0; index < input.length; index++) entries.push(canonical(input[index]));
-			return `[${entries.join(',')}]`;
-		}
-		if (input && typeof input === 'object') {
-			let entries = '';
-			for (const key of Object.keys(input).sort()) {
-				if (entries) entries += ',';
-				entries += `${JSON_STRINGIFY(key)}:${canonical(input[key])}`;
-			}
-			return `{${entries}}`;
-		}
-		throw new ActiveTsValidationError('Meilisearch search parameters must be JSON data.');
-	}
-	return createHash('sha256').update(canonical(value)).digest('base64url');
-}
 
 function nativeOptions(value: unknown) {
 	if (value === undefined) return {};
@@ -274,8 +233,8 @@ export async function createMeilisearchSearchAdapter(input: MeilisearchOptions =
 			const name = indexName(model);
 			const request = cloneJsonTransportPayload({ ...native, hitsPerPage,
 				...(fields.length ? { attributesToSearchOn: fields } : {}), attributesToRetrieve: retrieve }, 'Meilisearch search request') as Record<string, unknown>;
-			const fingerprint = cursorFingerprint(cloneJsonTransportPayload({ indexName: name, query: safeQuery, idField: model.idField, request }));
-			const page = pageFromCursor(searchOptions.cursor, fingerprint);
+			const fingerprint = searchCursorFingerprint(cloneJsonTransportPayload({ indexName: name, query: safeQuery, idField: model.idField, request }));
+			const page = searchPageFromCursor(searchOptions.cursor, fingerprint, 'meilisearch') ?? 1;
 			if (!fields.length && searchOptions.native === undefined) return { list: [], more: false, count: 0 };
 			const index = indexMethods(name);
 			// Search-only API keys cannot read index metadata; validate each returned identity below.
@@ -300,7 +259,7 @@ export async function createMeilisearchSearchAdapter(input: MeilisearchOptions =
 			const more = hitsPerPage > 0 && page < totalPages;
 			if (more && !list.length) throw new ActiveTsValidationError('Meilisearch returned an empty page before its final page.');
 			// estimatedTotalHits is approximate; even page-mode totals are bounded by maxTotalHits.
-			return { list, count: list.length, more, ...(more ? { cursor: cursorForPage(page + 1, fingerprint) } : {}) };
+			return { list, count: list.length, more, ...(more ? { cursor: searchCursorForPage(page + 1, fingerprint, 'meilisearch') } : {}) };
 		},
 		async index(model, id: EntityId, data: unknown, writeOptions = {}) {
 			model = snapshotSearchAdapterModel(model, 'Meilisearch model metadata', 'meilisearch');

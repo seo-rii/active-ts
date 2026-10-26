@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { searchPageFromCursor, searchCursorForPage, searchCursorFingerprint } from '../../core/search-cursor.js';
 import { optionalImport } from '../../core/optional-import.js';
 import { JSON_PARSE, JSON_STRINGIFY } from '../../core/json-intrinsics.js';
 import { ActiveTsConfigurationError, ActiveTsValidationError } from '../../core/errors.js';
@@ -87,48 +87,6 @@ function uniqueStrings(values: readonly string[]) {
 	return result;
 }
 
-function pageFromCursor(cursor: string | undefined, fingerprint: string) {
-	if (cursor === undefined) return undefined;
-	try {
-		if (!/^[A-Za-z0-9_-]+$/.test(cursor)) throw new Error();
-		const decoded = JSON_PARSE(Buffer.from(cursor, 'base64url').toString('utf8'));
-		const page = ownResponseValue(decoded, 'page');
-		if (ownResponseValue(decoded, 'v') !== 1 || ownResponseValue(decoded, 'kind') !== 'algolia' ||
-			ownResponseValue(decoded, 'fingerprint') !== fingerprint ||
-			typeof page !== 'number' || !Number.isSafeInteger(page) || page < 0) throw new Error();
-		return page;
-	} catch {
-		throw new ActiveTsValidationError('Algolia cursor is invalid or belongs to a different search.');
-	}
-}
-
-function cursorForPage(page: number, fingerprint: string) {
-	return Buffer.from(JSON_STRINGIFY(cloneJsonTransportPayload({ v: 1, kind: 'algolia', page, fingerprint })), 'utf8')
-		.toString('base64url');
-}
-
-// Input is an owned JSON transport snapshot. Preserve array order, normalize object key order.
-function cursorFingerprint(value: unknown): string {
-	function canonical(input: any): string {
-		if (input === null || typeof input === 'string' || typeof input === 'boolean' ||
-			(typeof input === 'number' && Number.isFinite(input))) return JSON_STRINGIFY(input);
-		if (Array.isArray(input)) {
-			const entries: string[] = [];
-			for (let index = 0; index < input.length; index++) entries.push(canonical(input[index]));
-			return `[${entries.join(',')}]`;
-		}
-		if (input && typeof input === 'object') {
-			let entries = '';
-			for (const key of Object.keys(input).sort()) {
-				if (entries) entries += ',';
-				entries += `${JSON_STRINGIFY(key)}:${canonical(input[key])}`;
-			}
-			return `{${entries}}`;
-		}
-		throw new ActiveTsValidationError('Algolia search parameters must be JSON data.');
-	}
-	return createHash('sha256').update(canonical(value)).digest('base64url');
-}
 
 function algoliaNativeOptions(native: unknown) {
 	if (native === undefined) return undefined;
@@ -195,8 +153,8 @@ export async function createAlgoliaSearchAdapter(options: AlgoliaOptions = {}): 
 			const request = cloneJsonTransportPayload({
 				indexName: indexName(model.name), searchParams
 			}, 'Algolia search request') as { indexName: string; searchParams: Record<string, unknown> };
-			const fingerprint = cursorFingerprint({ idField, request });
-			const requestedPage = pageFromCursor(searchOptions.cursor, fingerprint);
+			const fingerprint = searchCursorFingerprint({ idField, request });
+			const requestedPage = searchPageFromCursor(searchOptions.cursor, fingerprint, 'algolia');
 			if (requestedPage !== undefined) request.searchParams.page = requestedPage;
 			const res = await client.searchSingleIndex(request);
 			const page = algoliaOptionalNonNegativeInteger(ownResponseValue(res, 'page'), 'Algolia search response page');
@@ -212,7 +170,7 @@ export async function createAlgoliaSearchAdapter(options: AlgoliaOptions = {}): 
 			}
 			return {
 				list,
-				cursor: more && page !== undefined ? cursorForPage(page + 1, fingerprint) : undefined,
+				cursor: more && page !== undefined ? searchCursorForPage(page + 1, fingerprint, 'algolia') : undefined,
 				more,
 				count: list.length,
 				total
