@@ -45,3 +45,12 @@ test('custom key inputs retain opaque object methods and default keys reject acc
 	await assert.rejects(guarded.get({ get id() { getterCalls++; return 1; } }), /JSON-like inputs/);
 	assert.equal(getterCalls, 0);
 });
+
+test('plain input snapshots use captured WeakMap methods', async () => {
+	const get = WeakMap.prototype.get, set = WeakMap.prototype.set;
+	const cache = createFunctionCache({ prefix: 'input-snapshot-intrinsics', cache: false, factory: (input: { id: number }) => input.id });
+	WeakMap.prototype.get = function () { throw new Error('patched get'); };
+	WeakMap.prototype.set = function () { throw new Error('patched set'); };
+	try { assert.equal(await cache.get({ id: 1 }), 1); }
+	finally { WeakMap.prototype.get = get; WeakMap.prototype.set = set; }
+});

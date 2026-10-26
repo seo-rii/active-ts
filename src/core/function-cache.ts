@@ -983,7 +983,7 @@ function stableInputKey(input: unknown) {
 
 function snapshotFunctionCacheInput<T>(input: T, seen = new WeakMap<object, unknown>()): T {
 	if (input === null || typeof input !== 'object') return input;
-	const existing = seen.get(input);
+	const existing = WEAKMAP_GET.call(seen, input);
 	if (existing !== undefined) return existing as T;
 	const prototype = Object.getPrototypeOf(input);
 	// Custom key resolvers can accept opaque objects. Their identity/prototype is
@@ -992,7 +992,7 @@ function snapshotFunctionCacheInput<T>(input: T, seen = new WeakMap<object, unkn
 	const copy: any = input instanceof Date
 		? new Date(DATE_GET_TIME.call(input))
 		: Array.isArray(input) ? [] : Object.create(prototype);
-	seen.set(input, copy);
+	WEAKMAP_SET.call(seen, input, copy);
 	for (const key of Reflect.ownKeys(input)) {
 		const descriptor = Object.getOwnPropertyDescriptor(input, key)!;
 		if ('value' in descriptor) descriptor.value = snapshotFunctionCacheInput(descriptor.value, seen);
