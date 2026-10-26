@@ -481,7 +481,7 @@ with a native-only query body against the service container.
 
 `runStoreAdapterDifferentialContract(adapter, { seed })` compares a disposable adapter with a fresh Memory store (or a supplied `reference`). It generates deterministic Unicode, mixed-scalar, null/missing, finite-average and pagination cases. The result reports executed and skipped capability-dependent cases; failures identify the seed and case. `createStoreParityFixture(seed)` exposes the same generated rows and plans for backend-specific harnesses. Use disposable integration resources: inserted rows are removed, while table/collection cleanup remains the harness's responsibility. The default model name is unique per run.
 
-```ts
+```ts doc-test=fragment
 import { runStoreAdapterDifferentialContract } from 'active-ts/testing';
 await runStoreAdapterDifferentialContract(sqliteStore, { seed: 17 });
 ```

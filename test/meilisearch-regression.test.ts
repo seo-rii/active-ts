@@ -229,7 +229,7 @@ test('Meilisearch snapshots write payloads before asynchronous metadata lookup',
 
 test('Meilisearch avoids Unicode ID collisions and validates ancestor identity on reads/deletes', async () => {
 	const fixture = fake(); const adapter = await createMeilisearchSearchAdapter({ client: fixture.client });
-	for (const id of ['\ud800', '\ud801', '\ufffd', '한글/문서']) await adapter.index(metadata(), id, { slug: id, title: 'shared' });
+	for (const id of ['\u{10000}', '\u{10001}', '\ufffd', '한글/문서']) await adapter.index(metadata(), id, { slug: id, title: 'shared' });
 	assert.equal(fixture.docs.size, 4);
 	const model = metadata({ datastore: { ancestorFields: ['parentId'], ancestor: ({ data }) => data ? datastoreKey('parent', data.parentId) : undefined } });
 	await adapter.index(model, 1, { slug: 1, title: 'ancestor', parentId: 10 });
