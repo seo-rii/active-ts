@@ -49,3 +49,4 @@ export {
 export * from './adapters/cache/memory.js';
 export * from './adapters/store/memory.js';
 export * from './adapters/search/memory.js';
+export type { MemoryCacheOptions } from './adapters/cache/memory.js';

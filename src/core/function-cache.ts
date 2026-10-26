@@ -49,7 +49,7 @@ export type FunctionCacheOptions<TInput, TValue> = {
 	context?: ActiveContext;
 	cache?: CacheAdapter | string | false;
 	ttl?: number;
-	memory?: false | { ttl?: number; maxEntries?: number };
+	memory?: false | { ttl?: number; maxEntries?: number; sweepSize?: number };
 	singleFlight?: boolean;
 	staleWhileRevalidate?: number;
 	consistency?: 'local' | 'distributed';
@@ -94,7 +94,7 @@ const FUNCTION_CACHE_OPTION_KEYS = [
 	'staleWhileRevalidate',
 	'consistency'
 ] as const;
-const FUNCTION_CACHE_MEMORY_OPTION_KEYS = ['ttl', 'maxEntries'] as const;
+const FUNCTION_CACHE_MEMORY_OPTION_KEYS = ['ttl', 'maxEntries', 'sweepSize'] as const;
 const FUNCTION_CACHE_GET_OPTION_KEYS = ['refresh'] as const;
 const FUNCTION_CACHE_INVALIDATION_EPOCH_LIMIT = 4096;
 const functionCacheInvalidationEpochs = new Map<string, number>();
@@ -116,6 +116,7 @@ export class ActiveFunctionCache<TInput, TValue> {
 	};
 
 	private readonly memory = new Map<string, MemoryEntry<TValue>>();
+	private memorySweepIterator?: IterableIterator<[string, MemoryEntry<TValue>]>;
 	private readonly inFlight = new Map<string, Promise<TValue>>();
 	private readonly options: FunctionCacheOptions<TInput, TValue>;
 
@@ -125,7 +126,10 @@ export class ActiveFunctionCache<TInput, TValue> {
 		if (typeof this.options.namespace === 'string') assertSafeSchemaIdentifier(this.options.namespace, 'function cache namespace');
 		assertSafeTtl(this.options.ttl, 'function cache ttl');
 		if (this.options.memory) assertSafeTtl(this.options.memory.ttl, 'function cache memory ttl');
-		if (this.options.memory) assertSafeMaxEntries(this.options.memory.maxEntries);
+		if (this.options.memory) {
+			assertSafeMaxEntries(this.options.memory.maxEntries);
+			assertSafeMaxEntries(this.options.memory.sweepSize, 'function cache memory sweepSize');
+		}
 		assertSafeTtl(this.options.staleWhileRevalidate, 'function cache staleWhileRevalidate');
 	}
 
@@ -286,6 +290,7 @@ export class ActiveFunctionCache<TInput, TValue> {
 
 	clearMemory() {
 		MAP_CLEAR.call(this.memory);
+		this.memorySweepIterator = undefined;
 	}
 
 	snapshotMemory(): Record<string, { value: TValue; expires?: number }> {
@@ -528,6 +533,7 @@ export class ActiveFunctionCache<TInput, TValue> {
 	}
 
 	private memoryGet(key: string, options: { allowStale?: boolean } = {}): { found: boolean; stale: boolean; value?: TValue } {
+		this.sweepMemory();
 		const entry = MAP_GET.call(this.memory, key) as MemoryEntry<TValue> | undefined;
 		if (!entry) return { found: false, stale: false };
 		if (entry.epoch !== this.invalidationEpoch(key)) {
@@ -544,9 +550,22 @@ export class ActiveFunctionCache<TInput, TValue> {
 		return { found: true, stale: false, value: cloneFunctionCacheValue(entry.value) };
 	}
 
+	private sweepMemory() {
+		const now = Date.now();
+		this.memorySweepIterator ??= MAP_ENTRIES.call(this.memory) as IterableIterator<[string, MemoryEntry<TValue>]>;
+		for (let count = 0; count < (this.options.memory === false ? 0 : this.options.memory?.sweepSize ?? 16); count++) {
+			const next = this.memorySweepIterator.next();
+			if (next.done) { this.memorySweepIterator = undefined; break; }
+			const [key, entry] = next.value;
+			const expiry = entry.staleUntil ?? entry.expires;
+			if (entry.epoch !== this.invalidationEpoch(key) || (expiry !== undefined && expiry <= now)) MAP_DELETE.call(this.memory, key);
+		}
+	}
+
 	private memorySet(key: string, value: TValue) {
 		if (this.options.memory === false || this.options.consistency === 'distributed') return;
 		assertCacheableValue(value);
+		this.sweepMemory();
 		const ttl = this.options.memory?.ttl ?? this.options.ttl;
 		const expires = ttl === undefined ? undefined : Date.now() + ttl * 1000;
 		const staleUntil =
@@ -671,10 +690,10 @@ function validateNamespace(namespace: unknown) {
 	return assertSafeSchemaIdentifier(namespace, 'function cache namespace');
 }
 
-function assertSafeMaxEntries(maxEntries: number | undefined) {
+function assertSafeMaxEntries(maxEntries: number | undefined, context = 'function cache memory maxEntries') {
 	if (maxEntries === undefined) return;
 	if (!Number.isSafeInteger(maxEntries) || maxEntries <= 0) {
-		throw new ActiveTsValidationError('function cache memory maxEntries must be a positive safe integer.');
+		throw new ActiveTsValidationError(`${context} must be a positive safe integer.`);
 	}
 }
 
@@ -727,7 +746,8 @@ function normalizeFunctionCacheOptions(value: unknown): FunctionCacheOptions<unk
 		assertKnownFunctionCacheOptionKeys(memoryOptions, FUNCTION_CACHE_MEMORY_OPTION_KEYS, 'function cache memory options');
 		normalizedMemory = {
 			ttl: ownOptionValue(memoryOptions, 'ttl', 'function cache memory options') as number | undefined,
-			maxEntries: ownOptionValue(memoryOptions, 'maxEntries', 'function cache memory options') as number | undefined
+			maxEntries: ownOptionValue(memoryOptions, 'maxEntries', 'function cache memory options') as number | undefined,
+			sweepSize: ownOptionValue(memoryOptions, 'sweepSize', 'function cache memory options') as number | undefined
 		};
 	}
 	if (singleFlight !== undefined && typeof singleFlight !== 'boolean') {
