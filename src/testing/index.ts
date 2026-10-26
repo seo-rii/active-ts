@@ -4418,15 +4418,17 @@ export function createIntegrationHarness<TResource = unknown>(
 			const handle = await api.createContext();
 			let result: T | undefined;
 			let runError: unknown;
+			let runFailed = false;
 			try {
 				result = await withTestContext(handle.context, fn, withOptions);
 			} catch (error) {
 				runError = error;
+				runFailed = true;
 			}
 			try {
 				await handle.close();
 			} catch (closeError) {
-				if (runError) {
+				if (runFailed) {
 					throw new AggregateError(
 						[runError, closeError],
 						`Integration harness "${harness.name}" failed while running withContext and cleanup failed.`
@@ -4434,40 +4436,46 @@ export function createIntegrationHarness<TResource = unknown>(
 				}
 				throw closeError;
 			}
-			if (runError) throw runError;
+			if (runFailed) throw runError;
 			return result as T;
 		},
 		async runStoreContract(options: StoreAdapterContractOptions = {}) {
 			const contractOptions = normalizeStoreAdapterContractOptions(options);
 			let resource: TResource | undefined;
 			let contractError: unknown;
+			let contractFailed = false;
 			let stopError: unknown;
+			let stopFailed = false;
 			try {
 				resource = harness.start ? await harness.start() : undefined;
 				await runStoreAdapterContract(await harness.createStore(resource), contractOptions);
 			} catch (error) {
 				contractError = error;
+				contractFailed = true;
 			}
 			if (harness.stop) {
 				try {
 					await harness.stop(resource);
 				} catch (error) {
 					stopError = error;
+					stopFailed = true;
 				}
 			}
-			if (contractError && stopError) {
+			if (contractFailed && stopFailed) {
 				throw new AggregateError(
 					[contractError, stopError],
 					`Integration harness "${harness.name}" failed to run the store contract and cleanup failed.`
 				);
 			}
-			if (contractError) throw contractError;
-			if (stopError) throw stopError;
+			if (contractFailed) throw contractError;
+			if (stopFailed) throw stopError;
 		},
 		async runCacheContract() {
 			let resource: TResource | undefined;
 			let contractError: unknown;
+			let contractFailed = false;
 			let stopError: unknown;
+			let stopFailed = false;
 			try {
 				resource = harness.start ? await harness.start() : undefined;
 				if (!harness.createCache) {
@@ -4484,28 +4492,32 @@ export function createIntegrationHarness<TResource = unknown>(
 				await runCacheAdapterContract(cache);
 			} catch (error) {
 				contractError = error;
+				contractFailed = true;
 			}
 			if (harness.stop) {
 				try {
 					await harness.stop(resource);
 				} catch (error) {
 					stopError = error;
+					stopFailed = true;
 				}
 			}
-			if (contractError && stopError) {
+			if (contractFailed && stopFailed) {
 				throw new AggregateError(
 					[contractError, stopError],
 					`Integration harness "${harness.name}" failed to run the cache contract and cleanup failed.`
 				);
 			}
-			if (contractError) throw contractError;
-			if (stopError) throw stopError;
+			if (contractFailed) throw contractError;
+			if (stopFailed) throw stopError;
 		},
 		async runSearchContract(options: SearchAdapterContractOptions = {}) {
 			const contractOptions = normalizeSearchAdapterContractOptions(options);
 			let resource: TResource | undefined;
 			let contractError: unknown;
+			let contractFailed = false;
 			let stopError: unknown;
+			let stopFailed = false;
 			try {
 				resource = harness.start ? await harness.start() : undefined;
 				if (!harness.createSearch) {
@@ -4522,22 +4534,24 @@ export function createIntegrationHarness<TResource = unknown>(
 				await runSearchAdapterContract(search, contractOptions);
 			} catch (error) {
 				contractError = error;
+				contractFailed = true;
 			}
 			if (harness.stop) {
 				try {
 					await harness.stop(resource);
 				} catch (error) {
 					stopError = error;
+					stopFailed = true;
 				}
 			}
-			if (contractError && stopError) {
+			if (contractFailed && stopFailed) {
 				throw new AggregateError(
 					[contractError, stopError],
 					`Integration harness "${harness.name}" failed to run the search contract and cleanup failed.`
 				);
 			}
-			if (contractError) throw contractError;
-			if (stopError) throw stopError;
+			if (contractFailed) throw contractError;
+			if (stopFailed) throw stopError;
 		}
 	};
 	return api;
