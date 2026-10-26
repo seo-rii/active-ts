@@ -364,17 +364,8 @@ export class ActiveTestContext {
 		resetLazyLoadWarnings();
 		this.previousContext = getCurrentDefaultContext();
 		this.previousWarn = console.warn;
-		if (this.warningMode === 'capture') {
-			console.warn = (message?: any, ...args: any[]) => {
-				const text = formatWarningArgs([message, ...args]);
-				this.warnings.push(text);
-			};
-		} else if (this.warningMode === 'throw') {
-			console.warn = (message?: any, ...args: any[]) => {
-				const text = formatWarningArgs([message, ...args]);
-				this.warnings.push(text);
-				throw new Error(text);
-			};
+		if (this.warningMode === 'capture' || this.warningMode === 'throw') {
+			console.warn = lazyWarningCapture(this.warnings, this.previousWarn, this.warningMode === 'throw');
 		}
 		setDefaultContext(this.context);
 		ActiveTestContext.installedContext = this;
@@ -592,9 +583,7 @@ export async function captureLazyLoadWarnings<T>(fn: () => MaybePromise<T>) {
 	const originalWarn = console.warn;
 	lazyWarningCaptureActive = true;
 	resetLazyLoadWarnings();
-	console.warn = (message?: any, ...args: any[]) => {
-		warnings.push(formatWarningArgs([message, ...args]));
-	};
+	console.warn = lazyWarningCapture(warnings, originalWarn);
 	try {
 		const result = await fn();
 		return { result, warnings };
@@ -603,6 +592,18 @@ export async function captureLazyLoadWarnings<T>(fn: () => MaybePromise<T>) {
 		lazyWarningCaptureActive = false;
 		resetLazyLoadWarnings();
 	}
+}
+
+function lazyWarningCapture(warnings: string[], forward: typeof console.warn, throwOnWarning = false): typeof console.warn {
+	return (message?: any, ...args: any[]) => {
+		if (typeof message !== 'string' || !message.startsWith('active-ts lazy relation "')) {
+			forward.call(console, message, ...args);
+			return;
+		}
+		const text = formatWarningArgs([message, ...args]);
+		warnings.push(text);
+		if (throwOnWarning) throw new Error(text);
+	};
 }
 
 function formatWarningArgs(args: unknown[]) {
