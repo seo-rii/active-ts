@@ -173,15 +173,16 @@ function indexDefinitions(model: ResolvedModelMeta, index: ResolvedModelMeta['in
 		legacyKeys.push(`${field.typeKey}${direction}`, `coalesce(${field.value}, 'null')${direction}`);
 		lookupKeys.push(`${field.typeKey}${direction}`, `${field.comparisonValue}${direction}`);
 	}
-	const definitions: { name: string; sql: string }[] = [];
-	if (index.unique) {
-		// Keep the original uniqueness representation and physical name for
-		// existing databases. The lookup index is an additive schema upgrade.
-		const name = `active_ts_${hash}`;
-		definitions.push({ name, sql: `CREATE UNIQUE INDEX ${quote(name)} ON ${table(model)} (${legacyKeys.join(', ')})` });
-	}
+	// Validate retained legacy indexes even for nonunique declarations so a
+	// model cannot silently disagree with a still-enforced unique constraint.
+	const legacyName = `active_ts_${hash}`;
+	const definitions = [{
+		name: legacyName,
+		sql: `CREATE ${index.unique ? 'UNIQUE ' : ''}INDEX ${quote(legacyName)} ON ${table(model)} (${legacyKeys.join(', ')})`,
+		required: index.unique === true
+	}];
 	const name = `active_ts_lookup_v1_${hash}`;
-	definitions.push({ name, sql: `CREATE INDEX ${quote(name)} ON ${table(model)} (${lookupKeys.join(', ')})` });
+	definitions.push({ name, sql: `CREATE INDEX ${quote(name)} ON ${table(model)} (${lookupKeys.join(', ')})`, required: true });
 	return definitions;
 }
 
@@ -297,7 +298,7 @@ export async function createSqliteStoreAdapter(input: SqliteStoreOptions = {}): 
 				let missing = false;
 				for (const physical of indexDefinitions(model, index)) {
 					const found = get('select type, tbl_name, sql from sqlite_schema where name = ? collate nocase', [physical.name]);
-					if (found === undefined) missing = true;
+					if (found === undefined) { if (physical.required) missing = true; }
 					else if (found.type !== 'index' || found.tbl_name !== model.name || found.sql !== physical.sql) {
 						throw new ActiveTsConfigurationError(`SQLite existing index "${physical.name}" has an incompatible owner or definition.`);
 					}
@@ -512,7 +513,7 @@ export async function createSqliteStoreAdapter(input: SqliteStoreOptions = {}): 
 								}
 							}
 							for (const physical of indexDefinitions(model, index)) {
-								if (!get('select 1 from sqlite_schema where name = ? collate nocase', [physical.name])) exec(physical.sql);
+								if (physical.required && !get('select 1 from sqlite_schema where name = ? collate nocase', [physical.name])) exec(physical.sql);
 							}
 						}
 					}

@@ -623,6 +623,40 @@ test('SQLite declared indexes serve generated scalar equality and range predicat
 	} finally { DatabaseSync.prototype.prepare = original; await store.close(); database.close(); }
 });
 
+test('SQLite rejects removing declared uniqueness while the retained constraint remains', async () => {
+	for (const legacyOnly of [false, true]) {
+		for (const unique of [false, undefined]) {
+			const database = new DatabaseSync(':memory:');
+			const store = await createSqliteStoreAdapter({ database });
+			const model = metadata('active_sqlite_unique_drift', {
+				indexes: [{ name: 'email', fields: ['email'], unique: true }]
+			});
+			try {
+				await store.schema!.apply([model], { mode: 'safe' });
+				if (legacyOnly) {
+					const lookup = database.prepare("select name from sqlite_schema where name like 'active_ts_lookup_v1_%'").get()!;
+					database.exec(`DROP INDEX "${lookup.name}"`);
+				}
+				await store.create(model, 1, { id: 1, email: 'same' });
+				const changed = { ...model, indexes: [{ name: 'email', fields: ['email'], ...(unique === undefined ? {} : { unique }) }] };
+				await assert.rejects(() => store.schema!.plan([changed]), /existing index .* incompatible owner or definition/);
+				await assert.rejects(() => store.schema!.apply([changed], { mode: 'safe' }), /existing index .* incompatible owner or definition/);
+				await assert.rejects(() => store.create(model, 2, { id: 2, email: 'same' }), ActiveTsConflictError);
+				await store.schema!.apply([model], { mode: 'safe' });
+				assert.deepEqual((await store.schema!.plan([model])).changes, []);
+			} finally { await store.close(); database.close(); }
+		}
+	}
+	const store = await createSqliteStoreAdapter();
+	const model = metadata('active_sqlite_nonunique', { indexes: [{ name: 'email', fields: ['email'], unique: false }] });
+	try {
+		await store.schema!.apply([model], { mode: 'safe' });
+		await store.create(model, 1, { id: 1, email: 'same' });
+		await store.create(model, 2, { id: 2, email: 'same' });
+		assert.deepEqual((await store.schema!.plan([model])).changes, []);
+	} finally { await store.close(); }
+});
+
 test('SQLite upgrades legacy unique indexes additively and preserves their constraints', async () => {
 	const database = new DatabaseSync(':memory:');
 	const store = await createSqliteStoreAdapter({ database });
