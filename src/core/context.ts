@@ -1837,42 +1837,66 @@ export class ActiveContext {
 				this.assertTransactionOpen('load by id from store');
 				assertModelConstructor(model, 'loadByIdFresh model');
 				assertSafeEntityId(id, 'loadByIdFresh id');
+				return (await this.loadManyFresh(model, [id], operation, options))[0] ?? null;
+			}
+		));
+	}
+
+	loadManyFresh<TModel>(
+		model: ModelConstructor<TModel>,
+		ids: EntityId[],
+		operation?: ActiveTsHookPayload['operation'],
+		options?: StoreReadOptions
+	): Promise<Array<TModel | null>> {
+		return contextOperationPromise(() => this.runTrackedScopedOperation(
+			'load models from store',
+			(scoped) => scoped.loadManyFresh(model, ids, operation, options),
+			async () => {
+				this.assertTransactionOpen('load models from store');
+				assertModelConstructor(model, 'loadManyFresh model');
+				ids = assertSafeEntityIdArray(ids, 'loadManyFresh ids');
 				const meta = this.meta(model);
 				assertDirectIdReadAllowed(meta);
 				const store = this.internalStore(meta.store);
 				const safeOptions = options === undefined
 					? undefined
-					: normalizeStoreReadOptions(options, 'loadByIdFresh store read options');
+					: normalizeStoreReadOptions(options, 'loadManyFresh store read options');
 				if (safeOptions !== undefined) {
-					assertContextStoreReadOptionsSupported(store, safeOptions, 'loadByIdFresh store read options');
+					assertContextStoreReadOptionsSupported(store, safeOptions, 'loadManyFresh store read options');
 				}
 				const readPolicy = safeOptions?.meta !== undefined &&
 					Object.prototype.hasOwnProperty.call(safeOptions.meta, 'datastoreRead')
 					? normalizeDatastoreReadPolicy(
 							safeOptions.meta.datastoreRead,
-							'loadByIdFresh store read options.meta.datastoreRead'
+							'loadManyFresh store read options.meta.datastoreRead'
 						)
 					: undefined;
-				await this.runHooks('beforeRead', { model: meta, ids: [id], operation: 'read' });
-				let loaded = sanitizeReadResult(
-					await store.getMany(meta, [id], safeOptions),
-					[id],
-					meta.idField,
-					`Store adapter "${store.kind}" getMany`
-				);
-				const afterRead = await this.runHooks('afterRead', {
-					model: meta,
-					ids: [id],
-					result: loaded,
-					operation: 'read'
-				});
-				loaded = sanitizeReadResult(afterRead.result, [id], meta.idField, 'afterRead');
-				const item = this.instantiate(model, loaded[0] ?? null);
-				if (item) {
-					if (readPolicy?.readTime !== undefined) markDatastoreHistoricalModel(item as object, readPolicy.readTime);
-					await this.runAfterInstantiateHooks(meta, item as any, operation);
+				const result: Array<TModel | null> = [];
+				for (const chunk of chunkItems(ids, this.maxBatchSize)) {
+					await this.runHooks('beforeRead', { model: meta, ids: chunk, operation: 'read' });
+					let loaded = sanitizeReadResult(
+						await store.getMany(meta, chunk, safeOptions),
+						chunk,
+						meta.idField,
+						`Store adapter "${store.kind}" getMany`
+					);
+					const afterRead = await this.runHooks('afterRead', {
+						model: meta,
+						ids: chunk,
+						result: loaded,
+						operation: 'read'
+					});
+					loaded = sanitizeReadResult(afterRead.result, chunk, meta.idField, 'afterRead');
+					for (let index = 0; index < loaded.length; index++) {
+						const item = this.instantiate(model, loaded[index]);
+						if (item) {
+							if (readPolicy?.readTime !== undefined) markDatastoreHistoricalModel(item as object, readPolicy.readTime);
+							await this.runAfterInstantiateHooks(meta, item as any, operation);
+						}
+						result[result.length] = item as TModel | null;
+					}
 				}
-				return item as TModel | null;
+				return result;
 			}
 		));
 	}

@@ -2586,11 +2586,7 @@ export class SearchBuilder<TModel extends { data: any }, TIncludes extends boole
 				}
 				const expectedIds = modelResultSnapshots(meta, list, 'afterSearch original result', { searchIdentityMeta: adapterMeta });
 				if (includes.length) {
-					const includeTasks: Array<Promise<void> | void> = [];
-					for (let index = 0; index < list.length; index++) {
-						includeTasks[index] = (list[index] as any).include(...includes);
-					}
-					await Promise.all(includeTasks);
+					await preloadIncludes(context, this.model, list, includes);
 					validateModelResultIdentities(context, meta, list, expectedIds, 'afterRelationLoad search result');
 				}
 				const result = { ...raw, list, count: list.length, total: staleHits ? undefined : raw.total };
@@ -2667,11 +2663,7 @@ export class SearchBuilder<TModel extends { data: any }, TIncludes extends boole
 			this.rememberSearchHitId(meta, idsByKey, id, hit);
 		}
 		const ids = iterableToArray(MAP_VALUES.call(idsByKey) as Iterable<EntityId>);
-		const loadTasks: Array<Promise<any>> = [];
-		for (let index = 0; index < ids.length; index++) {
-			loadTasks[index] = context.loadByIdFresh(this.model, ids[index], 'search');
-		}
-		const loaded = await Promise.all(loadTasks);
+		const loaded = await context.loadManyFresh(this.model, ids, 'search');
 		const list: TModel[] = [];
 		for (const item of loaded) {
 			if (item && (!revalidatePlan || filterRows([item.data], revalidatePlan, meta.idField).length)) {

@@ -5610,3 +5610,56 @@ test('remote search adapters reject undefined transport values before SDK calls'
 	);
 	assert.equal(elasticPayloads.length, 1);
 });
+
+
+test('search includes batch fresh owners and shared relations within max batch size', async () => {
+	const store = new MemoryStoreAdapter();
+	const memory = new MemorySearchAdapter();
+	const batches: Array<{ model: string; ids: Array<string | number> }> = [];
+	const getMany = store.getMany.bind(store);
+	store.getMany = async (model, ids) => {
+		batches.push({ model: model.name, ids: [...ids] });
+		return getMany(model, ids);
+	};
+	const context = createActiveTs({ stores: { default: store }, search: { memory }, defaultSearch: 'memory', batch: { maxSize: 2 } });
+	const Article = SearchIncludeArticle.use(context) as typeof SearchIncludeArticle;
+	const meta = context.meta(SearchIncludeArticle);
+	await store.seed(context.meta(SearchIncludeAuthor), [{ id: 10, name: 'Ada' }]);
+	const rows = [1, 2, 3].map((id) => ({ id, authorId: 10, title: 'batched search', body: `full ${id}` }));
+	await store.seed(meta, rows);
+	for (const row of rows) await memory.index(meta, row.id, row);
+	const result = await Article.search('batched').include('author').load();
+	assert.deepEqual(result.list.map((row) => row.data.body), ['full 1', 'full 2', 'full 3']);
+	assert.deepEqual(batches.filter((batch) => batch.model === meta.name).map((batch) => batch.ids), [[1, 2], [3]]);
+	// Existing loaders may repeat a shared ID across chunks; deduplicating it further is compatible.
+	assert.ok(batches.filter((batch) => batch.model === context.meta(SearchIncludeAuthor).name).length <= 2);
+	const related = await Promise.all(result.list.map((row) => row.ref<SearchIncludeAuthor>('author').load()));
+	assert.deepEqual(related.map((author) => (author as SearchIncludeAuthor).data.name), ['Ada', 'Ada', 'Ada']);
+	assert.equal(new Set(related).size, 3);
+	assert.ok(batches.length <= 4);
+});
+
+
+test('search hasMany includes issue one relation query for all result owners', async () => {
+	class Parent extends Model<{ id: number; title: string }> {}
+	class Child extends Model<{ id: number; parentId: number }> {}
+	defineModel<{ id: number; parentId: number }>('search_batch_child').id('id').attach(Child);
+	defineModel<{ id: number; title: string }>({ name: 'search_batch_parent', search: 'memory' }).id('id')
+		.search('memory', ['title']).hasMany('children', () => Child, { localKey: 'id', foreignKey: 'parentId' }).attach(Parent);
+	const store = new MemoryStoreAdapter();
+	const memory = new MemorySearchAdapter();
+	const context = createActiveTs({ stores: { default: store }, search: { memory }, defaultSearch: 'memory' });
+	const Bound = Parent.use(context) as typeof Parent;
+	const rows = [1, 2, 3].map((id) => ({ id, title: 'many owners' }));
+	await store.seed(context.meta(Parent), rows);
+	await store.seed(context.meta(Child), rows.map(({ id }) => ({ id: id + 10, parentId: id })));
+	for (const row of rows) await memory.index(context.meta(Parent), row.id, row);
+	const result = await Bound.search('many').include('children').load();
+	assert.equal(store.stats.getMany, 1);
+	assert.equal(store.stats.query, 1);
+	for (const row of result.list) {
+		const children = await row.ref<Child>('children').load() as Child[];
+		assert.deepEqual(children.map((child) => child.data.parentId), [row.data.id]);
+	}
+	assert.equal(store.stats.query, 1);
+});
