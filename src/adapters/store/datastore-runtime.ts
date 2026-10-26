@@ -28,6 +28,7 @@ import {
 import { snapshotArrayInput } from '../../core/array-input.js';
 import { aggregateRows, assertAggregateSpecsCompatibleWithModel, normalizeAggregateRow } from '../../core/aggregate.js';
 import { compareRowsBySort, sortWithStableId } from '../../core/cursor.js';
+import { stableSortedCopy } from './datastore-row-sort.js';
 import { entityIdFromCanonicalKey, entityIdFromKey, entityIdKey, filterRows, pickFields, valueFor } from '../../core/query-utils.js';
 import { snapshotAdapterModel } from '../../core/adapter-model.js';
 import {
@@ -2380,21 +2381,7 @@ function createDatastoreAdapter(
 									model.idField
 								);
 								const sort = sortWithStableId(encodedPlan, model.idField);
-								const sortedRows: any[] = [];
-								for (let rowIndex = 0; rowIndex < filteredRows.length; rowIndex++) {
-									const row = filteredRows[rowIndex];
-									let insertAt = sortedRows.length;
-									for (let sortedIndex = 0; sortedIndex < sortedRows.length; sortedIndex++) {
-										if (compareRowsBySort(row, sortedRows[sortedIndex], sort) < 0) {
-											insertAt = sortedIndex;
-											break;
-										}
-									}
-									for (let shift = sortedRows.length; shift > insertAt; shift--) {
-										sortedRows[shift] = sortedRows[shift - 1];
-									}
-									sortedRows[insertAt] = row;
-								}
+								const sortedRows = stableSortedCopy(filteredRows, (left, right) => compareRowsBySort(left, right, sort));
 								filteredRows = sortedRows;
 								filteredRows = offsetDatastoreRows(filteredRows, encodedPlan.offset);
 								let more =
@@ -2911,21 +2898,7 @@ function createDatastoreAdapter(
 				);
 				let filteredRows = filterRows(scanResult.rows, stripFieldCodecQueryOperandMarker(plan), model.idField);
 				const sort = sortWithStableId(plan, model.idField);
-				const sortedRows: any[] = [];
-				for (let rowIndex = 0; rowIndex < filteredRows.length; rowIndex++) {
-					const row = filteredRows[rowIndex];
-					let insertAt = sortedRows.length;
-					for (let sortedIndex = 0; sortedIndex < sortedRows.length; sortedIndex++) {
-						if (compareRowsBySort(row, sortedRows[sortedIndex], sort) < 0) {
-							insertAt = sortedIndex;
-							break;
-						}
-					}
-					for (let shift = sortedRows.length; shift > insertAt; shift--) {
-						sortedRows[shift] = sortedRows[shift - 1];
-					}
-					sortedRows[insertAt] = row;
-				}
+				const sortedRows = stableSortedCopy(filteredRows, (left, right) => compareRowsBySort(left, right, sort));
 				filteredRows = sortedRows;
 				filteredRows = offsetDatastoreRows(filteredRows, plan.offset);
 				let more = scanResult.incomplete;
@@ -3084,21 +3057,7 @@ function createDatastoreAdapter(
 						pageIndex++;
 					}
 					const sort = sortWithStableId(plan, model.idField);
-					const sortedRows: any[] = [];
-					for (let rowIndex = 0; rowIndex < candidateRows.length; rowIndex++) {
-						const row = candidateRows[rowIndex];
-						let insertAt = sortedRows.length;
-						for (let sortedIndex = 0; sortedIndex < sortedRows.length; sortedIndex++) {
-							if (compareRowsBySort(row, sortedRows[sortedIndex], sort) < 0) {
-								insertAt = sortedIndex;
-								break;
-							}
-						}
-						for (let shift = sortedRows.length; shift > insertAt; shift--) {
-							sortedRows[shift] = sortedRows[shift - 1];
-						}
-						sortedRows[insertAt] = row;
-					}
+					const sortedRows = stableSortedCopy(candidateRows, (left, right) => compareRowsBySort(left, right, sort));
 					let filteredRows = offsetDatastoreRows(sortedRows, plan.offset);
 					let more = false;
 					if (plan.limit !== undefined) {
