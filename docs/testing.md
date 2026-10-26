@@ -81,9 +81,12 @@ await expectNoLazyLoadWarnings(async () => {
 });
 ```
 
+Other `console.warn` messages are forwarded unchanged to the original logger;
+they do not fail `expectNoLazyLoadWarnings()` or `throw` mode.
+
 Warning modes:
 
-- `capture` - collect warnings in `ctx.warnings`
+- `capture` - collect active-ts lazy-load warnings in `ctx.warnings`
 - `throw` - throw when a lazy-load warning occurs
 - `console` - leave `console.warn` behavior unchanged
 - `off` - disable lazy-load warnings in the active context
