@@ -17,6 +17,7 @@ import {
 	type StoreAdapter
 } from '../src/index.js';
 import { createSqliteStoreAdapter } from '../src/adapters/store/sqlite.js';
+import { aggregateRows } from '../src/core/aggregate.js';
 import { runStoreAdapterContract } from '../src/testing/index.js';
 
 const emptyPlan: QueryPlan = { where: [], or: [], sort: [], include: [] };
@@ -518,4 +519,22 @@ test('SQLite numeric aggregates preserve finite JavaScript numbers beyond safe i
 		{ op: 'sum', field: 'score', as: 'sum' }, { op: 'avg', field: 'score', as: 'avg' },
 		{ op: 'min', field: 'score', as: 'min' }, { op: 'max', field: 'score', as: 'max' }
 	] }), { sum: score * 2, avg: score, min: score, max: score });
+});
+
+test('SQLite average preserves finite extremes, cancellation and subnormal residues', async (t) => {
+	const { store, model } = await fixture(t);
+	const spec = [{ op: 'avg' as const, field: 'score', as: 'mean' }];
+	const cases = [
+		[1e308, 1e308], [-1e308, -1e308], [Number.MAX_VALUE, Number.MAX_VALUE],
+		[1e308, 1, -1e308], [Number.MIN_VALUE, Number.MIN_VALUE],
+		[1e308, Number.MIN_VALUE * 4, -1e308], [], [null, null]
+	];
+	let id = 0;
+	for (const [group, values] of cases.entries()) {
+		const rows = values.map((score) => ({ id: id++, group, score }));
+		for (const row of rows) await store.create(model, row.id, row);
+		assert.deepEqual(await store.aggregate!(model, {
+			where: [{ field: 'group', op: '=', value: group }], or: [], aggregates: spec
+		}), aggregateRows(rows, spec));
+	}
 });
