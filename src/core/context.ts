@@ -1873,7 +1873,7 @@ export class ActiveContext {
 					: undefined;
 				const result: Array<TModel | null> = [];
 				for (const chunk of chunkItems(ids, this.maxBatchSize)) {
-					await this.runHooks('beforeRead', { model: meta, ids: chunk, operation: 'read' });
+					await this.runHooks('beforeRead', { model: meta, ids: cloneArray(chunk), operation: 'read' });
 					let loaded = sanitizeReadResult(
 						await store.getMany(meta, chunk, safeOptions),
 						chunk,
@@ -1882,7 +1882,7 @@ export class ActiveContext {
 					);
 					const afterRead = await this.runHooks('afterRead', {
 						model: meta,
-						ids: chunk,
+						ids: cloneArray(chunk),
 						result: loaded,
 						operation: 'read'
 					});
