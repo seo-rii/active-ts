@@ -130,6 +130,7 @@ export class ActiveFunctionCache<TInput, TValue> {
 	}
 
 	async get(input: TInput, options: FunctionCacheGetOptions = {}) {
+		input = snapshotFunctionCacheInput(input);
 		const getOptions = normalizeFunctionCacheGetOptions(options);
 		const key = await this.keyFor(input);
 		const epoch = this.invalidationEpoch(key);
@@ -194,6 +195,7 @@ export class ActiveFunctionCache<TInput, TValue> {
 	}
 
 	async peek(input: TInput) {
+		input = snapshotFunctionCacheInput(input);
 		if (this.shouldBypassCacheForTransaction()) return undefined;
 		const key = await this.keyFor(input);
 		const epoch = this.invalidationEpoch(key);
@@ -212,6 +214,7 @@ export class ActiveFunctionCache<TInput, TValue> {
 	}
 
 	async set(input: TInput, value: TValue) {
+		input = snapshotFunctionCacheInput(input);
 		const key = await this.keyFor(input);
 		const transactionContext = this.transactionContext();
 		if (transactionContext?.isInTransaction()) {
@@ -233,6 +236,7 @@ export class ActiveFunctionCache<TInput, TValue> {
 	}
 
 	async invalidate(input: TInput) {
+		input = snapshotFunctionCacheInput(input);
 		const key = await this.keyFor(input);
 		const transactionContext = this.transactionContext();
 		if (transactionContext?.isInTransaction()) {
@@ -975,6 +979,28 @@ function pruneFunctionCacheInvalidationEpochs() {
 
 function stableInputKey(input: unknown) {
 	return stableStringify(input, new WeakSet());
+}
+
+function snapshotFunctionCacheInput<T>(input: T, seen = new WeakMap<object, unknown>()): T {
+	if (input === null || typeof input !== 'object') return input;
+	const existing = WEAKMAP_GET.call(seen, input);
+	if (existing !== undefined) return existing as T;
+	const prototype = Object.getPrototypeOf(input);
+	// Custom key resolvers can accept opaque objects. Their identity/prototype is
+	// caller-owned; plain data nested beside them is still copied below.
+	if (!Array.isArray(input) && !(input instanceof Date) && prototype !== Object.prototype && prototype !== null) return input;
+	const copy: any = input instanceof Date
+		? new Date(DATE_GET_TIME.call(input))
+		: Array.isArray(input) ? [] : Object.create(prototype);
+	WEAKMAP_SET.call(seen, input, copy);
+	for (const key of Reflect.ownKeys(input)) {
+		const descriptor = Object.getOwnPropertyDescriptor(input, key)!;
+		if ('value' in descriptor) descriptor.value = snapshotFunctionCacheInput(descriptor.value, seen);
+		// Copy descriptors without invoking accessors. Default-key validation will
+		// reject unsupported properties with the same diagnostics as before.
+		Object.defineProperty(copy, key, descriptor);
+	}
+	return copy;
 }
 
 function stableStringify(input: unknown, seen: WeakSet<object>): string {
