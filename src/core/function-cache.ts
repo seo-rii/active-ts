@@ -413,7 +413,12 @@ export class ActiveFunctionCache<TInput, TValue> {
 		const distributed = this.distributedAdapter(adapter);
 		if (!adapter) return undefined;
 		if (hasPendingInvalidation(key)) return undefined;
-		if (hasInvalidationFailure(adapter, key)) return undefined;
+		if (hasInvalidationFailure(adapter, key)) {
+			if (!distributed) return undefined;
+			// A fresh fence must invalidate older fills before accepting a version
+			// for recovery. Reading the poisoned value's version alone is unsafe.
+			await this.invalidateResolvedKey(key);
+		}
 		const context = this.hookContext();
 		if (context) await this.beforeCacheGet(context, key);
 		if (hasPendingInvalidation(key)) return undefined;
@@ -449,7 +454,8 @@ export class ActiveFunctionCache<TInput, TValue> {
 		const distributed = this.distributedAdapter(adapter);
 		if (!adapter) return undefined;
 		if (!distributed) return undefined;
-		if (hasPendingInvalidation(key) || hasInvalidationFailure(adapter, key)) return undefined;
+		if (hasPendingInvalidation(key)) return undefined;
+		if (hasInvalidationFailure(adapter, key)) await this.invalidateResolvedKey(key);
 		const snapshots = normalizeCacheVersionedValues(
 			await distributed.getManyVersioned([key]),
 			1,
