@@ -170,9 +170,8 @@ type AggregateSelectionFieldConstraint<TData extends Record<string, any>, TSelec
 					: TSelection[Alias]
 			: TSelection[Alias];
 };
-type SelectedIdData<TData extends Record<string, any>> = 'id' extends keyof TData ? Pick<TData, 'id'> : {};
 type SelectedData<TData extends Record<string, any>, K extends keyof TData> =
-	Partial<TData> & SelectedIdData<TData> & Pick<TData, K>;
+	Partial<TData> & Pick<TData, K>;
 type ModelResultSnapshot = {
 	id: EntityId;
 	partial: boolean;
@@ -1286,14 +1285,14 @@ export class QueryBuilder<TModel extends { data: any }, TData extends Record<str
 	select<K extends Extract<keyof TData, string>>(
 		...fields: K[]
 	): QueryBuilder<PartialModel<TModel, SelectedData<TData, K>>, TData>;
-	select(...fields: string[]): QueryBuilder<PartialModel<TModel, Partial<TData> & SelectedIdData<TData>>, TData>;
+	select(...fields: string[]): QueryBuilder<PartialModel<TModel, Partial<TData>>, TData>;
 	select(...fields: string[]) {
 		const select: string[] = [];
 		for (let index = 0; index < fields.length; index++) {
 			select[index] = assertSafeFieldPath(fields[index], 'select field');
 		}
 		this.plan.select = select;
-		return this as unknown as QueryBuilder<PartialModel<TModel, Partial<TData> & SelectedIdData<TData>>, TData>;
+		return this as unknown as QueryBuilder<PartialModel<TModel, Partial<TData>>, TData>;
 	}
 
 	include(...relations: IncludeSpec[]) {

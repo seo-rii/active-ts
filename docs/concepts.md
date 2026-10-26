@@ -430,3 +430,9 @@ and indexes. Destructive changes are intentionally out of scope.
 
 `schemaMigration(models, name)` captures the same plans as a migration snapshot
 without applying them.
+
+Projection types guarantee only explicitly selected data fields. The configured
+model key is still included in stored query results and available through the
+model's `id` accessor. A data property literally named `id` may be an unrelated
+field when the model uses a custom key, so select that property explicitly before
+using it as a required value.
