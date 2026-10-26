@@ -2235,7 +2235,11 @@ export class ActiveContext {
 			}
 			captureConstructorData(cloneSafeDataObject(data, `${meta.name} constructor data`));
 		}
+		const originalData = meta.datastore?.ancestor ? cloneSafeDataObject(data, `${meta.name} constructor input`) : undefined;
 		const item = new model(data, this, { persisted: true, [MODEL_PERSISTED_TOKEN]: true });
+		const constructedData = modelDataValue(item as object, `${meta.name} constructor result`);
+		assertResultMatchesId(constructedData, id, meta.idField, `${meta.name} constructor result`);
+		if (originalData) assertReadTransformPreservesAncestor(meta, originalData, constructedData, 'constructor');
 		return options.partial ? markPartialModel(item as object) as TModel : item;
 	}
 
