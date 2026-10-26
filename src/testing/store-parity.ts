@@ -158,7 +158,7 @@ export async function runStoreAdapterDifferentialContract(candidate: StoreAdapte
 	} catch (cause) {
 		failed = true; failure = cause; throw cause;
 	} finally {
-		const cleanup = await Promise.allSettled(created.map(({ store, id }) => store.delete(model, id)));
+		const cleanup = await Promise.allSettled(created.map(async ({ store, id }) => { await store.delete(model, id); }));
 		const failures = cleanup.filter((entry) => entry.status === 'rejected');
 		if (failures.length) throw new AggregateError([...(failed ? [failure] : []), ...failures.map((entry) => (entry as PromiseRejectedResult).reason)], 'Store parity fixture cleanup failed.');
 	}
