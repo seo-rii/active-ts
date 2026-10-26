@@ -1,3 +1,4 @@
+import { normalizeCacheKeys as normalizeCodecCacheKeys, normalizeCacheEntries, normalizeCacheWriteOptions } from './cache-input.js';
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import { ActiveTsValidationError } from './errors.js';
 import { assertCacheableValue, assertSafeCacheKey, assertSafeTtl, defineDataProperty } from './safe-keys.js';
@@ -18,7 +19,6 @@ export type CodecCacheAdapterOptions = {
 	kind?: string;
 };
 const CODEC_CACHE_ADAPTER_OPTION_KEYS = ['kind'] as const;
-const CACHE_WRITE_OPTION_KEYS = ['ttl'] as const;
 
 export function createCodecCacheAdapter(
 	adapter: CacheAdapter,
@@ -166,48 +166,13 @@ function normalizeCodecCacheGetManyResult(value: unknown, expected: number, cont
 	return snapshotArrayInput(value, `${context} result`);
 }
 
-function normalizeCodecCacheKeys(keys: unknown, context: string) {
-	const rawKeys = snapshotArrayInput(keys, context);
-	const safeKeys: string[] = [];
-	for (let index = 0; index < rawKeys.length; index++) {
-		safeKeys[index] = assertSafeCacheKey(rawKeys[index], `${context}[${index}]`);
-	}
-	return safeKeys;
-}
-
 function normalizeCodecCacheEntries(entries: unknown, context: string): Array<[string, any]> {
-	const rawEntries = snapshotArrayInput(entries, context);
-	const safeEntries: Array<[string, any]> = [];
-	const keys = new Set<string>();
-	for (let index = 0; index < rawEntries.length; index++) {
-		const entry = rawEntries[index];
-		if (!Array.isArray(entry) || entry.length !== 2) {
-			throw new ActiveTsValidationError(`${context}[${index}] must be a [key, value] tuple.`);
-		}
-		const tuple = snapshotArrayInput(entry, `${context}[${index}]`);
-		const key = assertSafeCacheKey(tuple[0], `${context}[${index}] key`);
-		if (SET_HAS.call(keys, key)) {
-			throw new ActiveTsValidationError(`${context} contains duplicate key "${key}".`);
-		}
-		SET_ADD.call(keys, key);
-		safeEntries[index] = [key, tuple[1]];
-	}
-	return safeEntries;
+	return normalizeCacheEntries(entries, context, undefined, 'tuple');
 }
 
 function normalizeCodecCacheWriteOptions(options: unknown, context: string): CacheWriteOptions {
-	if (options === undefined) return { ttl: undefined };
-	if (!options || typeof options !== 'object' || Array.isArray(options)) {
-		throw new ActiveTsValidationError(`${context} must be a plain object.`);
-	}
-	const prototype = Object.getPrototypeOf(options);
-	if (prototype !== Object.prototype && prototype !== null) {
-		throw new ActiveTsValidationError(`${context} must be a plain object.`);
-	}
-	assertNoSymbolOptions(options as Record<string, unknown>, context);
-	assertKnownOptions(options as Record<string, unknown>, CACHE_WRITE_OPTION_KEYS, context);
-	const ttl = assertSafeTtl(ownOptionValue(options as Record<string, unknown>, 'ttl', context), `${context}.ttl`);
-	return { ttl };
+	const snapshot = normalizeCacheWriteOptions(options, context, `${context} "ttl"`);
+	return { ttl: assertSafeTtl(snapshot.ttl, `${context}.ttl`) };
 }
 
 function normalizeCodecCacheAdapterOptions(value: unknown): CodecCacheAdapterOptions {
