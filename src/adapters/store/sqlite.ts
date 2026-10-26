@@ -453,7 +453,9 @@ export async function createSqliteStoreAdapter(input: SqliteStoreOptions = {}): 
 			throw new ActiveTsConfigurationError('SQLite transactions support only serializable isolation and readOnly; timeoutMs/native are unsupported.');
 		}
 		return enqueue(() => connection.scope.run({}, async () => {
-			exec('BEGIN IMMEDIATE');
+			// Read-only work needs a snapshot, not a reserved writer lock. Keep
+			// BEGIN IMMEDIATE for writable transactions to avoid upgrade races.
+			exec(normalized.readOnly === true ? 'BEGIN' : 'BEGIN IMMEDIATE');
 			let ended: string | undefined;
 			let sequence = 0;
 			let savepointFailure: unknown;

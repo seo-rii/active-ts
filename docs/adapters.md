@@ -775,7 +775,10 @@ Create tables and indexes with `store.schema.apply()`. Schema health checks
 require the adapter's exact table/index definitions, including JSON validation
 and strict tables; independently authored equivalent DDL may be rejected.
 
-Transactions use `BEGIN IMMEDIATE` and serialize access to a shared connection.
+Writable transactions use `BEGIN IMMEDIATE`; read-only transactions use deferred
+`BEGIN` so they do not reserve the writer lock. Both serialize access to a
+shared connection and retain SQLite snapshot isolation. Independent writers can
+commit while a WAL-mode read-only transaction keeps its existing snapshot.
 Unrelated root operations wait for the active transaction; using that root
 handle from its own callback rejects. Use the supplied transaction handle,
 which closes when the callback settles. Savepoints isolate child callbacks.
