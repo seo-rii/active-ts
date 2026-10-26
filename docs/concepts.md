@@ -187,6 +187,16 @@ const profile = await profileCache.get(1);
 await profileCache.invalidate(1);
 ```
 
+For bounded in-process retention, configure `new MemoryCacheAdapter({
+maxEntries: 4096, sweepSize: 16 })` and function-cache `memory: { ttl: 60,
+maxEntries: 4096, sweepSize: 16 }`. Capacity remains unlimited when `maxEntries`
+is omitted. The configured capacity evicts the oldest inserted entry as needed.
+Each memory lookup or insertion inspects at most `sweepSize` entries for expiry
+(16 by default), so unrelated traffic also releases expired keys that are never
+read again. No timer is installed; an idle cache retains entries until its next
+operation. Function-cache sweeps preserve values within their configured
+stale-while-revalidate window.
+
 ## Relations
 
 Relations are declared as metadata and loaded explicitly:
