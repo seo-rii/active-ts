@@ -446,20 +446,29 @@ export class ActiveTestContext {
 
 	reset(model?: ModelConstructor): Promise<void> {
 		const modelName = model ? this.context.meta(model).name : undefined;
-		const tasks: Array<MaybePromise<void>> = [];
+		// Validate helper shapes before starting any cleanup side effects.
 		const reset = testingAdapterMethod(this.store, 'reset');
-		if (reset) tasks.push(reset(modelName));
-		if (this.cache) {
-			const clear = testingAdapterMethod(this.cache, 'clear');
-			if (clear) tasks.push(clear());
-		}
-		if (this.search) {
-			const clear = testingAdapterMethod(this.search, 'clear');
-			if (clear) tasks.push(clear(modelName));
+		const clearCache = this.cache ? testingAdapterMethod(this.cache, 'clear') : undefined;
+		const clearSearch = this.search ? testingAdapterMethod(this.search, 'clear') : undefined;
+		const operations: Array<() => MaybePromise<void>> = [];
+		if (reset) operations.push(() => reset(modelName));
+		if (clearCache) operations.push(() => clearCache());
+		if (clearSearch) operations.push(() => clearSearch(modelName));
+		const tasks: Array<Promise<void>> = [];
+		for (const operation of operations) {
+			try { tasks.push(Promise.resolve(operation())); }
+			catch (error) { tasks.push(Promise.reject(error)); }
 		}
 		this.warnings.length = 0;
 		resetLazyLoadWarnings();
-		return Promise.all(tasks).then(() => undefined);
+		return Promise.allSettled(tasks).then((results) => {
+			const errors: unknown[] = [];
+			for (const result of results) {
+				if (result.status === 'rejected') errors.push(result.reason);
+			}
+			if (errors.length === 1) throw errors[0];
+			if (errors.length > 1) throw new AggregateError(errors, 'Test context reset cleanup failed.');
+		});
 	}
 
 	snapshotStore(model?: ModelConstructor) {
