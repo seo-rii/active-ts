@@ -363,7 +363,7 @@ export async function createSqliteStoreAdapter(input: SqliteStoreOptions = {}): 
 					columns.push(`count(case when ${field.type} is not null and ${field.type} != 'null' and not (${valid}) then 1 end) as ${quote(`e${i}`)}`);
 				}
 				const params: SQLInputValue[] = [];
-				const source = `select data from ${table(model)} where ${whereSql(plan, params)}`;
+				const source = `select data from main.${table(model)} where ${whereSql(plan, params)}`;
 				// Keep the row scan and the average's count in one SQLite statement
 				// and snapshot. Recursive doubling needs at most 64 small scale rows.
 				const prefix = hasAverage

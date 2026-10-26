@@ -165,6 +165,17 @@ test('SQLite supports Model codec filtering, nested projection and date hydratio
 	assert.equal(await Records.sum('profile.score'), 3);
 });
 
+test('SQLite average CTEs do not shadow model tables with the same names', async (t) => {
+	for (const name of ['active_ts_rows', 'active_ts_scale', 'active_ts_scales']) {
+		const { store, model } = await fixture(t, metadata(name));
+		await store.create(model, 1, { id: 1, score: 10 });
+		await store.create(model, 2, { id: 2, score: 20 });
+		assert.deepEqual(await store.aggregate!(model, {
+			where: [], or: [], aggregates: [{ op: 'avg', field: 'score', as: 'mean' }]
+		}), { mean: 15 });
+	}
+});
+
 test('SQLite aggregates count missing input rows without including them in numeric inputs', async (t) => {
 	const { store, model } = await fixture(t);
 	await store.create(model, 1, { id: 1, score: 3 });
