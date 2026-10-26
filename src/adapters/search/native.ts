@@ -1,4 +1,4 @@
-import { datastoreSearchScopeForStore } from '../../core/datastore-search-scope.js';
+import { datastoreSearchScopeForStore, normalizeDatastoreCacheScopeStability } from '../../core/datastore-search-scope.js';
 import type { QueryResult, ResolvedModelMeta, SearchAdapter, StoreAdapter } from '../../core/types.js';
 import {
 	assertPlainDataObject,
@@ -282,6 +282,9 @@ function normalizeNativeSearchStore(store: StoreAdapter) {
 		datastoreProjectId: adapterMember(store, 'datastoreProjectId', { allowOwnAccessor: allowContextAccessors }) as StoreAdapter['datastoreProjectId'],
 		datastoreDatabaseId: adapterMember(store, 'datastoreDatabaseId', { allowOwnAccessor: allowContextAccessors }) as StoreAdapter['datastoreDatabaseId'],
 		datastoreKeyEncoding: adapterMember(store, 'datastoreKeyEncoding', { allowOwnAccessor: allowContextAccessors }) as StoreAdapter['datastoreKeyEncoding'],
+		datastoreCacheScopeStability: normalizeDatastoreCacheScopeStability(
+			adapterMember(store, 'datastoreCacheScopeStability', { allowOwnAccessor: allowContextAccessors }), 'Native search store'
+		),
 		capabilities: capabilities as StoreAdapter['capabilities'] | undefined
 	});
 }

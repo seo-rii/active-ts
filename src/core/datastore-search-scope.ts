@@ -3,7 +3,7 @@ import { cloneJsonTransportPayload } from './native-payload.js';
 import { ActiveTsConfigurationError } from './errors.js';
 import type { StoreAdapter } from './types.js';
 
-type ScopeStore = Pick<StoreAdapter, 'kind' | 'cacheScope' | 'datastoreProjectId' | 'datastoreDatabaseId' | 'datastoreNamespace' | 'datastoreKeyEncoding'>;
+type ScopeStore = Pick<StoreAdapter, 'kind' | 'cacheScope' | 'datastoreProjectId' | 'datastoreDatabaseId' | 'datastoreNamespace' | 'datastoreKeyEncoding' | 'datastoreCacheScopeStability'>;
 
 /** Canonical, portable identity metadata. Never infer an unknown physical database. */
 export function datastoreSearchScopeForStore(store: ScopeStore): string | undefined {
@@ -13,6 +13,9 @@ export function datastoreSearchScopeForStore(store: ScopeStore): string | undefi
 		(namespace !== undefined && !validName(namespace)) || (store.cacheScope !== undefined && !validName(store.cacheScope)) ||
 		(encoding !== 'active-ts' && encoding !== 'native')) {
 		throw new ActiveTsConfigurationError('Datastore search requires known datastoreProjectId, datastoreDatabaseId (null for default), datastoreKeyEncoding, and a valid namespace.');
+	}
+	if (normalizeDatastoreCacheScopeStability(store.datastoreCacheScopeStability, 'Datastore store') === 'client') {
+		throw new ActiveTsConfigurationError('Datastore search and outbox require a stable cacheScope; configure an explicit physical cacheScope when the client endpoint is unknown.');
 	}
 	return JSON_STRINGIFY(cloneJsonTransportPayload([project, database, namespace ?? null, encoding, store.cacheScope ?? null]));
 }
@@ -35,4 +38,11 @@ export function datastoreSearchScopeNamespace(scope: string): string | undefined
 
 function validName(value: unknown): value is string {
 	return typeof value === 'string' && value.length > 0 && !value.includes('\0');
+}
+
+export function normalizeDatastoreCacheScopeStability(value: unknown, context: string): StoreAdapter['datastoreCacheScopeStability'] {
+	if (value !== undefined && value !== 'stable' && value !== 'client') {
+		throw new ActiveTsConfigurationError(`${context}.datastoreCacheScopeStability must be "stable", "client", or undefined.`);
+	}
+	return value;
 }

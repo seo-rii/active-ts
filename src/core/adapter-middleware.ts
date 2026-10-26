@@ -1,3 +1,4 @@
+import { normalizeDatastoreCacheScopeStability } from './datastore-search-scope.js';
 import type {
 	AggregatePlan,
 	AggregateResult,
@@ -202,6 +203,7 @@ function createStoreMiddlewareAdapterWithSource(
 		? sourceAdapter?.datastoreDatabaseId
 		: wrapped.datastoreDatabaseId;
 	const datastoreKeyEncoding = wrapped.datastoreKeyEncoding ?? sourceAdapter?.datastoreKeyEncoding;
+	const datastoreCacheScopeStability = wrapped.datastoreCacheScopeStability ?? sourceAdapter?.datastoreCacheScopeStability;
 	const trustsDatastoreEntityKeyRows =
 		storeTrustsDatastoreEntityKeyRows(adapter) ||
 		(sourceAdapter ? storeTrustsDatastoreEntityKeyRows(sourceAdapter) : false);
@@ -224,6 +226,7 @@ function createStoreMiddlewareAdapterWithSource(
 		datastoreProjectId,
 		datastoreDatabaseId,
 		datastoreKeyEncoding,
+		datastoreCacheScopeStability,
 		capabilities: wrapped.capabilities,
 		schema: wrapStoreMiddlewareSchema(wrapped.schema, adapterKind, track, dispatch),
 		get: (model: ResolvedModelMeta, id: EntityId, options?: StoreReadOptions) => track(async () => {
@@ -767,6 +770,9 @@ function normalizeStoreAdapter(adapter: unknown, context: string): StoreAdapter 
 		adapterMember(record, 'datastoreKeyEncoding', context, { requireEnumerableOwn: false }),
 		`${context}.datastoreKeyEncoding`
 	);
+	const datastoreCacheScopeStability = normalizeDatastoreCacheScopeStability(
+		adapterMember(record, 'datastoreCacheScopeStability', context, { requireEnumerableOwn: false }), context
+	);
 	const readCapabilities = () =>
 		normalizeStoreCapabilities(
 			adapterMember(record, 'capabilities', context, {
@@ -793,6 +799,7 @@ function normalizeStoreAdapter(adapter: unknown, context: string): StoreAdapter 
 		datastoreProjectId,
 		datastoreDatabaseId,
 		datastoreKeyEncoding,
+		datastoreCacheScopeStability,
 		capabilities,
 		schema
 	};

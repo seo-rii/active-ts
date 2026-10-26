@@ -27,3 +27,15 @@ Document identity prevents one physical entity from overwriting or deleting
 another. A shared external search index still searches the documents selected by
 its query; applications that need tenant-specific results should use dedicated
 indexes or explicit search filters as part of their existing access policy.
+
+A Datastore adapter may still use a client-local cache scope when an injected
+client does not expose a complete physical endpoint. This remains valid for
+entity-cache isolation, but the factory marks it as
+`datastoreCacheScopeStability: 'client'` and durable search/outbox operations
+reject it before indexing, deleting, or appending events. Configure the same
+explicit `cacheScope` identifying the real project, database, namespace, key
+encoding, and endpoint on every participating client. Known physical endpoints
+and explicit scopes are marked `'stable'`; reconnecting then preserves document
+IDs and allows another worker to deliver pending events. Custom adapters that
+provide physical metadata without a stability marker retain their existing
+caller-asserted identity contract.

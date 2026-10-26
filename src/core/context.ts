@@ -1,4 +1,4 @@
-import { datastoreSearchScopeForStore } from './datastore-search-scope.js';
+import { datastoreSearchScopeForStore, normalizeDatastoreCacheScopeStability } from './datastore-search-scope.js';
 import { BatchLoader } from './batch-loader.js';
 import {
 	ActiveTsCommittedTransactionError,
@@ -632,6 +632,14 @@ function assertStoreAdapter(adapter: unknown, context: string): asserts adapter 
 		throw new ActiveTsConfigurationError(
 			`${context}.datastoreKeyEncoding could not be snapshotted: ${safeErrorMessage(error)}`
 		);
+	}
+	const datastoreCacheScopeStability = normalizeDatastoreCacheScopeStability(
+		adapterMember(record, 'datastoreCacheScopeStability', context), context
+	);
+	try {
+		defineAdapterProperty(record, 'datastoreCacheScopeStability', datastoreCacheScopeStability, datastoreCacheScopeStability !== undefined);
+	} catch (error) {
+		throw new ActiveTsConfigurationError(`${context}.datastoreCacheScopeStability could not be snapshotted: ${safeErrorMessage(error)}`);
 	}
 	for (const property of ['get', 'getMany', 'query', 'create', 'update', 'delete']) {
 		snapshotFunctionProperty(record, property, context);
@@ -1343,6 +1351,7 @@ export class ActiveContext {
 			datastoreProjectId: adapter.datastoreProjectId,
 			datastoreDatabaseId: adapter.datastoreDatabaseId,
 			datastoreKeyEncoding: adapter.datastoreKeyEncoding,
+			datastoreCacheScopeStability: adapter.datastoreCacheScopeStability,
 			get: (model, id, options) => this.trackOperation(async () => {
 				const safeModel = snapshotAdapterModel(model, 'context store get model metadata');
 				assertSafeEntityId(id, 'context store get id');
@@ -4170,6 +4179,7 @@ function createTransactionReadOnlyStore(
 		datastoreProjectId: adapter.datastoreProjectId,
 		datastoreDatabaseId: adapter.datastoreDatabaseId,
 		datastoreKeyEncoding: adapter.datastoreKeyEncoding,
+		datastoreCacheScopeStability: adapter.datastoreCacheScopeStability,
 		capabilities,
 		get: (model, id, options) => {
 			const safeModel = snapshotAdapterModel(model, 'transaction read-only store model metadata');
@@ -4232,6 +4242,7 @@ function createTransactionScopedStore(adapter: StoreAdapter, source?: StoreAdapt
 			? source?.datastoreDatabaseId
 			: adapter.datastoreDatabaseId,
 		datastoreKeyEncoding: adapter.datastoreKeyEncoding ?? source?.datastoreKeyEncoding,
+		datastoreCacheScopeStability: adapter.datastoreCacheScopeStability ?? source?.datastoreCacheScopeStability,
 		capabilities: Object.freeze({ ...(adapter.capabilities ?? {}), transaction: false }),
 		get: (...args) => adapter.get(...args),
 		getMany: (...args) => adapter.getMany(...args),
@@ -4268,6 +4279,7 @@ function createTransactionReadOnlyScopedStore(
 			? source.datastoreDatabaseId
 			: adapter.datastoreDatabaseId,
 		datastoreKeyEncoding: adapter.datastoreKeyEncoding ?? source.datastoreKeyEncoding,
+		datastoreCacheScopeStability: adapter.datastoreCacheScopeStability ?? source.datastoreCacheScopeStability,
 		capabilities: Object.freeze({ ...(adapter.capabilities ?? {}), transaction: false, native: false }),
 		get: (model, id, options) => {
 			const safeModel = snapshotAdapterModel(model, 'transaction read-only scoped store model metadata');
@@ -4355,6 +4367,7 @@ function createContextBoundTransactionStore(adapter: StoreAdapter, source: Store
 		? source.datastoreDatabaseId
 		: adapter.datastoreDatabaseId;
 	const datastoreKeyEncoding = adapter.datastoreKeyEncoding ?? source.datastoreKeyEncoding;
+	const datastoreCacheScopeStability = adapter.datastoreCacheScopeStability ?? source.datastoreCacheScopeStability;
 	const cacheScope = adapter.cacheScope ?? source.cacheScope;
 	const trustedDatastoreEntityKeys = storeTrustsDatastoreEntityKeyRows(adapter) || storeTrustsDatastoreEntityKeyRows(source);
 	const handle: StoreAdapter = {
@@ -4364,6 +4377,7 @@ function createContextBoundTransactionStore(adapter: StoreAdapter, source: Store
 		datastoreProjectId,
 		datastoreDatabaseId,
 		datastoreKeyEncoding,
+		datastoreCacheScopeStability,
 		capabilities: Object.freeze({ ...(adapter.capabilities ?? {}), transaction: false }),
 		get: async (model, id, options) => {
 			const safeModel = snapshotAdapterModel(model, 'context store transaction get model metadata');

@@ -1683,6 +1683,7 @@ function createCloseGuardedStoreAdapterWithSavepointGate(
 		datastoreProjectId: adapter.datastoreProjectId,
 		datastoreDatabaseId: adapter.datastoreDatabaseId,
 		datastoreKeyEncoding: adapter.datastoreKeyEncoding,
+		datastoreCacheScopeStability: adapter.datastoreCacheScopeStability,
 		capabilities: adapter.capabilities,
 		get: (model, id, options) => track('get rows', () => adapter.get(model, id, options)),
 		getMany: (model, ids, options) => track('get rows', () => adapter.getMany(model, ids, options)),

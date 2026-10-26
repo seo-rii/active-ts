@@ -1,6 +1,8 @@
 import test from 'node:test';
+import { createNativeSearchAdapter } from '../src/adapters/search/native.js';
+import { createCloseGuardedStoreAdapter } from '../src/core/store-options.js';
 import assert from 'node:assert/strict';
-import { createActiveTs, createOutboxPlugin, createSearchMiddlewareAdapter, datastoreKey, defineModel, MemoryOutboxAdapter, MemorySearchAdapter, MemoryStoreAdapter, Model, normalizeOutboxEvent, runSearchSyncWorker, setDefaultContext } from '../src/index.js';
+import { createActiveTs, createOutboxPlugin, createSearchMiddlewareAdapter, createStoreMiddlewareAdapter, datastoreKey, defineModel, MemoryOutboxAdapter, MemorySearchAdapter, MemoryStoreAdapter, Model, normalizeOutboxEvent, runSearchSyncWorker, setDefaultContext } from '../src/index.js';
 import { datastoreSearchDocumentIdentity, searchDocumentIdentity, withDatastoreSearchNamespace, withSearchDocumentIdentity } from '../src/core/search-utils.js';
 import { datastoreSearchScopeForStore, normalizeDatastoreSearchScope } from '../src/core/datastore-search-scope.js';
 
@@ -141,4 +143,68 @@ test('physical identity uses captured JSON intrinsics and ignores inherited seri
 		}
 	}
 	assert.equal(calls, 0);
+});
+
+
+test('client-local cache scopes fail before durable search and outbox effects', async () => {
+	for (const wrap of ['direct', 'middleware', 'guarded']) {
+		const source = scopedStore({ cacheScope: 'client-local-token', datastoreCacheScopeStability: 'client' });
+		const store = wrap === 'middleware' ? createStoreMiddlewareAdapter(source, [])
+			: wrap === 'guarded' ? createCloseGuardedStoreAdapter(source, () => undefined, 'test store').adapter
+			: source;
+		const search = new MemorySearchAdapter();
+		const outbox = new MemoryOutboxAdapter();
+		const context = createActiveTs({ stores: { default: store }, search: { memory: search }, defaultSearch: 'memory', plugins: [createOutboxPlugin({ outbox })] });
+		const meta = context.meta(ScopeRoot);
+		assert.throws(() => datastoreSearchScopeForStore(store), /stable cacheScope/);
+		assert.equal(context.store('default').datastoreCacheScopeStability, 'client');
+		await assert.rejects(context.searchAdapter('memory').index(meta, 1, { id: 1, title: 'must not index' }), /stable cacheScope/);
+		await assert.rejects(context.searchAdapter('memory').delete(meta, 1), /stable cacheScope/);
+		await assert.rejects(ScopeRoot.use(context).search('must not search').load(), /stable cacheScope/);
+		await assert.rejects(createNativeSearchAdapter(store).search(meta, 'must not search', {}), /stable cacheScope/);
+		await assert.rejects(context.runHooks('afterUpdate', { model: meta, id: 1, operation: 'update', data: { id: 1, title: 'must not enqueue' } }), /stable cacheScope/);
+		await context.transaction(async tx => {
+			assert.equal(tx.store('default').datastoreCacheScopeStability, 'client');
+			assert.throws(() => datastoreSearchScopeForStore(tx.store('default')), /stable cacheScope/);
+		});
+		assert.deepEqual(await outbox.list(), []);
+		assert.deepEqual(search.stats, { search: 0, index: 0, delete: 0 });
+	}
+});
+
+test('stable physical scopes survive independent clients and outbox delivery', async () => {
+	const firstStore = scopedStore({ cacheScope: 'shared-physical-endpoint', datastoreCacheScopeStability: 'stable' });
+	const secondStore = scopedStore({ cacheScope: 'shared-physical-endpoint', datastoreCacheScopeStability: 'stable' });
+	const search = new MemorySearchAdapter();
+	const outbox = new MemoryOutboxAdapter();
+	const first = createActiveTs({ stores: { default: firstStore }, search: { memory: search }, defaultSearch: 'memory', plugins: [createOutboxPlugin({ outbox })] });
+	const second = createActiveTs({ stores: { default: secondStore }, search: { memory: search }, defaultSearch: 'memory' });
+	await secondStore.seed(second.meta(ScopeRoot), [{ id: 1, title: 'authoritative current row', parentId: 10 }]);
+	await first.searchAdapter('memory').index(first.meta(ScopeRoot), 1, { id: 1, title: 'first client', parentId: 10 });
+	await second.searchAdapter('memory').index(second.meta(ScopeRoot), 1, { id: 1, title: 'second client', parentId: 10 });
+	assert.equal(search.snapshot('scope_root').length, 1);
+	await first.runHooks('afterUpdate', { model: first.meta(ScopeRoot), id: 1, operation: 'update', data: { id: 1, title: 'event', parentId: 10 } });
+	assert.equal(await runSearchSyncWorker({ outbox, search, models: [ScopeRoot], context: second }), 1);
+	assert.equal(search.snapshot('scope_root')[0].title, 'authoritative current row');
+	assert.deepEqual(await outbox.list(), []);
+	assert.notEqual(datastoreSearchScopeForStore(firstStore), datastoreSearchScopeForStore(scopedStore({ cacheScope: 'another-endpoint', datastoreCacheScopeStability: 'stable' })));
+});
+
+
+test('cache scope stability metadata is validated and snapshotted without accessors', async () => {
+	const invalid = scopedStore({ datastoreCacheScopeStability: 'invalid' });
+	assert.throws(() => createActiveTs({ stores: { default: invalid } }), /datastoreCacheScopeStability/);
+	assert.throws(() => createStoreMiddlewareAdapter(invalid, []), /datastoreCacheScopeStability/);
+	let reads = 0;
+	const accessor = scopedStore();
+	Object.defineProperty(accessor, 'datastoreCacheScopeStability', { enumerable: true, get() { reads++; return 'stable'; } });
+	assert.throws(() => createActiveTs({ stores: { default: accessor } }), /data property/);
+	assert.throws(() => createStoreMiddlewareAdapter(accessor, []), /data property/);
+	assert.equal(reads, 0);
+	const mutable = scopedStore({ datastoreCacheScopeStability: 'client' });
+	const search = new MemorySearchAdapter();
+	const context = createActiveTs({ stores: { default: mutable }, search: { memory: search } });
+	Object.assign(mutable, { datastoreCacheScopeStability: 'stable' });
+	await assert.rejects(context.searchAdapter('memory').index(context.meta(ScopeRoot), 1, { id: 1, title: 'must remain rejected' }), /stable cacheScope/);
+	assert.equal(search.stats.index, 0);
 });
