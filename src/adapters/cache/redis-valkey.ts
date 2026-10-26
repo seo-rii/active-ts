@@ -18,8 +18,10 @@ export type RedisValkeyOptions = {
 	codec?: CacheCodec<string | Buffer>;
 	/** Maximum encoded payload bytes per entry, checked before writes and decoding. */
 	maxPayloadBytes?: number;
+	/** Maximum simultaneous per-key Redis script calls (default: 16). */
+	maxConcurrency?: number;
 };
-const REDIS_VALKEY_OPTION_KEYS = ['client', 'url', 'prefix', 'codec', 'maxPayloadBytes'] as const;
+const REDIS_VALKEY_OPTION_KEYS = ['client', 'url', 'prefix', 'codec', 'maxPayloadBytes', 'maxConcurrency'] as const;
 const CACHE_WRITE_OPTION_KEYS = ['ttl'] as const;
 const UTF8_BYTE_LENGTH = Buffer.byteLength;
 const TYPED_ARRAY_BYTE_LENGTH = Object.getOwnPropertyDescriptor(
@@ -118,6 +120,7 @@ export async function createRedisValkeyCacheAdapter(options: RedisValkeyOptions 
 	if (!options.client) await rawClient.connect();
 	const client = normalizeRedisValkeyClient(rawClient);
 	const codec = options.codec;
+	const maxConcurrency = options.maxConcurrency ?? 16;
 	const prefix = normalizePrefix(options.prefix);
 	const key = (raw: string) => redisValkeyPhysicalKey(prefix, assertSafeCacheKey(raw, 'redis-valkey cache key'));
 	const versionKey = (raw: string) => redisValkeyVersionKey(key(raw));
@@ -148,10 +151,10 @@ export async function createRedisValkeyCacheAdapter(options: RedisValkeyOptions 
 		return structuredClone(decoded);
 	};
 	const invalidateVersionedKeys = async (keys: string[]) => {
-		const tasks: Array<Promise<void>> = [];
+		const tasks: Array<() => Promise<void>> = [];
 		for (let index = 0; index < keys.length; index++) {
 			const entryKey = keys[index];
-			tasks[index] = (async () => {
+			tasks[index] = async () => {
 				const reply = await client.eval!(INVALIDATE_SCRIPT, {
 					keys: [key(entryKey), versionKey(entryKey)],
 					arguments: [createRedisVersionToken(), String(VERSION_TOMBSTONE_TTL_SECONDS)]
@@ -159,9 +162,9 @@ export async function createRedisValkeyCacheAdapter(options: RedisValkeyOptions 
 				if (reply !== 1) {
 					throw new ActiveTsValidationError('redis-valkey cache invalidation result must be 1.');
 				}
-			})();
+			};
 		}
-		await Promise.all(tasks);
+		await runRedisTasks(tasks, maxConcurrency);
 	};
 
 	const adapter: CacheAdapter = {
@@ -191,10 +194,10 @@ export async function createRedisValkeyCacheAdapter(options: RedisValkeyOptions 
 				for (let index = 0; index < entries.length; index++) {
 					encoded[index] = await encode(entries[index][0], entries[index][1]);
 				}
-				const tasks: Array<Promise<void>> = [];
+				const tasks: Array<() => Promise<void>> = [];
 				for (let index = 0; index < entries.length; index++) {
 					const entryKey = entries[index][0];
-					tasks[index] = (async () => {
+					tasks[index] = async () => {
 						const reply = await client.eval!(UNCONDITIONAL_SET_SCRIPT, {
 							keys: [key(entryKey), versionKey(entryKey)],
 							arguments: [
@@ -206,9 +209,9 @@ export async function createRedisValkeyCacheAdapter(options: RedisValkeyOptions 
 						if (reply !== 1) {
 							throw new ActiveTsValidationError('redis-valkey cache set result must be 1.');
 						}
-					})();
+					};
 				}
-				await Promise.all(tasks);
+				await runRedisTasks(tasks, maxConcurrency);
 				return;
 			}
 			if (ttl !== undefined) {
@@ -241,10 +244,10 @@ export async function createRedisValkeyCacheAdapter(options: RedisValkeyOptions 
 	if (client.eval) {
 		adapter.getManyVersioned = async (keys) => {
 			keys = normalizeCacheKeys(keys, 'redis-valkey versioned cache keys');
-			const tasks: Array<Promise<{ value: any | undefined; version: string }>> = [];
+			const tasks: Array<() => Promise<{ value: any | undefined; version: string }>> = [];
 			for (let index = 0; index < keys.length; index++) {
 				const entryKey = keys[index];
-				tasks[index] = (async () => {
+				tasks[index] = async () => {
 					const reply = assertRedisVersionedGetResult(await client.eval!(VERSIONED_GET_SCRIPT, {
 						keys: [key(entryKey), versionKey(entryKey)],
 						arguments: [createRedisVersionToken(), String(VERSION_TOMBSTONE_TTL_SECONDS)]
@@ -253,9 +256,9 @@ export async function createRedisValkeyCacheAdapter(options: RedisValkeyOptions 
 						value: await decode(entryKey, reply[0]),
 						version: normalizeRedisVersion(reply[1], 'redis-valkey versioned cache revision')
 					};
-				})();
+				};
 			}
-			return await Promise.all(tasks);
+			return await runRedisTasks(tasks, maxConcurrency);
 		};
 		adapter.setManyVersioned = async (entries, writeOptions = {}) => {
 			entries = normalizeCacheVersionedEntries(entries, 'redis-valkey versioned cache entries');
@@ -265,10 +268,10 @@ export async function createRedisValkeyCacheAdapter(options: RedisValkeyOptions 
 			for (let index = 0; index < entries.length; index++) {
 				encoded[index] = await encode(entries[index][0], entries[index][1]);
 			}
-			const tasks: Array<Promise<boolean>> = [];
+			const tasks: Array<() => Promise<boolean>> = [];
 			for (let index = 0; index < entries.length; index++) {
 				const [entryKey, , expectedVersion] = entries[index];
-				tasks[index] = (async () => {
+				tasks[index] = async () => {
 					const reply = await client.eval!(VERSIONED_SET_SCRIPT, {
 						keys: [key(entryKey), versionKey(entryKey)],
 						arguments: [
@@ -281,9 +284,9 @@ export async function createRedisValkeyCacheAdapter(options: RedisValkeyOptions 
 					});
 					if (reply === 0 || reply === 1) return reply === 1;
 					throw new ActiveTsValidationError('redis-valkey versioned cache set result must be 0 or 1.');
-				})();
+				};
 			}
-			return await Promise.all(tasks);
+			return await runRedisTasks(tasks, maxConcurrency);
 		};
 		adapter.invalidateMany = async (keys) => {
 			keys = normalizeCacheKeys(keys, 'redis-valkey invalidation keys');
@@ -291,6 +294,30 @@ export async function createRedisValkeyCacheAdapter(options: RedisValkeyOptions 
 		};
 	}
 	return adapter;
+}
+
+async function runRedisTasks<T>(tasks: Array<() => Promise<T>>, concurrency: number): Promise<T[]> {
+	const results: T[] = [];
+	let next = 0;
+	let failed = false;
+	let firstError: unknown;
+	const workers: Array<Promise<void>> = [];
+	for (let worker = 0; worker < Math.min(tasks.length, concurrency); worker++) {
+		workers[workers.length] = (async () => {
+			while (!failed && next < tasks.length) {
+				const index = next++;
+				try { results[index] = await tasks[index](); }
+				catch (error) {
+					if (!failed) { failed = true; firstError = error; }
+				}
+			}
+		})();
+	}
+	// A rejection stops queued work, but already-dispatched Redis operations
+	// must settle before callers can observe batch completion.
+	await Promise.all(workers);
+	if (failed) throw firstError;
+	return results;
 }
 
 function assertRedisVersionedGetResult(value: unknown): [string | Buffer | null, string | Buffer] {
@@ -480,6 +507,10 @@ function validateRedisValkeyOptions(options: RedisValkeyOptions) {
 	const prefix = ownFactoryOptionValue(record, 'prefix', 'redis-valkey cache option');
 	const codec = ownFactoryOptionValue(record, 'codec', 'redis-valkey cache option');
 	const maxPayloadBytes = ownFactoryOptionValue(record, 'maxPayloadBytes', 'redis-valkey cache option');
+	const maxConcurrency = ownFactoryOptionValue(record, 'maxConcurrency', 'redis-valkey cache option');
+	if (maxConcurrency !== undefined && (typeof maxConcurrency !== 'number' || !Number.isSafeInteger(maxConcurrency) || maxConcurrency < 1)) {
+		throw new ActiveTsValidationError('redis-valkey cache maxConcurrency must be a positive safe integer.');
+	}
 	if (maxPayloadBytes !== undefined && (
 		typeof maxPayloadBytes !== 'number' || !Number.isSafeInteger(maxPayloadBytes) || maxPayloadBytes < 1
 	)) {
@@ -498,7 +529,7 @@ function validateRedisValkeyOptions(options: RedisValkeyOptions) {
 	if (codec !== undefined) {
 		normalizeRedisValkeyCodec(codec);
 	}
-	return { client, url, prefix, codec: codec === undefined ? undefined : normalizeRedisValkeyCodec(codec), maxPayloadBytes } as RedisValkeyOptions;
+	return { client, url, prefix, codec: codec === undefined ? undefined : normalizeRedisValkeyCodec(codec), maxPayloadBytes, maxConcurrency } as RedisValkeyOptions;
 }
 
 function assertRedisPayloadSize(value: string | Buffer, maxPayloadBytes: number | undefined) {

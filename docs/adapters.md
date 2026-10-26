@@ -816,6 +816,14 @@ The default leaves payload size unrestricted for compatibility. This budget
 applies to encoded entries; codecs that expand compressed data also need their
 own decoded-size limits. It does not limit aggregate batch bytes or Redis RPCs.
 
+`maxConcurrency` controls simultaneous per-key Redis script calls and defaults
+to 16. Set it to a positive safe integer to fit the application's connection and
+request budget. Versioned reads, writes and invalidations preserve input result
+order. A failure stops queued work and waits for already dispatched calls before
+rejecting; successful peer writes are not rolled back. Payload encoding still
+finishes before any write script is dispatched, so codec/size failures cannot
+partially write a prepared batch. This option bounds concurrency, not total RPCs.
+
 Cache codecs can wrap any cache adapter, or be passed directly to Redis/Valkey
 for encryption-style extensions:
 
