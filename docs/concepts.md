@@ -430,3 +430,9 @@ and indexes. Destructive changes are intentionally out of scope.
 
 `schemaMigration(models, name)` captures the same plans as a migration snapshot
 without applying them.
+
+A `LazyRef` follows its owner rather than preserving an old relation snapshot.
+After a successful owner save or delete, a retained handle discards its cached
+partial/full value when it is loaded again. This also applies when that handle
+was obtained before an earlier save and no longer appears in the owner's current
+relation map. Retain a loaded child value explicitly when a snapshot is needed.
