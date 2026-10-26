@@ -62,6 +62,11 @@ Helpers operate on the current test context:
 - `resetTestContext(Model?)` - clear one model or all memory state; `await`
   this when adapters provide async cleanup helpers
 
+Seeding accepts model data and applies field-type storage transforms and field
+codecs before calling adapter seed/create methods. The returned fixture data
+remains in its logical form, and the complete batch is encoded before any write.
+Lifecycle hooks and validators are not run by these fixture helpers.
+
 The memory adapters expose stats for query/cache assertions:
 
 ```ts doc-test=fragment
