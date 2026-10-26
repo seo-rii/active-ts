@@ -595,6 +595,51 @@ test('SQLite Unicode comparisons, pages and extrema follow JavaScript UTF-16 ord
 	] }), { min: ordered[0], max: ordered.at(-1) });
 });
 
+
+test('SQLite declared indexes serve generated scalar equality and range predicates', async () => {
+	const database = new DatabaseSync(':memory:');
+	const store = await createSqliteStoreAdapter({ database });
+	const model = metadata('active_sqlite_lookup', { indexes: [{ name: 'value', fields: ['value'] }] });
+	const original = DatabaseSync.prototype.prepare;
+	try {
+		await store.schema!.apply([model], { mode: 'safe' });
+		for (const row of [{ id: 1, value: 7 }, { id: 2, value: 9 }, { id: 3, value: '\u{10000}' }, { id: 4, value: '\uE000' }]) {
+			await store.create(model, row.id, row);
+		}
+		for (const [op, value, ids] of [['=', 7, [1]], ['>', 7, [2]], ['=', '\u{10000}', [3]], ['<', '\uE000', [3]]] as const) {
+			let captured = '';
+			DatabaseSync.prototype.prepare = function(sql) {
+				if (sql.startsWith('select id, data from')) captured = sql;
+				return original.call(this, sql);
+			};
+			const result = await store.query(model, { ...emptyPlan, where: [{ field: 'value', op, value }], limit: 5 });
+			DatabaseSync.prototype.prepare = original;
+			assert.deepEqual(result.list.map((row) => row.id), ids);
+			assert.ok(captured);
+			const bound = typeof value === 'string' ? Buffer.from(value, 'utf16le').swap16() : value;
+			const plan = database.prepare(`EXPLAIN QUERY PLAN ${captured}`).all(bound, 6, 0);
+			assert.ok(plan.some((row) => /SEARCH .* USING INDEX active_ts_lookup_v1_/.test(String(row.detail))), JSON.stringify(plan));
+		}
+	} finally { DatabaseSync.prototype.prepare = original; await store.close(); database.close(); }
+});
+
+test('SQLite upgrades legacy unique indexes additively and preserves their constraints', async () => {
+	const database = new DatabaseSync(':memory:');
+	const store = await createSqliteStoreAdapter({ database });
+	const model = metadata('active_sqlite_legacy_index', { indexes: [{ name: 'value', fields: ['value'], unique: true }] });
+	try {
+		await store.schema!.apply([model], { mode: 'safe' });
+		const lookup = database.prepare("select name from sqlite_schema where type = 'index' and name like 'active_ts_lookup_v1_%'").get()!;
+		database.exec(`DROP INDEX "${lookup.name}"`);
+		await store.create(model, 1, { id: 1, value: null });
+		await assert.rejects(() => store.create(model, 2, { id: 2, value: null }), ActiveTsConflictError);
+		assert.deepEqual((await store.schema!.plan([model])).changes.map((change) => change.type), ['create-index']);
+		await store.schema!.apply([model], { mode: 'safe' });
+		assert.deepEqual((await store.schema!.plan([model])).changes, []);
+		await assert.rejects(() => store.create(model, 2, { id: 2, value: null }), ActiveTsConflictError);
+	} finally { await store.close(); database.close(); }
+});
+
 test('SQLite JSON string keys preserve lone surrogates without replacement-character aliases', async (t) => {
 	const model = metadata('active_sqlite_surrogate_values', {
 		indexes: [{ name: 'label', fields: ['label'] }],
