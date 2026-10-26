@@ -1,3 +1,4 @@
+import { CacheInvalidationFailures } from './cache-invalidation-failures.js';
 import { BatchLoader } from './batch-loader.js';
 import {
 	ActiveTsCommittedTransactionError,
@@ -94,8 +95,6 @@ import {
 	SET_DELETE,
 	SET_FOR_EACH,
 	SET_HAS,
-	SET_SIZE,
-	WEAKMAP_DELETE,
 	WEAKMAP_GET,
 	WEAKMAP_SET,
 	WEAKSET_ADD,
@@ -316,17 +315,12 @@ const SAFE_PROMISE_REJECT = Promise.reject.bind(Promise);
 const PROMISE_THEN = Promise.prototype.then;
 const NOOP_REJECTION_OBSERVER = () => undefined;
 const SHARED_CACHE_INVALIDATION_EPOCH_LIMIT = 4096;
-const SHARED_CACHE_INVALIDATION_FAILURE_LIMIT = 4096;
 const adapterRegistrationSources = new WeakMap<object, object>();
 const sharedCacheInvalidationEpochs = new WeakMap<object, {
 	epochs: Map<string, number>;
 	defaultEpoch: number;
 }>();
-const sharedCacheInvalidationFailures = new WeakMap<object, {
-	failures: Set<string>;
-	poisonGeneration: number;
-	recovered: Map<string, number>;
-}>();
+const sharedCacheInvalidationFailures = new CacheInvalidationFailures();
 const sharedCachePrimaryStores = new WeakMap<object, WeakSet<object>>();
 const localStoreCacheScopes = new WeakMap<object, string>();
 let nextLocalStoreCacheScope = 0;
@@ -3458,58 +3452,15 @@ export class ActiveContext {
 	}
 
 	private hasCacheInvalidationFailure(cache: CacheAdapter, key: string) {
-		const state = WEAKMAP_GET.call(sharedCacheInvalidationFailures, cacheAdapterSource(cache)) as {
-			failures: Set<string>;
-			poisonGeneration: number;
-			recovered: Map<string, number>;
-		} | undefined;
-		if (!state) return false;
-		if (SET_HAS.call(state.failures, key)) return true;
-		return state.poisonGeneration > 0 && mapGet(state.recovered, key) !== state.poisonGeneration;
+		return sharedCacheInvalidationFailures.has(cacheAdapterSource(cache), key);
 	}
 
 	private markCacheInvalidationFailure(cache: CacheAdapter, key: string) {
-		const source = cacheAdapterSource(cache);
-		let state = WEAKMAP_GET.call(sharedCacheInvalidationFailures, source) as {
-			failures: Set<string>;
-			poisonGeneration: number;
-			recovered: Map<string, number>;
-		} | undefined;
-		if (!state) {
-			state = { failures: new Set<string>(), poisonGeneration: 0, recovered: new Map<string, number>() };
-			WEAKMAP_SET.call(sharedCacheInvalidationFailures, source, state);
-		}
-		SET_ADD.call(state.failures, key);
-		MAP_DELETE.call(state.recovered, key);
-		if (SET_SIZE.call(state.failures) <= SHARED_CACHE_INVALIDATION_FAILURE_LIMIT) return;
-		if (!Number.isSafeInteger(state.poisonGeneration) || state.poisonGeneration >= Number.MAX_SAFE_INTEGER) {
-			throw new ActiveTsConfigurationError('Cache invalidation failure generation is exhausted.');
-		}
-		state.poisonGeneration++;
-		SET_CLEAR.call(state.failures);
-		MAP_CLEAR.call(state.recovered);
+		sharedCacheInvalidationFailures.mark(cacheAdapterSource(cache), key);
 	}
 
 	private clearCacheInvalidationFailure(cache: CacheAdapter, key: string) {
-		const source = cacheAdapterSource(cache);
-		const state = WEAKMAP_GET.call(sharedCacheInvalidationFailures, source) as {
-			failures: Set<string>;
-			poisonGeneration: number;
-			recovered: Map<string, number>;
-		} | undefined;
-		if (!state) return;
-		SET_DELETE.call(state.failures, key);
-		if (state.poisonGeneration > 0) {
-			MAP_DELETE.call(state.recovered, key);
-			mapSet(state.recovered, key, state.poisonGeneration);
-			while (MAP_SIZE.call(state.recovered) > SHARED_CACHE_INVALIDATION_FAILURE_LIMIT) {
-				const oldest = (MAP_KEYS.call(state.recovered) as IterableIterator<string>).next();
-				if (oldest.done) break;
-				MAP_DELETE.call(state.recovered, oldest.value);
-			}
-			return;
-		}
-		if (!SET_SIZE.call(state.failures)) WEAKMAP_DELETE.call(sharedCacheInvalidationFailures, source);
+		sharedCacheInvalidationFailures.clear(cacheAdapterSource(cache), key);
 	}
 
 	private async writeCacheEntries(

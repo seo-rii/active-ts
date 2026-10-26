@@ -108,6 +108,13 @@ contract cannot provide that cross-context guarantee. Every external writer must
 use the same key scope and invalidation protocol; sharing a codec alone does not
 establish cache coherence.
 
+Entity and function caches conservatively bypass entries whose invalidation
+failed. Failure protection has bounded bookkeeping: after a large burst of
+failures it may also bypass other entries on that adapter until each key is
+safely refreshed or invalidated. Dropping an old failure record never makes a
+potentially stale entry readable. Recover the cache service and retry failed
+invalidations rather than relying on TTL alone to clear failure protection.
+
 Use a new Redis prefix when a cache's representation or invalidation protocol
 changes, for example `prefix: 'entity-cache:v2'`. Give different physical
 projects, databases, and tenants different cache scopes. Viewer-specific DTO

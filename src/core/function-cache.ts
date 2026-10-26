@@ -1,3 +1,4 @@
+import { CacheInvalidationFailures } from './cache-invalidation-failures.js';
 import { createHash } from 'node:crypto';
 import { ActiveContext, getDefaultContext } from './context.js';
 import { assertContextTransactionWritable, currentTransactionContext } from './context-internal.js';
@@ -23,11 +24,9 @@ import {
 	SET_ADD,
 	SET_DELETE,
 	SET_HAS,
-	SET_SIZE,
 	WEAKSET_ADD,
 	WEAKSET_DELETE,
 	WEAKSET_HAS,
-	WEAKMAP_DELETE,
 	WEAKMAP_GET,
 	WEAKMAP_SET
 } from './collection-intrinsics.js';
@@ -98,7 +97,7 @@ const FUNCTION_CACHE_MEMORY_OPTION_KEYS = ['ttl', 'maxEntries'] as const;
 const FUNCTION_CACHE_GET_OPTION_KEYS = ['refresh'] as const;
 const FUNCTION_CACHE_INVALIDATION_EPOCH_LIMIT = 4096;
 const functionCacheInvalidationEpochs = new Map<string, number>();
-const functionCacheInvalidationFailures = new WeakMap<object, Set<string>>();
+const functionCacheInvalidationFailures = new CacheInvalidationFailures();
 const functionCachePendingInvalidations = new Map<string, number>();
 const functionCacheTransactionScopes = new WeakMap<ActiveContext, number>();
 const DATE_GET_TIME = Date.prototype.getTime;
@@ -863,23 +862,15 @@ function cacheFailureSource(adapter: CacheAdapter) {
 }
 
 function hasInvalidationFailure(adapter: CacheAdapter, key: string) {
-	const keys = WEAKMAP_GET.call(functionCacheInvalidationFailures, cacheFailureSource(adapter)) as Set<string> | undefined;
-	return keys ? SET_HAS.call(keys, key) : false;
+	return functionCacheInvalidationFailures.has(cacheFailureSource(adapter), key);
 }
 
 function markInvalidationFailure(adapter: CacheAdapter, key: string) {
-	const source = cacheFailureSource(adapter);
-	const keys = (WEAKMAP_GET.call(functionCacheInvalidationFailures, source) as Set<string> | undefined) ?? new Set<string>();
-	SET_ADD.call(keys, key);
-	WEAKMAP_SET.call(functionCacheInvalidationFailures, source, keys);
+	functionCacheInvalidationFailures.mark(cacheFailureSource(adapter), key);
 }
 
 function clearInvalidationFailure(adapter: CacheAdapter, key: string) {
-	const source = cacheFailureSource(adapter);
-	const keys = WEAKMAP_GET.call(functionCacheInvalidationFailures, source) as Set<string> | undefined;
-	if (!keys) return;
-	SET_DELETE.call(keys, key);
-	if (!SET_SIZE.call(keys)) WEAKMAP_DELETE.call(functionCacheInvalidationFailures, source);
+	functionCacheInvalidationFailures.clear(cacheFailureSource(adapter), key);
 }
 
 function markPendingInvalidation(key: string) {
