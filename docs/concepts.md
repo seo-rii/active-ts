@@ -187,6 +187,13 @@ const profile = await profileCache.get(1);
 await profileCache.invalidate(1);
 ```
 
+Function-cache calls capture plain objects, arrays, and dates before resolving a
+key or namespace. The factory uses that same snapshot, so changing the caller's
+data after `get()` starts cannot store a different input's result under the old
+key. Custom key resolvers may also accept opaque class instances; keep those
+objects and any opaque values nested in the input immutable until the operation
+finishes, because their prototypes and identity remain caller-owned.
+
 ## Relations
 
 Relations are declared as metadata and loaded explicitly:
