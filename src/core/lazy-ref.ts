@@ -18,7 +18,7 @@ import { assertSafeEntityId } from './safe-keys.js';
 import { SET_ADD, SET_HAS, WEAKMAP_GET, WEAKMAP_SET } from './collection-intrinsics.js';
 import { assertModelSnapshotRelationsAllowed, MODEL_DATASTORE_WRITE_ANCESTOR } from './model-internal.js';
 import type { DatastoreKey, EntityId, ModelConstructor, RelationMeta } from './types.js';
-import { runTrackedContextOperation } from './context-internal.js';
+import { contextHasQueryHooks, runTrackedContextOperation } from './context-internal.js';
 
 let warned = new WeakMap<ActiveContext, Set<string>>();
 const PROMISE_THEN = Promise.prototype.then;
@@ -222,7 +222,8 @@ export class LazyRef<TModel = any> implements PromiseLike<TModel | TModel[] | nu
 			this.relation.foreignKey === targetMeta.idField &&
 			(options.full || !this.relation.preload?.length) &&
 			!canMatchTargetAncestorFields &&
-			!targetHasDatastoreAncestorFields
+			!targetHasDatastoreAncestorFields &&
+			!contextHasQueryHooks(context, targetMeta)
 		) {
 			assertSafeEntityId(localValue, `${this.relation.name} relation key`);
 			if (this.relation.ancestor || ancestor !== undefined) {

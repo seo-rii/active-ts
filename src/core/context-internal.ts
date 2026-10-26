@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { ActiveTsConfigurationError } from './errors.js';
 import type { ActiveContext } from './context.js';
-import type { CacheAdapter, SearchAdapter, StoreAdapter } from './types.js';
+import type { CacheAdapter, SearchAdapter, StoreAdapter, ResolvedModelMeta } from './types.js';
 
 export type ActiveContextInternalAccess = {
 	store(name: string): StoreAdapter;
@@ -10,6 +10,7 @@ export type ActiveContextInternalAccess = {
 	assertWritable(operation: string): void;
 	markRollbackOnly(error: unknown): void;
 	trackOperation<T>(run: () => Promise<T>): Promise<T>;
+	hasQueryHooks(model: ResolvedModelMeta): boolean;
 };
 
 export const ACTIVE_CONTEXT_INTERNALS = Symbol('active-ts.context-internals');
@@ -72,4 +73,8 @@ export function runTrackedContextOperation<T>(
 
 export function currentTransactionContext() {
 	return transactionContextStorage.getStore();
+}
+
+export function contextHasQueryHooks(context: ActiveContext, model: ResolvedModelMeta) {
+	return activeContextInternals(context).hasQueryHooks(model);
 }
