@@ -31,6 +31,7 @@ import {
 	MODEL_DATASTORE_WRITE_ANCESTOR,
 	MODEL_PERSISTED_TOKEN,
 	trackTransactionModel,
+	invalidateModelRelations,
 	type ModelConstructorOptions
 } from './model-internal.js';
 import { BOUND_CONTEXT, SOURCE_MODEL, staticMarkerValue } from './model-markers.js';
@@ -578,6 +579,7 @@ export abstract class Model<TData extends Record<string, any> = Record<string, a
 		replaceData(this.data, prepared.data);
 		this.persistedId = prepared.id;
 		this.persistedVersion = typeof prepared.data.version === 'number' ? prepared.data.version : undefined;
+		invalidateModelRelations(this);
 		MAP_CLEAR.call(this.relationCache);
 	}
 
@@ -657,6 +659,7 @@ export abstract class Model<TData extends Record<string, any> = Record<string, a
 				);
 				this.persistedId = undefined;
 				this.persistedVersion = undefined;
+				invalidateModelRelations(this);
 				MAP_CLEAR.call(this.relationCache);
 				await afterStoreWrite(context, meta.name, 'delete', id, async () => {
 					await runCommittedWriteBoundaryEffects(context, meta, id, {

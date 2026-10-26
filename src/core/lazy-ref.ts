@@ -16,7 +16,7 @@ import {
 } from './relation-result.js';
 import { assertSafeEntityId } from './safe-keys.js';
 import { SET_ADD, SET_HAS, WEAKMAP_GET, WEAKMAP_SET } from './collection-intrinsics.js';
-import { assertModelSnapshotRelationsAllowed, MODEL_DATASTORE_WRITE_ANCESTOR } from './model-internal.js';
+import { assertModelSnapshotRelationsAllowed, modelRelationGeneration, MODEL_DATASTORE_WRITE_ANCESTOR } from './model-internal.js';
 import type { DatastoreKey, EntityId, ModelConstructor, RelationMeta } from './types.js';
 import { runTrackedContextOperation } from './context-internal.js';
 
@@ -33,6 +33,7 @@ export class LazyRef<TModel = any> implements PromiseLike<TModel | TModel[] | nu
 	private promise?: Promise<TModel | TModel[] | null>;
 	private promiseContext?: ActiveContext;
 	private plannedLoad: boolean;
+	private ownerGeneration: number;
 
 	constructor(
 		private readonly context: ActiveContext,
@@ -41,6 +42,7 @@ export class LazyRef<TModel = any> implements PromiseLike<TModel | TModel[] | nu
 		planned: boolean
 	) {
 		this.plannedLoad = planned;
+		this.ownerGeneration = modelRelationGeneration(owner);
 	}
 
 	markPlanned() {
@@ -49,6 +51,7 @@ export class LazyRef<TModel = any> implements PromiseLike<TModel | TModel[] | nu
 
 	prime(value: TModel | TModel[] | null, options: { full?: boolean } = {}) {
 		const context = this.scopedContext('prime relations');
+		this.refreshOwnerGeneration();
 		this.plannedLoad = true;
 		this.promise = Promise.resolve(value);
 		this.promiseContext = context;
@@ -67,6 +70,7 @@ export class LazyRef<TModel = any> implements PromiseLike<TModel | TModel[] | nu
 
 	load(options: LazyLoadOptions = {}) {
 		const context = this.scopedContext('load relations');
+		this.refreshOwnerGeneration();
 		if (options.full) {
 			if (!this.fullPromise || this.fullPromiseContext !== context) {
 				this.warnIfUnplanned();
@@ -112,6 +116,13 @@ export class LazyRef<TModel = any> implements PromiseLike<TModel | TModel[] | nu
 
 	private fullPromise?: Promise<TModel | TModel[] | null>;
 	private fullPromiseContext?: ActiveContext;
+
+	private refreshOwnerGeneration() {
+		const generation = modelRelationGeneration(this.owner);
+		if (generation === this.ownerGeneration) return;
+		this.clear();
+		this.ownerGeneration = generation;
+	}
 
 	private scopedContext(operation: string) {
 		assertModelSnapshotRelationsAllowed(this.owner);
