@@ -473,55 +473,64 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 		const leased: OutboxEvent[] = [];
 		const blockedEntityKeys = new Set<string>();
 		let cursor: string | undefined;
-		const paged = limit !== undefined && store.capabilities?.cursor === true;
-		do {
-			const remaining = limit === undefined ? undefined : limit - leased.length;
-			if (remaining !== undefined && remaining <= 0) break;
-			const page = await this.listPageWithContext(context, { limit: paged ? remaining : undefined, cursor });
-			for (const event of page.events) {
-				const checkOrderKeys = outboxEntityOrderCheckKeys(event);
-				const blockOrderKeys = outboxEntityOrderBlockKeys(event);
-				if (event.deadLetteredAt !== undefined) continue;
-				if (outboxEntityOrderKeysBlocked(blockedEntityKeys, checkOrderKeys)) {
-					blockOutboxEntityOrderKeys(blockedEntityKeys, blockOrderKeys);
-					continue;
-				}
-				if (!isOutboxDeliveryAvailable(event, now)) {
-					blockOutboxEntityOrderKeys(blockedEntityKeys, blockOrderKeys);
-					continue;
-				}
-				if (isOutboxLeaseActive(event, now)) {
-					blockOutboxEntityOrderKeys(blockedEntityKeys, blockOrderKeys);
-					continue;
-				}
-				const releaseCandidate = withOutboxLease(event, token, expiresAt);
-				try {
-					const claim = await this.claimOutboxLease(context, event, token, expiresAt, now);
-					if (!claim.claimed) {
+		const paged = store.capabilities?.cursor === true;
+		const seenCursors = new Set<string>();
+		let cleanupAttempted = false;
+		try {
+			do {
+				const remaining = limit === undefined ? undefined : limit - leased.length;
+				if (remaining !== undefined && remaining <= 0) break;
+				const page = await this.listPageWithContext(context, { limit: paged ? remaining : undefined, cursor });
+				for (const event of page.events) {
+					const checkOrderKeys = outboxEntityOrderCheckKeys(event);
+					const blockOrderKeys = outboxEntityOrderBlockKeys(event);
+					if (event.deadLetteredAt !== undefined) continue;
+					if (outboxEntityOrderKeysBlocked(blockedEntityKeys, checkOrderKeys)) {
 						blockOutboxEntityOrderKeys(blockedEntityKeys, blockOrderKeys);
-						if (claim.current) {
-							blockOutboxEntityOrderKeys(blockedEntityKeys, outboxEntityOrderBlockKeys(claim.current));
+						continue;
+					}
+					if (!isOutboxDeliveryAvailable(event, now)) {
+						blockOutboxEntityOrderKeys(blockedEntityKeys, blockOrderKeys);
+						continue;
+					}
+					if (isOutboxLeaseActive(event, now)) {
+						blockOutboxEntityOrderKeys(blockedEntityKeys, blockOrderKeys);
+						continue;
+					}
+					const releaseCandidate = withOutboxLease(event, token, expiresAt);
+					try {
+						const claim = await this.claimOutboxLease(context, event, token, expiresAt, now);
+						if (!claim.claimed) {
+							blockOutboxEntityOrderKeys(blockedEntityKeys, blockOrderKeys);
+							if (claim.current) {
+								blockOutboxEntityOrderKeys(blockedEntityKeys, outboxEntityOrderBlockKeys(claim.current));
+							}
+							continue;
 						}
-						continue;
+						leased.push(claim.claimed);
+						blockOutboxEntityOrderKeys(blockedEntityKeys, outboxEntityOrderBlockKeys(claim.claimed));
+					} catch (error) {
+						if (isStoreOutboxLeaseClaimConflict(store, error)) {
+							blockOutboxEntityOrderKeys(blockedEntityKeys, blockOrderKeys);
+							const next = await this.currentOutboxEvent(context, event.id);
+							if (next) blockOutboxEntityOrderKeys(blockedEntityKeys, outboxEntityOrderBlockKeys(next));
+							continue;
+						}
+						cleanupAttempted = true;
+						await this.releaseClaimedLeaseBatch([...leased, releaseCandidate], error);
+						throw error;
 					}
-					leased.push(claim.claimed);
-					blockOutboxEntityOrderKeys(blockedEntityKeys, outboxEntityOrderBlockKeys(claim.claimed));
-				} catch (error) {
-					if (isStoreOutboxLeaseClaimConflict(store, error)) {
-						blockOutboxEntityOrderKeys(blockedEntityKeys, blockOrderKeys);
-						const next = await this.currentOutboxEvent(context, event.id);
-						if (next) blockOutboxEntityOrderKeys(blockedEntityKeys, outboxEntityOrderBlockKeys(next));
-						continue;
-					}
-					await this.releaseClaimedLeaseBatch([...leased, releaseCandidate], error);
-					throw error;
+					if (limit !== undefined && leased.length >= limit) break;
 				}
 				if (limit !== undefined && leased.length >= limit) break;
-			}
-			if (!paged || !page.more || !page.cursor) break;
-			cursor = page.cursor;
-		} while (limit === undefined || leased.length < limit);
-		return leased;
+				cursor = nextStoreOutboxCursor(page, paged, seenCursors);
+				if (cursor === undefined) break;
+			} while (limit === undefined || leased.length < limit);
+			return leased;
+		} catch (error) {
+			if (!cleanupAttempted) await this.releaseClaimedLeaseBatch(leased, error);
+			throw error;
+		}
 	}
 
 	supportsExclusiveLease() {
@@ -918,72 +927,84 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 			const drained: OutboxEvent[] = [];
 			const blockedEntityKeys = new Set<string>();
 			let cursor: string | undefined;
-			const paged = limit !== undefined && store.capabilities?.cursor === true;
-			do {
-				const remaining = limit === undefined ? undefined : limit - drained.length;
-				if (remaining !== undefined && remaining <= 0) break;
-				const page = await this.listPageWithContext(context, { limit: paged ? remaining : undefined, cursor });
-				for (const event of page.events) {
-					const checkOrderKeys = outboxEntityOrderCheckKeys(event);
-					const blockOrderKeys = outboxEntityOrderBlockKeys(event);
-					if (event.deadLetteredAt !== undefined) continue;
-					if (outboxEntityOrderKeysBlocked(blockedEntityKeys, checkOrderKeys)) {
-						blockOutboxEntityOrderKeys(blockedEntityKeys, blockOrderKeys);
-						continue;
-					}
-					if (!isOutboxDeliveryAvailable(event, now)) {
-						blockOutboxEntityOrderKeys(blockedEntityKeys, blockOrderKeys);
-						continue;
-					}
-					if (isOutboxLeaseActive(event, now)) {
-						blockOutboxEntityOrderKeys(blockedEntityKeys, blockOrderKeys);
-						continue;
-					}
-					const current = await this.currentOutboxEvent(context, event.id);
-					if (
-						!current ||
-						current.deadLetteredAt !== undefined ||
-						!isOutboxDeliveryAvailable(current, now) ||
-						!isOutboxSnapshotCurrent(current, event) ||
-						isOutboxLeaseActive(current, now)
-					) {
-						blockOutboxEntityOrderKeys(blockedEntityKeys, blockOrderKeys);
-						if (current) blockOutboxEntityOrderKeys(blockedEntityKeys, outboxEntityOrderBlockKeys(current));
-						continue;
-					}
-					try {
-						await store.delete(
-							this.meta,
-							current.id,
-							store.capabilities?.optimisticLock === true ? outboxExpectedVersionOption(current) : undefined
-						);
-						if (recoverDeletes) deleted.push(current);
-						drained.push(current);
-						if (limit !== undefined && drained.length >= limit) break;
-					} catch (error) {
-						if (
-							store.capabilities?.optimisticLock === true &&
-							(error instanceof ActiveTsConflictError || error instanceof ActiveTsNotFoundError)
-						) {
+			const paged = store.capabilities?.cursor === true;
+			const seenCursors = new Set<string>();
+			let recoveryAttempted = false;
+			try {
+				do {
+					const remaining = limit === undefined ? undefined : limit - drained.length;
+					if (remaining !== undefined && remaining <= 0) break;
+					const page = await this.listPageWithContext(context, { limit: paged ? remaining : undefined, cursor });
+					for (const event of page.events) {
+						const checkOrderKeys = outboxEntityOrderCheckKeys(event);
+						const blockOrderKeys = outboxEntityOrderBlockKeys(event);
+						if (event.deadLetteredAt !== undefined) continue;
+						if (outboxEntityOrderKeysBlocked(blockedEntityKeys, checkOrderKeys)) {
 							blockOutboxEntityOrderKeys(blockedEntityKeys, blockOrderKeys);
 							continue;
 						}
-						if (recoverDeletes) {
-							const errors = await this.reinsertDeletedEvents(context, [...deleted, event]);
-							if (errors.length) {
-								throw new AggregateError(
-									[error, ...errors],
-									`Store outbox drain failed and rollback failed: ${safeErrorMessage(error)}`
-								);
-							}
+						if (!isOutboxDeliveryAvailable(event, now)) {
+							blockOutboxEntityOrderKeys(blockedEntityKeys, blockOrderKeys);
+							continue;
 						}
-						throw error;
+						if (isOutboxLeaseActive(event, now)) {
+							blockOutboxEntityOrderKeys(blockedEntityKeys, blockOrderKeys);
+							continue;
+						}
+						const current = await this.currentOutboxEvent(context, event.id);
+						if (
+							!current ||
+							current.deadLetteredAt !== undefined ||
+							!isOutboxDeliveryAvailable(current, now) ||
+							!isOutboxSnapshotCurrent(current, event) ||
+							isOutboxLeaseActive(current, now)
+						) {
+							blockOutboxEntityOrderKeys(blockedEntityKeys, blockOrderKeys);
+							if (current) blockOutboxEntityOrderKeys(blockedEntityKeys, outboxEntityOrderBlockKeys(current));
+							continue;
+						}
+						try {
+							await store.delete(
+								this.meta,
+								current.id,
+								store.capabilities?.optimisticLock === true ? outboxExpectedVersionOption(current) : undefined
+							);
+							if (recoverDeletes) deleted.push(current);
+							drained.push(current);
+							if (limit !== undefined && drained.length >= limit) break;
+						} catch (error) {
+							if (
+								store.capabilities?.optimisticLock === true &&
+								(error instanceof ActiveTsConflictError || error instanceof ActiveTsNotFoundError)
+							) {
+								blockOutboxEntityOrderKeys(blockedEntityKeys, blockOrderKeys);
+								continue;
+							}
+							if (recoverDeletes) {
+								recoveryAttempted = true;
+								const errors = await this.reinsertDeletedEvents(context, [...deleted, event]);
+								if (errors.length) {
+									throw new AggregateError(
+										[error, ...errors],
+										`Store outbox drain failed and rollback failed: ${safeErrorMessage(error)}`
+									);
+								}
+							}
+							throw error;
+						}
 					}
+					if (limit !== undefined && drained.length >= limit) break;
+					cursor = nextStoreOutboxCursor(page, paged, seenCursors);
+					if (cursor === undefined) break;
+				} while (limit === undefined || drained.length < limit);
+				return drained;
+			} catch (error) {
+				if (recoverDeletes && !recoveryAttempted) {
+					const errors = await this.reinsertDeletedEvents(context, deleted);
+					if (errors.length) throw new AggregateError([error, ...errors], `Store outbox drain failed and rollback failed: ${safeErrorMessage(error)}`);
 				}
-				if (!paged || !page.more || !page.cursor) break;
-				cursor = page.cursor;
-			} while (limit === undefined || drained.length < limit);
-			return drained;
+				throw error;
+			}
 		};
 		const context = this.activeContext();
 		const store = contextInternalStore(context, this.meta.store);
@@ -1026,7 +1047,16 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 	}
 
 	private async listWithContext(context: ActiveContext) {
-		return (await this.listPageWithContext(context)).events;
+		const store = contextInternalStore(context, this.meta.store);
+		const events: OutboxEvent[] = [];
+		const seenCursors = new Set<string>();
+		let cursor: string | undefined;
+		do {
+			const page = await this.listPageWithContext(context, { cursor });
+			for (const event of page.events) events.push(event);
+			cursor = nextStoreOutboxCursor(page, store.capabilities?.cursor === true, seenCursors);
+		} while (cursor !== undefined);
+		return events;
 	}
 
 	private async listPageWithContext(
@@ -1278,6 +1308,19 @@ function isStoreOutboxLeaseClaimConflict(store: StoreAdapter, error: unknown) {
 	const descriptor = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(error, 'code');
 	if (!descriptor || !('value' in descriptor) || !descriptor.enumerable) return false;
 	return descriptor.value === 10 || descriptor.value === 'aborted' || descriptor.value === 'ABORTED';
+}
+
+function nextStoreOutboxCursor(
+	page: { more: boolean; cursor?: string },
+	supportsCursor: boolean,
+	seen: Set<string>
+): string | undefined {
+	if (!page.more) return undefined;
+	if (!supportsCursor || !page.cursor || SET_HAS.call(seen, page.cursor)) {
+		throw new ActiveTsConfigurationError('Store outbox requires an advancing cursor to consume a continuation page.');
+	}
+	SET_ADD.call(seen, page.cursor);
+	return page.cursor;
 }
 
 function outboxListQueryPlan(options: { limit?: number; cursor?: string } = {}): QueryPlan {

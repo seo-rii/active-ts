@@ -540,6 +540,15 @@ adapters honor that limit directly. Custom adapters should do the same; the
 worker also releases or requeues overflow defensively if an adapter returns more
 than the requested limit.
 
+Store-backed outbox listing, leasing and draining also follow a store's default
+continuation pages when no limit is supplied. A page containing only dead
+letters or unavailable events does not mean that the queue is empty. Continuing
+stores must advertise cursor support and return an advancing cursor; otherwise
+the adapter rejects an incomplete scan instead of silently omitting events.
+If a later page fails, claimed leases are released and nontransactional drains
+attempt to restore already removed events before returning the error. Cleanup
+failures are reported together with the original failure.
+
 For Datastore models with ancestor metadata, outbox search sync keeps the public
 model id unchanged but carries a bounded per-entity `modelIdentity` for the
 backend search document key. This lets two children with the same id under
