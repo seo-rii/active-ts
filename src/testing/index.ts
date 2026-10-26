@@ -4759,3 +4759,5 @@ function seedRowId(row: Record<string, unknown>, meta: ResolvedModelMeta) {
 	assertSafeEntityId(id, `ActiveTestContext.seed() ${meta.name}.${meta.idField}`);
 	return id;
 }
+
+export { createStoreParityFixture, runStoreAdapterDifferentialContract, type StoreParityFixture, type StoreAdapterDifferentialOptions } from './store-parity.js';
