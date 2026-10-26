@@ -173,24 +173,24 @@ test('Datastore cache scopes include project, database, and namespace identity',
 	assert.equal(defaultNamespace.datastoreKeyEncoding, 'active-ts');
 	assert.equal(
 		defaultNamespace.cacheScope,
-		'datastore|project=9:project-a|database=4:db-a|namespace=-|client=-'
+		'datastore|project=9:project-a|database=4:db-a|namespace=-|client=-|endpoint=53:{"servicePath":"datastore.googleapis.com","port":443}'
 	);
 	assert.equal(
 		tenantA.cacheScope,
-		'datastore|project=9:project-a|database=4:db-a|namespace=8:tenant-a|client=-'
+		'datastore|project=9:project-a|database=4:db-a|namespace=8:tenant-a|client=-|endpoint=53:{"servicePath":"datastore.googleapis.com","port":443}'
 	);
 	assert.equal(
 		tenantB.cacheScope,
-		'datastore|project=9:project-a|database=4:db-a|namespace=8:tenant-b|client=-'
+		'datastore|project=9:project-a|database=4:db-a|namespace=8:tenant-b|client=-|endpoint=53:{"servicePath":"datastore.googleapis.com","port":443}'
 	);
 	assert.equal(
 		nativeTenantA.cacheScope,
-		'datastore|project=9:project-a|database=4:db-a|namespace=8:tenant-a|client=-|keyEncoding=6:native'
+		'datastore|project=9:project-a|database=4:db-a|namespace=8:tenant-a|client=-|endpoint=53:{"servicePath":"datastore.googleapis.com","port":443}|keyEncoding=6:native'
 	);
 	assert.equal(sdkNamespace.datastoreNamespace, 'tenant-sdk');
 	assert.equal(
 		sdkNamespace.cacheScope,
-		'datastore|project=9:project-a|database=4:db-a|namespace=10:tenant-sdk|client=-'
+		'datastore|project=9:project-a|database=4:db-a|namespace=10:tenant-sdk|client=-|endpoint=53:{"servicePath":"datastore.googleapis.com","port":443}'
 	);
 	assert.notEqual(tenantA.cacheScope, tenantB.cacheScope);
 	assert.notEqual(tenantA.cacheScope, nativeTenantA.cacheScope);
@@ -295,7 +295,7 @@ test('injected Datastore clients use client identity and ignore detached datasto
 	assert.equal(first.datastoreProjectId, undefined);
 	assert.match(
 		first.cacheScope!,
-		/^datastore\|project=-\|database=-\|namespace=13:client-tenant\|client=36:[0-9a-f-]{36}$/
+		/^datastore\|project=-\|database=-\|namespace=13:client-tenant\|client=36:[0-9a-f-]{36}\|endpoint=-$/
 	);
 	assert.equal(first.cacheScope, sameClient.cacheScope);
 	assert.equal(sameClientNative.cacheScope, `${first.cacheScope}|keyEncoding=6:native`);

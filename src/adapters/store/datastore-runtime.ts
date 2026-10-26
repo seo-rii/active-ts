@@ -1296,11 +1296,12 @@ export async function createDatastoreStoreAdapter(
 		? readConfiguredDatastoreProjectId(rawClient)
 		: await resolveDatastoreProjectId(rawClient);
 	const datastoreDatabaseId = readDatastoreDatabaseId(rawClient);
+	const datastoreEndpoint = readDatastoreEndpointIdentity(rawClient);
 	if (options.cacheScope === undefined) {
 		const projectId = datastoreProjectId;
 		const databaseId = datastoreDatabaseId;
 		let clientIdentity: string | undefined;
-		if (projectId === undefined || databaseId === undefined) {
+		if (projectId === undefined || databaseId === undefined || datastoreEndpoint === undefined) {
 			clientIdentity = WEAKMAP_GET.call(DATASTORE_CLIENT_CACHE_SCOPE_IDS, rawClient) as string | undefined;
 			if (clientIdentity === undefined) {
 				clientIdentity = randomUUID();
@@ -1315,10 +1316,11 @@ export async function createDatastoreStoreAdapter(
 				: `${databaseId.length}:${databaseId}`;
 		const namespacePart = options.namespace === undefined ? '-' : `${options.namespace.length}:${options.namespace}`;
 		const clientPart = clientIdentity === undefined ? '-' : `${clientIdentity.length}:${clientIdentity}`;
+		const endpointPart = datastoreEndpoint === undefined ? '-' : `${datastoreEndpoint.length}:${datastoreEndpoint}`;
 		const keyEncodingPart = keyEncoding === 'native' ? '|keyEncoding=6:native' : '';
 		options = {
 			...options,
-			cacheScope: `datastore|project=${projectPart}|database=${databasePart}|namespace=${namespacePart}|client=${clientPart}${keyEncodingPart}`
+			cacheScope: `datastore|project=${projectPart}|database=${databasePart}|namespace=${namespacePart}|client=${clientPart}|endpoint=${endpointPart}${keyEncodingPart}`
 		};
 	}
 
@@ -5116,6 +5118,34 @@ function datastoreOptionalMethod(target: object, method: string, context: string
 		throw new ActiveTsConfigurationError(`${context} must be a function.`);
 	}
 	return value.bind(target);
+}
+
+// Use the configured client's endpoint snapshot, including the SDK-resolved
+// emulator servicePath/port. Never infer an injected client's endpoint from the
+// current process environment or from detached factory options.
+function readDatastoreEndpointIdentity(client: object): string | undefined {
+	const descriptor = Object.getOwnPropertyDescriptor(client, 'options');
+	if (!descriptor || !('value' in descriptor) || descriptor.value === undefined) return undefined;
+	const options = descriptor.value as Record<string, unknown>;
+	const parts: Record<string, string | number> = {};
+	let knownHost = false;
+	for (const key of ['apiEndpoint', 'servicePath'] as const) {
+		const value = ownFactoryOptionValue(options, key, 'Datastore adapter client.options');
+		if (value === undefined) continue;
+		if (typeof value !== 'string' || !value || value.includes('\0')) {
+			throw new ActiveTsConfigurationError(`Datastore adapter client.options.${key} must be a non-empty string without null bytes.`);
+		}
+		parts[key] = value;
+		knownHost = true;
+	}
+	const port = ownFactoryOptionValue(options, 'port', 'Datastore adapter client.options');
+	if (port !== undefined) {
+		if (!Number.isInteger(port) || (port as number) < 1 || (port as number) > 65535) {
+			throw new ActiveTsConfigurationError('Datastore adapter client.options.port must be a valid TCP port.');
+		}
+		parts.port = port as number;
+	}
+	return knownHost ? JSON_STRINGIFY(parts) : undefined;
 }
 
 function readConfiguredDatastoreProjectId(client: object): string | undefined {
