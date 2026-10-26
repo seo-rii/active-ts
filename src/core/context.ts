@@ -1885,21 +1885,35 @@ export class ActiveContext {
 				if (!ids.length) return [];
 				const meta = this.meta(model);
 				assertDirectIdReadAllowed(meta);
-				if (ids.length > this.maxBatchSize) {
-					const results: Array<TModel | null> = [];
-					const chunks = chunkItems(ids, this.maxBatchSize);
-					for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
-						const chunkResults = await this.loadManyNow(model, chunks[chunkIndex]);
-						for (let resultIndex = 0; resultIndex < chunkResults.length; resultIndex++) {
-							results[results.length] = chunkResults[resultIndex];
+				const idsByKey = new Map<string, EntityId>();
+				const indexesByKey = new Map<string, number[]>();
+				for (let index = 0; index < ids.length; index++) {
+					const key = entityIdKey(ids[index]);
+					mapSet(idsByKey, key, ids[index]);
+					const indexes = mapGet(indexesByKey, key) ?? [];
+					indexes[indexes.length] = index;
+					mapSet(indexesByKey, key, indexes);
+				}
+				const uniqueIds = iterableToArray(MAP_VALUES.call(idsByKey) as Iterable<EntityId>);
+				if (uniqueIds.length > this.maxBatchSize) {
+					const results: Array<TModel | null> = new Array(ids.length);
+					for (const uniqueChunk of chunkItems(uniqueIds, this.maxBatchSize)) {
+						const chunk: EntityId[] = [];
+						const resultIndexes: number[] = [];
+						for (const id of uniqueChunk) {
+							for (const index of mapGet(indexesByKey, entityIdKey(id))!) {
+								chunk[chunk.length] = ids[index];
+								resultIndexes[resultIndexes.length] = index;
+							}
+						}
+						const chunkResults = await this.loadManyNow(model, chunk);
+						for (let index = 0; index < chunkResults.length; index++) {
+							results[resultIndexes[index]] = chunkResults[index];
 						}
 					}
 					return results;
 				}
 				const store = this.internalStore(meta.store);
-				const idsByKey = new Map<string, EntityId>();
-				for (const id of ids) mapSet(idsByKey, entityIdKey(id), id);
-				const uniqueIds = iterableToArray(MAP_VALUES.call(idsByKey) as Iterable<EntityId>);
 				const cache = meta.cache && !this.transactionState ? this.internalCache(meta.cache.adapter) : undefined;
 				const distributedCache = cache && meta.cache?.consistency === 'distributed'
 					? this.assertDistributedCache(meta, cache)
