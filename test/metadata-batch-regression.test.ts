@@ -992,6 +992,25 @@ test('resolved field codecs remain frozen after cloning metadata', async () => {
 	assert.equal((await Record.use(context).find(1).load())?.data.name, 'expected');
 });
 
+test('rejected validator configuration preserves metadata and cached contexts', () => {
+	class Record extends Model<{ id: number; name: string }> {}
+	const original = (input: unknown) => input as { id: number; name: string };
+	const replacement = (input: unknown) => ({ ...(input as { id: number; name: string }), name: 'changed' });
+	defineModel('atomic_validator_configuration').validate(original).readValidation('warn').attach(Record);
+	const first = createActiveTs({ stores: { default: new MemoryStoreAdapter() } });
+	const cached = first.meta(Record);
+	assert.throws(() => modelMeta.validate(Record, replacement, 'invalid' as any), /Read validation mode/);
+	const second = createActiveTs({ stores: { default: new MemoryStoreAdapter() } });
+	assert.equal(first.meta(Record), cached);
+	assert.equal(second.meta(Record).validator, original);
+	assert.equal(getModelMeta(Record).validator, original);
+	assert.equal(second.meta(Record).readValidation, 'warn');
+	modelMeta.validate(Record, replacement, 'error');
+	assert.equal(first.meta(Record).validator, replacement);
+	assert.equal(second.meta(Record).validator, replacement);
+	assert.equal(first.meta(Record).readValidation, 'error');
+});
+
 test('metadata application ignores inherited top-level schema fields', () => {
 	class InheritedTopLevelSchema extends Model<MetadataData> {}
 	Object.defineProperty(Object.prototype, 'entity', {
