@@ -110,6 +110,14 @@ function scalarCondition(field: ReturnType<typeof fieldSql>, value: unknown, par
 	return `(${kind} and ${field.value} ${operator} ?)`;
 }
 
+function sqliteSortRank(type: unknown) {
+	if (type === null || type === 'null') return 0;
+	if (type === 'false' || type === 'true') return 1;
+	if (type === 'integer' || type === 'real') return 2;
+	if (type === 'text') return 3;
+	throw new ActiveTsValidationError('SQLite sort values must be scalar, null, or missing.');
+}
+
 function whereSql(plan: Pick<QueryPlan, 'where' | 'or'>, params: SQLInputValue[]): string {
 	const and = plan.where.map((where) => {
 		const field = fieldSql(where.field);
@@ -187,6 +195,7 @@ export async function createSqliteStoreAdapter(input: SqliteStoreOptions = {}): 
 		if (owned) DatabaseSync.prototype.close.call(database);
 		throw new ActiveTsConfigurationError('SQLite options.database must be an open node:sqlite DatabaseSync.');
 	}
+	Reflect.apply(DatabaseSync.prototype.function, database, ['active_ts_sort_rank', { deterministic: true }, sqliteSortRank]);
 	let state = connections.get(database);
 	if (!state) {
 		let scope = `sqlite:connection:${randomUUID()}`;
@@ -317,7 +326,7 @@ export async function createSqliteStoreAdapter(input: SqliteStoreOptions = {}): 
 				const order = sortWithStableId(plan, model.idField).map((sort) => {
 					const field = fieldSql(sort.field);
 					const direction = sort.direction === 'desc' ? 'desc' : 'asc';
-					return `(case ${field.type} when 'false' then 1 when 'true' then 1 when 'integer' then 2 when 'real' then 2 when 'text' then 3 else 0 end) ${direction}, ${field.value} ${direction}`;
+					return `active_ts_sort_rank(${field.type}) ${direction}, ${field.value} ${direction}`;
 				}).join(', ');
 				for (const field of plan.select ?? []) fieldSql(field);
 				const limit = limitWithLookahead(plan.limit, 'SQLite limit');

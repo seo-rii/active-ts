@@ -549,3 +549,22 @@ test('SQLite average preserves finite extremes, cancellation and subnormal resid
 		}), aggregateRows(rows, spec));
 	}
 });
+
+test('SQLite validates every matching sort value before applying the page limit', async (t) => {
+	const { store, model } = await fixture(t);
+	await store.create(model, 1, { id: 1, score: 1 });
+	await store.create(model, 2, { id: 2, score: 2 });
+	for (const score of [{ nested: 1 }, [1, 2]]) {
+		await store.update(model, 2, { id: 2, score });
+		for (const direction of ['asc', 'desc'] as const) {
+			await assert.rejects(() => store.query(model, {
+				...emptyPlan, sort: [{ field: 'score', direction }], limit: 1
+			}), /sort values must be scalar/);
+		}
+		// Invalid rows outside the query's input set do not poison its order.
+		assert.deepEqual((await store.query(model, {
+			...emptyPlan, where: [{ field: 'id', op: '=', value: 1 }],
+			sort: [{ field: 'score', direction: 'asc' }], limit: 1
+		})).list, [{ id: 1, score: 1 }]);
+	}
+});
