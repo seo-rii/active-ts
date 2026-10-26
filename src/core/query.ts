@@ -134,7 +134,7 @@ import {
 	relationAncestorForOwner,
 	relationTargetJoinKeys
 } from './relation-ancestor.js';
-import { contextInternalStore, runTrackedContextOperation } from './context-internal.js';
+import { contextInternalStore, contextMapConcurrent, runTrackedContextOperation } from './context-internal.js';
 import {
 	markDatastoreHistoricalModel,
 	MODEL_DATASTORE_WRITE_ANCESTOR,
@@ -1677,11 +1677,7 @@ export class QueryBuilder<TModel extends { data: any }, TData extends Record<str
 			}
 		}
 		attachDatastoreWriteAncestorScope(meta, list, scopedDatastoreAncestor);
-		const afterInstantiateTasks: Array<Promise<void> | void> = [];
-		for (let index = 0; index < list.length; index++) {
-			afterInstantiateTasks[index] = context.runAfterInstantiateHooks(meta, list[index] as any, 'query');
-		}
-		await Promise.all(afterInstantiateTasks);
+		await contextMapConcurrent(context, list, item => context.runAfterInstantiateHooks(meta, item as any, 'query'));
 		const expectedIds = modelResultSnapshots(meta, list, 'afterQuery original result');
 		await preloadIncludes(context, this.model, list, plan.include);
 		if (plan.include.length) {
@@ -2001,23 +1997,16 @@ async function preloadIncludes(
 						assertSafeEntityId(values[index], `${ownerMeta.name}.${relation.name} relation key`);
 					}
 					if (relationUsesAncestor) {
-						const loadTasks: Array<Promise<void>> = [];
 						resultByOwner = new Map<any, any | any[] | null>();
-						for (let index = 0; index < activeOwners.length; index++) {
-							const owner = activeOwners[index];
-							loadTasks[index] = (async () => {
-								let query = new QueryBuilder<any>(context, target);
-								if (owner.ancestor) query = query.ancestor(owner.ancestor);
-								mapSet(resultByOwner, owner.item, await query.find(owner.localValue as EntityId).load());
-							})();
-						}
-						await Promise.all(loadTasks);
+						await contextMapConcurrent(context, activeOwners, async owner => {
+							let query = new QueryBuilder<any>(context, target);
+							if (owner.ancestor) query = query.ancestor(owner.ancestor);
+							mapSet(resultByOwner, owner.item, await query.find(owner.localValue as EntityId).load());
+						});
 					} else {
-						const loadTasks: Array<Promise<any>> = [];
-						for (let index = 0; index < activeOwners.length; index++) {
-							loadTasks[index] = context.loadById(target, activeOwners[index].localValue as EntityId);
-						}
-						const loaded = await Promise.all(loadTasks);
+						const loaded = await contextMapConcurrent(context, activeOwners, owner =>
+							context.loadById(target, owner.localValue as EntityId)
+						);
 						resultByOwner = new Map<any, any | any[] | null>();
 						for (let index = 0; index < activeOwners.length; index++) {
 							mapSet(resultByOwner, activeOwners[index].item, loaded[index] ?? null);
@@ -2575,19 +2564,11 @@ export class SearchBuilder<TModel extends { data: any }, TIncludes extends boole
 					}
 				}
 				if (!includes.length) {
-					const afterInstantiateTasks: Array<Promise<void> | void> = [];
-					for (let index = 0; index < list.length; index++) {
-						afterInstantiateTasks[index] = context.runAfterInstantiateHooks(meta, list[index] as any, 'search');
-					}
-					await Promise.all(afterInstantiateTasks);
+					await contextMapConcurrent(context, list, item => context.runAfterInstantiateHooks(meta, item as any, 'search'));
 				}
 				const expectedIds = modelResultSnapshots(meta, list, 'afterSearch original result', { searchIdentityMeta: adapterMeta });
 				if (includes.length) {
-					const includeTasks: Array<Promise<void> | void> = [];
-					for (let index = 0; index < list.length; index++) {
-						includeTasks[index] = (list[index] as any).include(...includes);
-					}
-					await Promise.all(includeTasks);
+					await contextMapConcurrent(context, list, item => (item as any).include(...includes));
 					validateModelResultIdentities(context, meta, list, expectedIds, 'afterRelationLoad search result');
 				}
 				const result = { ...raw, list, count: list.length, total: staleHits ? undefined : raw.total };
@@ -2616,12 +2597,12 @@ export class SearchBuilder<TModel extends { data: any }, TIncludes extends boole
 		const revalidatePlan = where ? { where: whereShapeToEntries(where), or: [] } : undefined;
 		if (meta.datastore?.ancestor) {
 			const seen = new Set<string>();
-			const loadTasks: Array<Promise<TModel | null>> = [];
+			const loadTasks: Array<() => Promise<TModel | null>> = [];
 			for (let index = 0; index < hits.length; index++) {
 				const hit = hits[index];
 				const id = this.searchHitId(meta, hit);
 				if (!this.searchHitMatchesDocumentIdentity(meta, id, hit)) {
-					loadTasks[index] = Promise.resolve(null);
+					loadTasks[index] = async () => null;
 					continue;
 				}
 				const ancestor = datastoreSearchHitAncestor(meta, id, hit, `Search hit for ${meta.name}`);
@@ -2636,12 +2617,12 @@ export class SearchBuilder<TModel extends { data: any }, TIncludes extends boole
 					throw new ActiveTsValidationError(`Search result for ${meta.name} contains duplicate id "${String(id)}".`);
 				}
 				SET_ADD.call(seen, key);
-				loadTasks[index] = new QueryBuilder<TModel>(context, this.model)
+				loadTasks[index] = () => new QueryBuilder<TModel>(context, this.model)
 					.ancestor(safeAncestor)
 					.find(id)
 					.load();
 			}
-			const loaded = await Promise.all(loadTasks);
+			const loaded = await contextMapConcurrent(context, loadTasks, task => task());
 			const list: TModel[] = [];
 			let staleHits = 0;
 			for (const item of loaded) {
@@ -2664,11 +2645,7 @@ export class SearchBuilder<TModel extends { data: any }, TIncludes extends boole
 			this.rememberSearchHitId(meta, idsByKey, id, hit);
 		}
 		const ids = iterableToArray(MAP_VALUES.call(idsByKey) as Iterable<EntityId>);
-		const loadTasks: Array<Promise<any>> = [];
-		for (let index = 0; index < ids.length; index++) {
-			loadTasks[index] = context.loadByIdFresh(this.model, ids[index], 'search');
-		}
-		const loaded = await Promise.all(loadTasks);
+		const loaded = await contextMapConcurrent(context, ids, id => context.loadByIdFresh(this.model, id, 'search'));
 		const list: TModel[] = [];
 		for (const item of loaded) {
 			if (item && (!revalidatePlan || filterRows([item.data], revalidatePlan, meta.idField).length)) {

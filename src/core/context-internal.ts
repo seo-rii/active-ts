@@ -10,6 +10,7 @@ export type ActiveContextInternalAccess = {
 	assertWritable(operation: string): void;
 	markRollbackOnly(error: unknown): void;
 	trackOperation<T>(run: () => Promise<T>): Promise<T>;
+	mapConcurrent<T, TResult>(items: readonly T[], operation: (item: T, index: number) => Promise<TResult> | TResult): Promise<TResult[]>;
 };
 
 export const ACTIVE_CONTEXT_INTERNALS = Symbol('active-ts.context-internals');
@@ -72,4 +73,12 @@ export function runTrackedContextOperation<T>(
 
 export function currentTransactionContext() {
 	return transactionContextStorage.getStore();
+}
+
+export function contextMapConcurrent<T, TResult>(
+	context: ActiveContext,
+	items: readonly T[],
+	operation: (item: T, index: number) => Promise<TResult> | TResult
+) {
+	return activeContextInternals(context).mapConcurrent(items, operation);
 }

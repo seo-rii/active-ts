@@ -1,3 +1,4 @@
+import { mapConcurrent } from './concurrent-map.js';
 import { BatchLoader } from './batch-loader.js';
 import {
 	ActiveTsCommittedTransactionError,
@@ -285,7 +286,7 @@ const ACTIVE_TS_CONFIG_KEYS = [
 ] as const;
 const ACTIVE_CONTEXT_OPTION_KEYS = ['skipPluginSetup'] as const;
 const SCHEMA_CONFIG_KEYS = ['autoSync'] as const;
-const BATCH_CONFIG_KEYS = ['maxSize'] as const;
+const BATCH_CONFIG_KEYS = ['maxSize', 'concurrency'] as const;
 const AGGREGATE_CONFIG_KEYS = ['allowQueryFallback'] as const;
 const QUERY_PLANNER_KEYS = ['routeQuery', 'routeAggregate', 'routeSearch', 'schemaSearchAdapters'] as const;
 const SCHEMA_APPLY_OPTION_KEYS = ['mode'] as const;
@@ -1215,7 +1216,8 @@ export class ActiveContext {
 			searchAdapter: (name) => this.internalSearchAdapter(name),
 			assertWritable: (operation) => this.assertTransactionWritable(operation),
 			markRollbackOnly: (error) => this.markTransactionRollbackOnly(error),
-			trackOperation: (run) => this.trackOperation(run)
+			trackOperation: (run) => this.trackOperation(run),
+			mapConcurrent: (items, operation) => mapConcurrent(items, this.config.batch?.concurrency, operation)
 		};
 	}
 
@@ -2047,13 +2049,13 @@ export class ActiveContext {
 					mapSet(rawById, entityIdKey(id), value ?? null);
 				}
 				const list: Array<TModel | null> = [];
-				const afterInstantiateTasks: Array<Promise<unknown>> = [];
 				for (let index = 0; index < ids.length; index++) {
 					const item = this.instantiate(model, mapGet(rawById, entityIdKey(ids[index]))) as TModel | null;
 					list[index] = item;
-					if (item) afterInstantiateTasks[afterInstantiateTasks.length] = this.runAfterInstantiateHooks(meta, item as any);
 				}
-				await Promise.all(afterInstantiateTasks);
+				await mapConcurrent(list, this.config.batch?.concurrency, item =>
+					item ? this.runAfterInstantiateHooks(meta, item as any) : undefined
+				);
 				if (cache && missingIds.length && !this.transactionState) {
 					const cacheableMissingIds: EntityId[] = [];
 					for (let index = 0; index < missingIds.length; index++) {
@@ -3996,6 +3998,13 @@ function normalizeBatchConfig(batch: ActiveTsConfig['batch']) {
 	const maxSize = ownValue(batch as Record<string, unknown>, 'maxSize', 'batch');
 	const normalized = Object.create(null) as NonNullable<ActiveTsConfig['batch']>;
 	if (maxSize !== undefined) normalized.maxSize = maxSize as number;
+	const concurrency = ownValue(batch as Record<string, unknown>, 'concurrency', 'batch');
+	if (concurrency !== undefined) {
+		if (typeof concurrency !== 'number' || !Number.isSafeInteger(concurrency) || concurrency <= 0) {
+			throw new ActiveTsConfigurationError('batch.concurrency must be a positive safe integer.');
+		}
+		normalized.concurrency = concurrency;
+	}
 	return Object.freeze(normalized);
 }
 

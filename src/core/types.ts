@@ -568,7 +568,7 @@ export type ActiveTsConfig = {
 	defaultSearch?: string;
 	lazyWarnings?: boolean;
 	schema?: { autoSync?: SchemaSyncMode };
-	batch?: { maxSize?: number };
+	batch?: { maxSize?: number; concurrency?: number };
 	aggregate?: { allowQueryFallback?: boolean };
 	stores: Record<string, StoreAdapter>;
 	caches?: Record<string, CacheAdapter>;
