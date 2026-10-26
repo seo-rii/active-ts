@@ -473,7 +473,8 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 		const leased: OutboxEvent[] = [];
 		const blockedEntityKeys = new Set<string>();
 		let cursor: string | undefined;
-		const paged = limit !== undefined && store.capabilities?.cursor === true;
+		const paged = store.capabilities?.cursor === true;
+		const seenCursors = new Set<string>();
 		do {
 			const remaining = limit === undefined ? undefined : limit - leased.length;
 			if (remaining !== undefined && remaining <= 0) break;
@@ -518,8 +519,9 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 				}
 				if (limit !== undefined && leased.length >= limit) break;
 			}
-			if (!paged || !page.more || !page.cursor) break;
-			cursor = page.cursor;
+			if (limit !== undefined && leased.length >= limit) break;
+			cursor = nextStoreOutboxCursor(page, paged, seenCursors);
+			if (cursor === undefined) break;
 		} while (limit === undefined || leased.length < limit);
 		return leased;
 	}
@@ -918,7 +920,8 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 			const drained: OutboxEvent[] = [];
 			const blockedEntityKeys = new Set<string>();
 			let cursor: string | undefined;
-			const paged = limit !== undefined && store.capabilities?.cursor === true;
+			const paged = store.capabilities?.cursor === true;
+			const seenCursors = new Set<string>();
 			do {
 				const remaining = limit === undefined ? undefined : limit - drained.length;
 				if (remaining !== undefined && remaining <= 0) break;
@@ -980,8 +983,9 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 						throw error;
 					}
 				}
-				if (!paged || !page.more || !page.cursor) break;
-				cursor = page.cursor;
+				if (limit !== undefined && drained.length >= limit) break;
+				cursor = nextStoreOutboxCursor(page, paged, seenCursors);
+				if (cursor === undefined) break;
 			} while (limit === undefined || drained.length < limit);
 			return drained;
 		};
@@ -1026,7 +1030,16 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 	}
 
 	private async listWithContext(context: ActiveContext) {
-		return (await this.listPageWithContext(context)).events;
+		const store = contextInternalStore(context, this.meta.store);
+		const events: OutboxEvent[] = [];
+		const seenCursors = new Set<string>();
+		let cursor: string | undefined;
+		do {
+			const page = await this.listPageWithContext(context, { cursor });
+			for (const event of page.events) events.push(event);
+			cursor = nextStoreOutboxCursor(page, store.capabilities?.cursor === true, seenCursors);
+		} while (cursor !== undefined);
+		return events;
 	}
 
 	private async listPageWithContext(
@@ -1278,6 +1291,19 @@ function isStoreOutboxLeaseClaimConflict(store: StoreAdapter, error: unknown) {
 	const descriptor = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(error, 'code');
 	if (!descriptor || !('value' in descriptor) || !descriptor.enumerable) return false;
 	return descriptor.value === 10 || descriptor.value === 'aborted' || descriptor.value === 'ABORTED';
+}
+
+function nextStoreOutboxCursor(
+	page: { more: boolean; cursor?: string },
+	supportsCursor: boolean,
+	seen: Set<string>
+): string | undefined {
+	if (!page.more) return undefined;
+	if (!supportsCursor || !page.cursor || SET_HAS.call(seen, page.cursor)) {
+		throw new ActiveTsConfigurationError('Store outbox requires an advancing cursor to consume a continuation page.');
+	}
+	SET_ADD.call(seen, page.cursor);
+	return page.cursor;
 }
 
 function outboxListQueryPlan(options: { limit?: number; cursor?: string } = {}): QueryPlan {
