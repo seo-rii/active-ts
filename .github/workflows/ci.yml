@@ -24,6 +24,8 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm run audit
       - run: node --test scripts/prepare-package.test.mjs scripts/release-artifact.test.mjs
+      - name: Check the generated active risk register
+        run: node --test scripts/render-risk-register.test.mjs
       - run: pnpm typecheck
       - run: pnpm test
       - run: node --test test/packed-artifact.test.mjs
