@@ -393,8 +393,10 @@ export class ActiveTestContext {
 		this.installed = false;
 	}
 
-	static hasInstalledContext() {
-		return !!ActiveTestContext.installedContext;
+	static hasInstalledContext(context?: ActiveTestContext) {
+		return context === undefined
+			? !!ActiveTestContext.installedContext
+			: ActiveTestContext.installedContext === context;
 	}
 
 	async seed<TModel extends { data: any }>(model: ModelConstructor<TModel>, rows: TModel['data'][]) {
@@ -539,11 +541,12 @@ export async function withTestContext<T>(
 	const withOptions = normalizeWithTestContextOptions(options);
 	return await currentTestContext.run(context, async () => {
 		if (withOptions.install === false) return await fn(context);
+		const alreadyInstalled = ActiveTestContext.hasInstalledContext(context);
 		context.install();
 		try {
 			return await fn(context);
 		} finally {
-			context.restore();
+			if (!alreadyInstalled) context.restore();
 		}
 	});
 }
