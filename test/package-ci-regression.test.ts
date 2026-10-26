@@ -227,7 +227,7 @@ test('CI and package scripts keep dependency audit enabled', () => {
 	const ciWorkflow = readFileSync('.github/workflows/ci.yml', 'utf8');
 	const releaseWorkflow = readFileSync('.github/workflows/release.yml', 'utf8');
 	const ciAuditIndex = ciWorkflow.indexOf('pnpm run audit');
-	const ciTypecheckIndex = ciWorkflow.indexOf('pnpm typecheck');
+	const ciBuildIndex = ciWorkflow.indexOf('pnpm build');
 	const releaseAuditIndex = releaseWorkflow.indexOf('pnpm run audit');
 	const releaseTypecheckIndex = releaseWorkflow.indexOf('pnpm typecheck');
 
@@ -240,7 +240,8 @@ test('CI and package scripts keep dependency audit enabled', () => {
 	assert.match(pnpmWorkspace, /^overrides:\n(?:  [^\n]+\n)*  protobufjs: 7\.6\.5$/m);
 	assert.match(pnpmWorkspace, /^overrides:\n(?:  [^\n]+\n)*  undici: 7\.29\.1$/m);
 	assert.ok(ciAuditIndex >= 0, 'CI workflow must run dependency audit');
-	assert.ok(ciAuditIndex < ciTypecheckIndex, 'CI dependency audit must run before typecheck');
+	assert.ok(ciBuildIndex >= 0, 'CI workflow must compile and typecheck sources before tests');
+	assert.ok(ciAuditIndex < ciBuildIndex, 'CI dependency audit must run before compilation');
 	assert.ok(releaseAuditIndex >= 0, 'release workflow must run dependency audit');
 	assert.ok(releaseAuditIndex < releaseTypecheckIndex, 'release dependency audit must run before typecheck');
 	assert.doesNotMatch(ciWorkflow, /run: pnpm audit\b/);
@@ -317,7 +318,16 @@ test('workflow toolchain versions match package metadata', () => {
 			assert.equal(match[1], pnpmVersion, `${file} pnpm/action-setup version must match packageManager`);
 		}
 		for (const match of workflow.matchAll(/actions\/setup-node@[^\n]+\n\s+with:\n\s+node-version:\s*([^\s]+)/g)) {
-			assert.equal(match[1], nodeMajor, `${file} setup-node major must match engines.node lower bound`);
+			if (match[1] === '${{') {
+				assert.match(workflow, /node-version: \$\{\{ matrix\.node \}\}/);
+				const values = /\bnode: \[([\d, ]+)\]/.exec(workflow)?.[1];
+				assert.ok(values, `${file} Node matrix must list supported major versions`);
+				const majors = values.split(',').map(value => Number(value.trim()));
+				assert.ok(majors.includes(Number(nodeMajor)), `${file} must test the supported lower bound`);
+				assert.ok(majors.every(major => major >= Number(nodeMajor)), `${file} must not test unsupported Node versions`);
+			} else {
+				assert.equal(match[1], nodeMajor, `${file} setup-node major must match engines.node lower bound`);
+			}
 		}
 	}
 });
