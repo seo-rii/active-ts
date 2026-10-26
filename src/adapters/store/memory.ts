@@ -63,7 +63,7 @@ import {
 } from '../../core/field-codecs.js';
 import {
 	assertCursorMatchesSort,
-	compareRowsBySort,
+	prepareRowSort,
 	compareRowToCursor,
 	cursorValues,
 	decodeCursor,
@@ -927,21 +927,33 @@ export class MemoryStoreAdapter implements StoreAdapter {
 }
 
 function sortMemoryRows(rows: any[], sort: ReturnType<typeof sortWithStableId>) {
-	const sorted: any[] = [];
-	for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
-		const row = rows[rowIndex];
-		let insertAt = sorted.length;
-		for (let sortedIndex = 0; sortedIndex < sorted.length; sortedIndex++) {
-			if (compareRowsBySort(row, sorted[sortedIndex], sort) < 0) {
-				insertAt = sortedIndex;
-				break;
+	const prepared = prepareRowSort(sort);
+	type Entry = { row: any; key: ReturnType<typeof prepared.keyFor> };
+	let source: Entry[] = [];
+	let target: Entry[] = [];
+	for (let index = 0; index < rows.length; index++) {
+		source[index] = { row: rows[index], key: prepared.keyFor(rows[index]) };
+	}
+	// Bottom-up merge sort provides stable O(n log n) comparisons without
+	// trusting a mutable Array.prototype.sort or repeatedly validating keys.
+	for (let width = 1; width < source.length; width *= 2) {
+		for (let start = 0; start < source.length; start += width * 2) {
+			const middle = Math.min(start + width, source.length);
+			const end = Math.min(start + width * 2, source.length);
+			let left = start;
+			let right = middle;
+			for (let output = start; output < end; output++) {
+				if (left < middle && (right >= end || prepared.compareKeys(source[left].key, source[right].key) <= 0)) {
+					target[output] = source[left++];
+				} else target[output] = source[right++];
 			}
 		}
-		for (let shift = sorted.length; shift > insertAt; shift--) {
-			sorted[shift] = sorted[shift - 1];
-		}
-		sorted[insertAt] = row;
+		const previous = source;
+		source = target;
+		target = previous;
 	}
+	const sorted: any[] = [];
+	for (let index = 0; index < source.length; index++) sorted[index] = source[index].row;
 	return sorted;
 }
 
