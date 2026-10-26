@@ -568,3 +568,28 @@ test('SQLite validates every matching sort value before applying the page limit'
 		})).list, [{ id: 1, score: 1 }]);
 	}
 });
+
+test('SQLite Unicode comparisons, pages and extrema follow JavaScript UTF-16 order', async (t) => {
+	const model = metadata('active_sqlite_unicode_order', { fieldTypes: new Map([['label', 'string']]) });
+	const { store } = await fixture(t, model);
+	const labels = ['\uE000', '\u{10000}', '\uD7FF', '\uD7FFx', '\u{10FFFF}', '\uFFFF', '', 'a', 'aa', 'a\0z'];
+	for (const [id, label] of labels.entries()) await store.create(model, id, { id, label });
+	const ordered = [...labels].sort();
+	for (const direction of ['asc', 'desc'] as const) {
+		const expected = direction === 'asc' ? ordered : [...ordered].reverse();
+		assert.deepEqual((await store.query(model, {
+			...emptyPlan, sort: [{ field: 'label', direction }], offset: 2, limit: 5
+		})).list.map((row) => row.label), expected.slice(2, 7));
+	}
+	for (const bound of labels) {
+		for (const op of ['=', '>', '<'] as const) {
+			const matches = labels.filter((value) => op === '=' ? value === bound : op === '>' ? value > bound : value < bound);
+			assert.deepEqual((await store.query(model, {
+				...emptyPlan, where: [{ field: 'label', op, value: bound }], sort: [{ field: 'label', direction: 'asc' }]
+			})).list.map((row) => row.label), matches.sort());
+		}
+	}
+	assert.deepEqual(await store.aggregate!(model, { where: [], or: [], aggregates: [
+		{ op: 'min', field: 'label', as: 'min' }, { op: 'max', field: 'label', as: 'max' }
+	] }), { min: ordered[0], max: ordered.at(-1) });
+});
