@@ -1210,6 +1210,16 @@ export class ActiveContext {
 
 	private [ACTIVE_CONTEXT_INTERNALS](): ActiveContextInternalAccess {
 		return {
+			hasQueryHooks: (model) => {
+				for (const name of ['beforeQuery', 'afterQuery'] as const) {
+					if (toHookList(model.hooks[name]).length) return true;
+					for (const plugin of this.config.plugins ?? []) {
+						const hooks = plugin.hooks;
+						if (hooks && toHookList(hooks[name]).length) return true;
+					}
+				}
+				return false;
+			},
 			store: (name) => this.internalStore(name),
 			cache: (name) => this.internalCache(name),
 			searchAdapter: (name) => this.internalSearchAdapter(name),

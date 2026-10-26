@@ -134,7 +134,7 @@ import {
 	relationAncestorForOwner,
 	relationTargetJoinKeys
 } from './relation-ancestor.js';
-import { contextInternalStore, runTrackedContextOperation } from './context-internal.js';
+import { contextHasQueryHooks, contextInternalStore, runTrackedContextOperation } from './context-internal.js';
 import {
 	markDatastoreHistoricalModel,
 	MODEL_DATASTORE_WRITE_ANCESTOR,
@@ -1995,7 +1995,8 @@ async function preloadIncludes(
 					relation.foreignKey === targetMeta.idField &&
 					!relation.preload?.length &&
 					!needsTargetAncestorFieldMatch &&
-					!targetHasDatastoreAncestorFields
+					!targetHasDatastoreAncestorFields &&
+					!contextHasQueryHooks(context, targetMeta)
 				) {
 					for (let index = 0; index < values.length; index++) {
 						assertSafeEntityId(values[index], `${ownerMeta.name}.${relation.name} relation key`);

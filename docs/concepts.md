@@ -430,3 +430,8 @@ and indexes. Destructive changes are intentionally out of scope.
 
 `schemaMigration(models, name)` captures the same plans as a migration snapshot
 without applying them.
+
+Relation queries apply the target model's query hooks consistently, including
+soft-delete filters. A one/id relation may use a batched direct-read shortcut
+only when no target-model or context query hooks are configured. Adding a
+`preload` projection therefore changes fields, not relation membership.
