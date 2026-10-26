@@ -1,3 +1,5 @@
+import { datastoreMember, datastoreOptionalMethod, ownFactoryOptionValue } from './datastore-client-properties.js';
+import { datastorePhysicalCacheScope, resolveDatastorePhysicalIdentity } from './datastore-identity.js';
 import { createHash, randomInt, randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
@@ -458,7 +460,6 @@ const DATASTORE_RETRY_INITIAL_DELAY_MS = 25;
 const DATASTORE_RETRY_MAX_DELAY_MS = 1000;
 const DATASTORE_RETRY_DELAY_LIMIT_MS = 60_000;
 const DATASTORE_SCAN_FALLBACK_INCOMPLETE_RESULTS = new WeakSet<object>();
-const DATASTORE_CLIENT_CACHE_SCOPE_IDS = new WeakMap<object, string>();
 
 export function createDatastoreIndexYaml(models: ResolvedModelMeta | ResolvedModelMeta[]): string {
 	const modelList = Array.isArray(models) ? models : [models];
@@ -1292,39 +1293,14 @@ export async function createDatastoreStoreAdapter(
 	const datastoreKeySymbol = configuredKeySymbol ?? await resolveDatastoreKeySymbol(loadSdk);
 	const supportsKeyOnlyProjection = configuredKeySymbol !== undefined;
 	const transactionFactory = datastoreOptionalMethod(rawClient, 'transaction', 'Datastore adapter client.transaction');
-	const datastoreProjectId = injectedClient
-		? readConfiguredDatastoreProjectId(rawClient)
-		: await resolveDatastoreProjectId(rawClient);
-	const datastoreDatabaseId = readDatastoreDatabaseId(rawClient);
-	const datastoreEndpoint = readDatastoreEndpointIdentity(rawClient);
+	const identity = await resolveDatastorePhysicalIdentity(rawClient, injectedClient);
+	const datastoreProjectId = identity.projectId;
+	const datastoreDatabaseId = identity.databaseId;
 	const datastoreCacheScopeStability = options.cacheScope !== undefined || (
-		datastoreProjectId !== undefined && datastoreDatabaseId !== undefined && datastoreEndpoint !== undefined
+		datastoreProjectId !== undefined && datastoreDatabaseId !== undefined && identity.endpoint !== undefined
 	) ? 'stable' : 'client';
 	if (options.cacheScope === undefined) {
-		const projectId = datastoreProjectId;
-		const databaseId = datastoreDatabaseId;
-		let clientIdentity: string | undefined;
-		if (projectId === undefined || databaseId === undefined || datastoreEndpoint === undefined) {
-			clientIdentity = WEAKMAP_GET.call(DATASTORE_CLIENT_CACHE_SCOPE_IDS, rawClient) as string | undefined;
-			if (clientIdentity === undefined) {
-				clientIdentity = randomUUID();
-				WEAKMAP_SET.call(DATASTORE_CLIENT_CACHE_SCOPE_IDS, rawClient, clientIdentity);
-			}
-		}
-		const projectPart = projectId === undefined ? '-' : `${projectId.length}:${projectId}`;
-		const databasePart = databaseId === undefined
-			? '-'
-			: databaseId === null
-				? 'default'
-				: `${databaseId.length}:${databaseId}`;
-		const namespacePart = options.namespace === undefined ? '-' : `${options.namespace.length}:${options.namespace}`;
-		const clientPart = clientIdentity === undefined ? '-' : `${clientIdentity.length}:${clientIdentity}`;
-		const endpointPart = datastoreEndpoint === undefined ? '-' : `${datastoreEndpoint.length}:${datastoreEndpoint}`;
-		const keyEncodingPart = keyEncoding === 'native' ? '|keyEncoding=6:native' : '';
-		options = {
-			...options,
-			cacheScope: `datastore|project=${projectPart}|database=${databasePart}|namespace=${namespacePart}|client=${clientPart}|endpoint=${endpointPart}${keyEncodingPart}`
-		};
+		options = { ...options, cacheScope: datastorePhysicalCacheScope(rawClient, identity, options.namespace, keyEncoding) };
 	}
 
 	return createDatastoreAdapter(
@@ -4582,17 +4558,6 @@ function snapshotSdkOptions(value: unknown, context: string) {
 	return snapshot;
 }
 
-function ownFactoryOptionValue(record: Record<string, unknown>, key: string, context: string) {
-	if (!Object.prototype.hasOwnProperty.call(record, key)) return undefined;
-	const descriptor = Object.getOwnPropertyDescriptor(record, key);
-	if (!descriptor || !('value' in descriptor)) {
-		throw new ActiveTsConfigurationError(`${context} "${key}" must be a data property.`);
-	}
-	if (!descriptor.enumerable) {
-		throw new ActiveTsConfigurationError(`${context} "${key}" must be enumerable.`);
-	}
-	return descriptor.value;
-}
 
 function normalizeDatastoreClient(client: unknown) {
 	if (!client || typeof client !== 'object' || Array.isArray(client)) {
@@ -5122,118 +5087,6 @@ function datastoreTransactionConflict(error: unknown) {
 	return conflict;
 }
 
-function datastoreOptionalMethod(target: object, method: string, context: string) {
-	const value = datastoreMember(target, method, context, { requireEnumerableOwn: true });
-	if (value === undefined) return undefined;
-	if (typeof value !== 'function') {
-		throw new ActiveTsConfigurationError(`${context} must be a function.`);
-	}
-	return value.bind(target);
-}
-
-// Use the configured client's endpoint snapshot, including the SDK-resolved
-// emulator servicePath/port. Never infer an injected client's endpoint from the
-// current process environment or from detached factory options.
-function readDatastoreEndpointIdentity(client: object): string | undefined {
-	const descriptor = Object.getOwnPropertyDescriptor(client, 'options');
-	if (!descriptor || !('value' in descriptor) || descriptor.value === undefined) return undefined;
-	const options = descriptor.value as Record<string, unknown>;
-	const parts: Record<string, string | number> = {};
-	let knownHost = false;
-	for (const key of ['apiEndpoint', 'servicePath'] as const) {
-		const value = ownFactoryOptionValue(options, key, 'Datastore adapter client.options');
-		if (value === undefined) continue;
-		if (typeof value !== 'string' || !value || value.includes('\0')) {
-			throw new ActiveTsConfigurationError(`Datastore adapter client.options.${key} must be a non-empty string without null bytes.`);
-		}
-		parts[key] = value;
-		knownHost = true;
-	}
-	const port = ownFactoryOptionValue(options, 'port', 'Datastore adapter client.options');
-	if (port !== undefined) {
-		if (!Number.isInteger(port) || (port as number) < 1 || (port as number) > 65535) {
-			throw new ActiveTsConfigurationError('Datastore adapter client.options.port must be a valid TCP port.');
-		}
-		parts.port = port as number;
-	}
-	return knownHost ? JSON_STRINGIFY(parts) : undefined;
-}
-
-function readConfiguredDatastoreProjectId(client: object): string | undefined {
-	const descriptor = Object.getOwnPropertyDescriptor(client, 'options');
-	if (!descriptor) return undefined;
-	if (!('value' in descriptor)) {
-		throw new ActiveTsConfigurationError('Datastore adapter client.options must be a data property.');
-	}
-	if (!descriptor.enumerable && descriptor.value !== undefined) {
-		throw new ActiveTsConfigurationError('Datastore adapter client.options must be enumerable.');
-	}
-	const options = descriptor.value;
-	if (options === undefined) return undefined;
-	if (!options || typeof options !== 'object' || Array.isArray(options)) {
-		throw new ActiveTsConfigurationError('Datastore adapter client.options must be an object.');
-	}
-	const projectId = ownFactoryOptionValue(
-		options as Record<string, unknown>,
-		'projectId',
-		'Datastore adapter client.options'
-	);
-	if (projectId === undefined) return undefined;
-	if (typeof projectId !== 'string' || !projectId || projectId.includes('\0')) {
-		throw new ActiveTsConfigurationError(
-			'Datastore adapter client.options.projectId must be a non-empty string without null bytes.'
-		);
-	}
-	return projectId;
-}
-
-async function resolveDatastoreProjectId(client: object): Promise<string | undefined> {
-	const configured = readConfiguredDatastoreProjectId(client);
-	if (configured !== undefined) return configured;
-	const getProjectId = datastoreMember(client, 'getProjectId', 'Datastore adapter client.getProjectId');
-	if (getProjectId === undefined) return undefined;
-	if (typeof getProjectId !== 'function') {
-		throw new ActiveTsConfigurationError('Datastore adapter client.getProjectId must be a function.');
-	}
-	let projectId: unknown;
-	try {
-		projectId = await Reflect.apply(getProjectId, client, []);
-	} catch (error) {
-		throw new ActiveTsConfigurationError(
-			`Datastore adapter client.getProjectId failed: ${safeErrorMessage(error)}`
-		);
-	}
-	if (typeof projectId !== 'string' || !projectId || projectId.includes('\0')) {
-		throw new ActiveTsConfigurationError(
-			'Datastore adapter client.getProjectId must resolve to a non-empty string without null bytes.'
-		);
-	}
-	return projectId;
-}
-
-function readDatastoreDatabaseId(client: object): string | null | undefined {
-	const getDatabaseId = datastoreOptionalMethod(
-		client,
-		'getDatabaseId',
-		'Datastore adapter client.getDatabaseId'
-	);
-	if (!getDatabaseId) return undefined;
-	let databaseId: unknown;
-	try {
-		databaseId = getDatabaseId();
-	} catch (error) {
-		throw new ActiveTsConfigurationError(
-			`Datastore adapter client.getDatabaseId failed: ${safeErrorMessage(error)}`
-		);
-	}
-	if (databaseId === undefined) return null;
-	if (typeof databaseId !== 'string' || !databaseId || databaseId.includes('\0')) {
-		throw new ActiveTsConfigurationError(
-			'Datastore adapter client.getDatabaseId must return a non-empty string without null bytes, or undefined for the default database.'
-		);
-	}
-	return databaseId;
-}
 
 function datastoreMethod(target: object, method: string, context: string) {
 	const value = datastoreMember(target, method, context, { requireEnumerableOwn: true });
@@ -5243,28 +5096,6 @@ function datastoreMethod(target: object, method: string, context: string) {
 	return value.bind(target);
 }
 
-function datastoreMember(
-	target: object,
-	property: string,
-	context: string,
-	options: { requireEnumerableOwn?: boolean } = {}
-) {
-	let current: object | null = target;
-	while (current && current !== Object.prototype) {
-		if (Object.prototype.hasOwnProperty.call(current, property)) {
-			const descriptor = Object.getOwnPropertyDescriptor(current, property);
-			if (!descriptor || !('value' in descriptor)) {
-				throw new ActiveTsConfigurationError(`${context} must be a data property.`);
-			}
-			if (options.requireEnumerableOwn && current === target && !descriptor.enumerable && descriptor.value !== undefined) {
-				throw new ActiveTsConfigurationError(`${context} must be enumerable.`);
-			}
-			return descriptor.value;
-		}
-		current = Object.getPrototypeOf(current);
-	}
-	return undefined;
-}
 
 function ownOptionValue(record: Record<string, unknown>, key: string) {
 	if (!Object.prototype.hasOwnProperty.call(record, key)) return undefined;
