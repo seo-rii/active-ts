@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Datastore } from '@google-cloud/datastore';
 import { Model, defineModel, createActiveTs, MemoryCacheAdapter } from '../src/index.js';
-import { createDatastoreStoreAdapter } from '../src/adapters/store/datastore-injected.js';
+import { createDatastoreNamespaceStoreFactory, createDatastoreStoreAdapter } from '../src/adapters/store/datastore-injected.js';
 
 function client(endpoint?: string, port?: number) {
 	return {
@@ -22,6 +22,28 @@ test('Datastore derived scopes isolate endpoints, ports, and unidentified inject
 	assert.equal(await scope(unknown), await scope(unknown));
 	assert.notEqual(await scope(unknown), await scope(client()));
 	assert.equal((await createDatastoreStoreAdapter({ client: unknown, cacheScope: 'explicit' })).cacheScope, 'explicit');
+});
+
+test('Datastore scope stability distinguishes physical identities from client-local isolation', async () => {
+	for (const [endpoint, explicit, expected] of [
+		[undefined, undefined, 'client'],
+		['datastore.googleapis.com', undefined, 'stable'],
+		[undefined, 'verified-physical-backend', 'stable']
+	] as const) {
+		const raw = client(endpoint);
+		const transactional = Object.assign(raw, { transaction: () => ({
+			...raw, run: async () => {}, commit: async () => {}, rollback: async () => {}
+		}) });
+		const store = await createDatastoreStoreAdapter({ client: transactional, cacheScope: explicit });
+		assert.equal(store.datastoreCacheScopeStability, expected);
+		await store.transaction!(async tx => { assert.equal(tx.datastoreCacheScopeStability, expected); });
+		await store.transaction!(async tx => { assert.equal(tx.datastoreCacheScopeStability, expected); }, { readOnly: true });
+	}
+	const unknown = client();
+	const automatic = await createDatastoreNamespaceStoreFactory({ client: unknown });
+	assert.equal((await automatic.forNamespace('tenant')).datastoreCacheScopeStability, 'client');
+	const explicit = await createDatastoreNamespaceStoreFactory({ client: unknown, cacheScopePrefix: 'verified-backend' });
+	assert.equal((await explicit.forNamespace('tenant')).datastoreCacheScopeStability, 'stable');
 });
 
 test('Datastore endpoint isolation prevents shared cache reads from another backend', async () => {

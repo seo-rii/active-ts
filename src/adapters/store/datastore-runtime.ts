@@ -1297,6 +1297,9 @@ export async function createDatastoreStoreAdapter(
 		: await resolveDatastoreProjectId(rawClient);
 	const datastoreDatabaseId = readDatastoreDatabaseId(rawClient);
 	const datastoreEndpoint = readDatastoreEndpointIdentity(rawClient);
+	const datastoreCacheScopeStability = options.cacheScope !== undefined || (
+		datastoreProjectId !== undefined && datastoreDatabaseId !== undefined && datastoreEndpoint !== undefined
+	) ? 'stable' : 'client';
 	if (options.cacheScope === undefined) {
 		const projectId = datastoreProjectId;
 		const databaseId = datastoreDatabaseId;
@@ -1330,6 +1333,7 @@ export async function createDatastoreStoreAdapter(
 		options,
 		datastoreProjectId,
 		datastoreDatabaseId,
+		datastoreCacheScopeStability,
 		datastoreKeySymbol,
 		supportsKeyOnlyProjection,
 		transactionFactory
@@ -1466,6 +1470,7 @@ function createDatastoreAdapter(
 	options: DatastoreStoreOptions,
 	datastoreProjectId: string | undefined,
 	datastoreDatabaseId: string | null | undefined,
+	datastoreCacheScopeStability: 'stable' | 'client',
 	datastoreKeySymbol: symbol,
 	supportsKeyOnlyProjection: boolean,
 	transactionFactory?: DatastoreTransactionFactory,
@@ -1687,6 +1692,7 @@ function createDatastoreAdapter(
 		datastoreProjectId,
 		datastoreDatabaseId,
 		datastoreKeyEncoding: keyEncoding,
+		datastoreCacheScopeStability,
 		capabilities: {
 			or: false,
 			contains: false,
@@ -1836,6 +1842,7 @@ function createDatastoreAdapter(
 							options,
 							datastoreProjectId,
 							datastoreDatabaseId,
+							datastoreCacheScopeStability,
 							datastoreKeySymbol,
 							supportsKeyOnlyProjection,
 							undefined,
@@ -1848,6 +1855,7 @@ function createDatastoreAdapter(
 							options,
 							datastoreProjectId,
 							datastoreDatabaseId,
+							datastoreCacheScopeStability,
 							datastoreKeySymbol,
 							supportsKeyOnlyProjection,
 							undefined,
@@ -1859,6 +1867,7 @@ function createDatastoreAdapter(
 							options,
 							datastoreProjectId,
 							datastoreDatabaseId,
+							datastoreCacheScopeStability,
 							datastoreKeySymbol,
 							supportsKeyOnlyProjection,
 							undefined,
@@ -2172,6 +2181,7 @@ function createDatastoreAdapter(
 								? adapter.datastoreDatabaseId
 								: txStore.datastoreDatabaseId,
 							datastoreKeyEncoding: txStore.datastoreKeyEncoding ?? adapter.datastoreKeyEncoding,
+							datastoreCacheScopeStability: txStore.datastoreCacheScopeStability ?? adapter.datastoreCacheScopeStability,
 							capabilities: { ...txStore.capabilities, transaction: false },
 							get: async (model, id, readOptions) => {
 								model = snapshotAdapterModel(model, 'Datastore model metadata');
@@ -3907,6 +3917,7 @@ function createReadOnlyDatastoreTransactionStore(
 		datastoreProjectId: txStore.datastoreProjectId,
 		datastoreDatabaseId: txStore.datastoreDatabaseId,
 		datastoreKeyEncoding: txStore.datastoreKeyEncoding,
+		datastoreCacheScopeStability: txStore.datastoreCacheScopeStability,
 		capabilities: Object.freeze({ ...(txStore.capabilities ?? {}), transaction: false, native: false }),
 		get: (model, id, options) =>
 			txStore.get(model, id, normalizeReadOnlyReadOptions(options, 'Datastore read-only transaction get options')),
