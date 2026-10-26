@@ -39,6 +39,7 @@ import { MAP_CLEAR, MAP_ENTRIES, MAP_GET, MAP_SET, SET_ADD, SET_HAS } from './co
 import {
 	assertContextTransactionWritable,
 	contextInternalStore,
+	contextMapConcurrent,
 	markContextTransactionRollbackOnly,
 	runTrackedContextOperation
 } from './context-internal.js';
@@ -359,11 +360,7 @@ export abstract class Model<TData extends Record<string, any> = Record<string, a
 						);
 						if (nested.length && result) {
 							if (Array.isArray(result)) {
-								const tasks: Array<Promise<unknown>> = [];
-								for (let index = 0; index < result.length; index++) {
-									tasks[index] = result[index].include(...nested);
-								}
-								await Promise.all(tasks);
+								await contextMapConcurrent(context, result, item => item.include(...nested));
 							} else {
 								await (result as any).include(...nested);
 							}

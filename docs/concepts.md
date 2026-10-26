@@ -430,3 +430,11 @@ and indexes. Destructive changes are intentionally out of scope.
 
 `schemaMigration(models, name)` captures the same plans as a migration snapshot
 without applying them.
+
+Use `batch: { concurrency: 16 }` in the active-ts context configuration to bound
+asynchronous relation loading, search hydration and `afterInstantiate` hooks
+within each collection. Results retain input order. With a configured limit, started work is drained
+before rejection and queued work is not started after failure. The default remains
+unbounded for compatibility; the limit is per collection, not a global request
+or provider RPC quota. `batch.maxSize` continues to control unique read batch
+size independently.
