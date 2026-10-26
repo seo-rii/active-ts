@@ -1,4 +1,5 @@
 import { optionalImport } from '../../core/optional-import.js';
+import { createAdapterCloser } from '../../core/adapter-lifecycle.js';
 import {
 	ActiveTsConfigurationError,
 	ActiveTsConflictError,
@@ -333,11 +334,15 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 		client = new Firestore(options.firestoreOptions ?? {});
 		AggregateField ??= mod.AggregateField;
 	}
+	const rawClient = client;
+	const close = createAdapterCloser(options.client ? undefined :
+		() => firestoreMethod(rawClient, 'terminate', 'Firestore client.terminate')());
 	client = normalizeFirestoreClient(client);
 	AggregateField = AggregateField === undefined ? undefined : normalizeFirestoreAggregateField(AggregateField);
 
 	const adapter: StoreAdapter = {
 		kind: 'firestore',
+		close,
 		cacheScope: options.cacheScope,
 		capabilities: {
 			or: false,
