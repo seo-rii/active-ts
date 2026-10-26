@@ -3491,6 +3491,76 @@ test('empty search include requests reload full models consistently with their t
 	}
 });
 
+async function createNamespacedSearchIncludeOwner(
+	hook?: 'beforeRelationLoad' | 'afterRelationLoad',
+	mutate?: (data: { parentId: number; parentNamespace?: string }) => void
+) {
+	type OwnerData = { id: number; parentId: number; parentNamespace?: string; title: string };
+	class Parent extends Model<{ id: number; name: string }> {}
+	class Owner extends Model<OwnerData> {}
+	defineModel<{ id: number; name: string }>('namespaced_search_include_parent')
+		.id('id').validate(value => value as { id: number; name: string }).attach(Parent);
+	defineModel<OwnerData>({ name: 'namespaced_search_include_owner', search: 'memory' })
+		.id('id').validate(value => value as OwnerData)
+		.datastore({
+			ancestor: ({ data }) => data ? datastoreKey('parent', data.parentId, { namespace: data.parentNamespace }) : undefined,
+			ancestorFields: ['parentId']
+		})
+		.search('memory', ['title', 'parentId'])
+		.ref('parent', () => Parent, { localKey: 'parentId', foreignKey: 'id' }).attach(Owner);
+	const store = Object.assign(new MemoryStoreAdapter(), { datastoreNamespace: 'tenant_a' });
+	Object.assign(store.capabilities, { datastoreAncestor: true });
+	const search = new MemorySearchAdapter();
+	const stored: OwnerData = { id: 1, parentId: 10, title: 'stored needle' };
+	const query = store.query.bind(store);
+	const ancestor = datastoreKey('parent', 10, { namespace: 'tenant_a' });
+	store.query = async (meta, plan, options) => {
+		if (meta.name !== 'namespaced_search_include_owner') return query(meta, plan, options);
+		assert.deepEqual(plan.meta?.datastoreAncestor, ancestor);
+		return { list: [{ ...stored }], more: false, count: 1 };
+	};
+	const context = createActiveTs({
+		stores: { default: store }, search: { memory: search }, defaultSearch: 'memory',
+		plugins: hook ? [{ name: 'namespaced-search-include-hook', hooks: {
+			[hook]: (payload: any) => {
+				if (payload.model?.name === 'namespaced_search_include_owner') mutate!((payload.target as Owner).data);
+			}
+		} }] : []
+	});
+	await store.seed(context.meta(Parent), [{ id: 10, name: 'parent' }]);
+	await search.index(withDatastoreSearchNamespace(context.meta(Owner), 'tenant_a'), 1, { ...stored, title: 'indexed needle' });
+	return { Owner: Owner.use(context), ancestor, stored };
+}
+
+test('grouped query and search includes preserve implicit adapter ancestor namespaces', async () => {
+	for (const source of ['query', 'search'] as const) {
+		const { Owner, ancestor, stored } = await createNamespacedSearchIncludeOwner();
+		const result = source === 'query'
+			? await Owner.query().ancestor(ancestor).include('parent').load()
+			: await Owner.search('needle').include('parent').load();
+		assert.equal(result.count, 1);
+		assert.deepEqual(result.list[0].data, stored);
+		const parent = await result.list[0].ref<Model<{ id: number; name: string }>>('parent').load();
+		assert.ok(parent && !Array.isArray(parent));
+		assert.equal(parent.data.name, 'parent');
+	}
+});
+
+for (const hook of ['beforeRelationLoad', 'afterRelationLoad'] as const) {
+	for (const mutation of ['parent', 'namespace'] as const) {
+		test(`grouped search ${hook} rejects owner ${mutation} changes with an adapter namespace`, async () => {
+			const { Owner } = await createNamespacedSearchIncludeOwner(hook, data => {
+				if (mutation === 'parent') data.parentId = 11;
+				else data.parentNamespace = 'tenant_b';
+			});
+			await assert.rejects(
+				Owner.search('needle').include('parent').load(),
+				mutation === 'parent' ? /outside the scoped Datastore ancestor/ : /namespace must match adapter namespace/
+			);
+		});
+	}
+}
+
 test('search builder include preserves search instantiate operation', async () => {
 	class CountingStore extends MemoryStoreAdapter {
 		articleGetManyCalls = 0;

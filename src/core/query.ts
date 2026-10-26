@@ -969,7 +969,11 @@ function validateModelResultIdentities(
 					meta.datastore.ancestor({ model: meta, id: expected.id, data: item.data })
 				: retainedDatastoreAncestor;
 			const matches = options.exactDatastoreAncestor
-				? datastoreAncestorIdentitiesEqual(actual, expected.datastoreAncestor)
+				? datastoreAncestorIdentitiesEqual(
+						actual,
+						expected.datastoreAncestor,
+						contextInternalStore(context, meta.store).datastoreNamespace
+					)
 				: datastoreAncestorMatches(actual, expected.datastoreAncestor);
 			if (!matches) {
 				throw new ActiveTsValidationError(
@@ -2293,8 +2297,14 @@ function datastoreAncestorMatches(left: DatastoreKey | undefined, right: Datasto
 	return datastoreScopedAncestorMatches(left, right);
 }
 
-function datastoreAncestorIdentitiesEqual(actual: DatastoreKey | undefined, expected: DatastoreKey) {
-	return actual !== undefined && datastoreKeyIdentity(normalizeDatastoreKey(actual)) === datastoreKeyIdentity(expected);
+function datastoreAncestorIdentitiesEqual(
+	actual: DatastoreKey | undefined,
+	expected: DatastoreKey,
+	namespace: string | undefined
+) {
+	return actual !== undefined &&
+		datastoreKeyIdentity(datastoreKeyWithNamespace(actual, namespace)) ===
+		datastoreKeyIdentity(datastoreKeyWithNamespace(expected, namespace));
 }
 
 function datastoreExpectedResultAncestor(
