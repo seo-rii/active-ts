@@ -3,12 +3,16 @@ import assert from 'node:assert/strict';
 import { createActiveTs, MemoryStoreAdapter, StoreOutboxAdapter, type OutboxEvent, type StoreAdapter } from '../src/index.js';
 
 class PagedStore extends MemoryStoreAdapter {
+	failure?: 'query' | 'cursor';
 	override async query(...[model, plan, options]: Parameters<MemoryStoreAdapter['query']>) {
-		return super.query(model, { ...plan, limit: Math.min(plan.limit ?? 1, 1) }, options);
+		if (plan.cursor && this.failure === 'query') throw new Error('next page failed');
+		const result = await super.query(model, { ...plan, limit: Math.min(plan.limit ?? 1, 1) }, options);
+		if (plan.cursor && this.failure === 'cursor') return { ...result, cursor: plan.cursor, more: true };
+		return result;
 	}
 }
 
-async function fixture() {
+async function fixture(liveFirst = false) {
 	const store = new PagedStore();
 	const adapter: StoreAdapter = {
 		kind: 'paged-outbox', capabilities: { ...store.capabilities, transaction: false, savepoint: false, aggregate: false },
@@ -21,7 +25,7 @@ async function fixture() {
 	for (let id = 1; id <= 4; id++) await outbox.append({
 		id: String(id), model: 'record', modelId: id, operation: 'create', data: { id },
 		createdAt: `2026-01-0${id}T00:00:00.000Z`,
-		...(id === 1 || id === 4 ? { deadLetteredAt: '2026-01-10T00:00:00.000Z' } : {})
+		...((id === 1 && !liveFirst) || id === 4 ? { deadLetteredAt: '2026-01-10T00:00:00.000Z' } : {})
 	});
 	return { store, outbox };
 }
@@ -54,3 +58,16 @@ test('store outbox rejects a repeated continuation cursor rather than looping', 
 	const outbox = new StoreOutboxAdapter({ context });
 	await assert.rejects(outbox.list(), /advancing cursor/);
 });
+
+for (const operation of ['lease', 'drain'] as const) {
+	for (const failure of ['query', 'cursor'] as const) {
+		test(`outbox ${operation} cleans prior mutations after continuation ${failure} failure`, async () => {
+			const { store, outbox } = await fixture(true);
+			store.failure = failure;
+			await assert.rejects(outbox[operation](), failure === 'query' ? /next page failed/ : /advancing cursor/);
+			const rows = store.dump('active_ts_outbox_event') as OutboxEvent[];
+			assert.deepEqual(rows.map(event => event.id).sort(), ['1', '2', '3', '4']);
+			assert.ok(rows.every(event => event.leaseToken === undefined));
+		});
+	}
+}

@@ -545,6 +545,9 @@ continuation pages when no limit is supplied. A page containing only dead
 letters or unavailable events does not mean that the queue is empty. Continuing
 stores must advertise cursor support and return an advancing cursor; otherwise
 the adapter rejects an incomplete scan instead of silently omitting events.
+If a later page fails, claimed leases are released and nontransactional drains
+attempt to restore already removed events before returning the error. Cleanup
+failures are reported together with the original failure.
 
 For Datastore models with ancestor metadata, outbox search sync keeps the public
 model id unchanged but carries a bounded per-entity `modelIdentity` for the
