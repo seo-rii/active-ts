@@ -549,7 +549,7 @@ export type ResolvedModelMeta<TData = any> = {
 	views: Map<string, ViewResolver<TData>>;
 	policies: Map<string, PolicyResolver<TData>>;
 	scopes: Map<string, ScopeResolver<TData>>;
-	fieldCodecs: Map<string, FieldCodec>;
+	fieldCodecs: ReadonlyMap<string, Readonly<FieldCodec>>;
 	fieldTypes: Map<string, FieldType>;
 	datastore?: DatastoreModelMeta<TData>;
 };
