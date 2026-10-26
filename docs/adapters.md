@@ -726,6 +726,12 @@ timeouts. Firestore SDK transactions do not expose portable savepoints, so
 into those SDK options and rejects writes before reaching the SDK transaction
 object.
 
+MongoDB portable reads, updates and deletes explicitly use `locale: "simple"`
+collation so a collection default cannot change string ID or predicate matching.
+Schema planning rejects existing collections with a non-simple default collation;
+create or migrate a simple-collation collection before managing its indexes.
+Native callbacks remain explicit SDK escape hatches.
+
 ## SQLite
 
 `createSqliteStoreAdapter()` uses Node's built-in
