@@ -104,7 +104,12 @@ export class MemoryCacheAdapter implements CacheAdapter {
 }
 
 function normalizeCacheKeys(keys: unknown, context: string): string[] {
-	return snapshotArrayInput<string>(keys, context);
+	const snapshot = snapshotArrayInput<unknown>(keys, context);
+	const result: string[] = [];
+	for (let index = 0; index < snapshot.length; index++) {
+		result[index] = assertSafeCacheKey(snapshot[index], 'memory cache key');
+	}
+	return result;
 }
 
 function normalizeCacheEntries(entries: unknown, context: string): Array<[string, any]> {
