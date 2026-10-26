@@ -407,20 +407,32 @@ export class ActiveTestContext {
 			seed?: (modelName: string, rows: TModel['data'][]) => MaybePromise<void>;
 			seedModel?: (meta: ResolvedModelMeta, rows: TModel['data'][]) => MaybePromise<void>;
 		};
-		const seedModel = testingAdapterMethod(store, 'seedModel');
-		if (seedModel) {
-			await seedModel(meta, cloneSeedRowsForAdapter(safeRows));
-			return safeRows;
+		let writeFailed = false;
+		let writeError: unknown;
+		try {
+			const seedModel = testingAdapterMethod(store, 'seedModel');
+			const seed = seedModel ? undefined : testingAdapterMethod(store, 'seed');
+			if (seedModel) await seedModel(meta, cloneSeedRowsForAdapter(safeRows));
+			else if (seed) await seed(meta.name, cloneSeedRowsForAdapter(safeRows));
+			else {
+				for (let index = 0; index < safeRows.length; index++) {
+					await this.store.create(meta, ids[index], cloneSafeDataObject(safeRows[index], `ActiveTestContext.seed() rows[${index}]`));
+				}
+			}
+		} catch (error) {
+			writeFailed = true;
+			writeError = error;
 		}
-		const seed = testingAdapterMethod(store, 'seed');
-		if (seed) {
-			await seed(meta.name, cloneSeedRowsForAdapter(safeRows));
-			return safeRows;
+		// Fixture helpers write directly to the base store, so invalidate outside
+		// any ambient transaction. A helper may partially write before rejecting.
+		const invalidations = await Promise.allSettled(mapArray(ids, (id) => this.context.invalidateModelExternal(model, id)));
+		const failures: unknown[] = [];
+		if (writeFailed) failures.push(writeError);
+		for (const result of invalidations) {
+			if (result.status === 'rejected') failures.push(result.reason);
 		}
-		for (let index = 0; index < safeRows.length; index++) {
-			const row = safeRows[index];
-			await this.store.create(meta, ids[index], cloneSafeDataObject(row, `ActiveTestContext.seed() rows[${index}]`));
-		}
+		if (failures.length === 1) throw failures[0];
+		if (failures.length > 1) throw new AggregateError(failures, 'Fixture seed and cache invalidation failed.');
 		return safeRows;
 	}
 
