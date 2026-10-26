@@ -539,6 +539,8 @@ export type ResolvedModelMeta<TData = any> = {
 	};
 	search?: string;
 	searchDocumentIdentity?: string;
+	/** Canonical physical Datastore scope attached by context search routing. */
+	datastoreSearchScope?: string;
 	idField: string;
 	validator?: Validator<TData>;
 	readValidation: ValidationMode;

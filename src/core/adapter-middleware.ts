@@ -49,6 +49,7 @@ import {
 	assertSearchOptionsSupported,
 	assertSearchWriteOptionsSupported,
 	contextBoundSearchDatastoreNamespace,
+	contextBoundSearchDatastoreScope,
 	datastoreSearchHitDocumentIdentityOrForced,
 	markNativeSearchAdapter,
 	markSearchDocumentIdentity,
@@ -592,7 +593,8 @@ export function createSearchMiddlewareAdapter(
 			assertSearchOptionsSupported({ kind: adapterKind, capabilities: wrapped.capabilities }, searchOptions);
 			const resultModel = withDatastoreSearchNamespace(
 				model,
-				contextBoundSearchDatastoreNamespace(adapter, model)
+				contextBoundSearchDatastoreNamespace(adapter, model),
+				contextBoundSearchDatastoreScope(adapter, model)
 			);
 			return normalizeMiddlewareQueryResult(
 				resultModel,
@@ -614,7 +616,8 @@ export function createSearchMiddlewareAdapter(
 			const safeOptions = normalizeSearchWriteOptions(options, 'search middleware index options');
 			const indexModel = withDatastoreSearchNamespace(
 				model,
-				contextBoundSearchDatastoreNamespace(adapter, model)
+				contextBoundSearchDatastoreNamespace(adapter, model),
+				contextBoundSearchDatastoreScope(adapter, model)
 			);
 			projectSearchDocument(indexModel, indexAdapterKind, safeId, safeData, {
 				trustDatastoreEntityKey: false

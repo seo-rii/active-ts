@@ -74,6 +74,7 @@ import {
 	normalizeWhereShapeFieldTypes
 } from './field-types.js';
 import { snapshotArrayInput } from './array-input.js';
+import { datastoreSearchScopeForStore } from './datastore-search-scope.js';
 import {
 	assertSafeSearchQuery,
 	datastoreSearchDocumentIdentity,
@@ -2533,9 +2534,11 @@ export class SearchBuilder<TModel extends { data: any }, TIncludes extends boole
 					options,
 					adapterName
 				);
+				const store = contextInternalStore(context, meta.store);
 				const adapterMeta = withDatastoreSearchNamespace(
 					withSearchIndexesForAdapter(meta, route.name, route.indexKind),
-					contextInternalStore(context, meta.store).datastoreNamespace
+					store.datastoreNamespace,
+					datastoreSearchScopeForStore(store)
 				);
 				const raw = sanitizeRawResult(
 					await route.adapter.search(adapterMeta, query, cloneSearchOptions(options)),

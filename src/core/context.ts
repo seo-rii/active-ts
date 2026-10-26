@@ -1,3 +1,4 @@
+import { datastoreSearchScopeForStore } from './datastore-search-scope.js';
 import { BatchLoader } from './batch-loader.js';
 import {
 	ActiveTsCommittedTransactionError,
@@ -60,6 +61,7 @@ import {
 	assertSearchOptionsSupported,
 	assertSearchWriteOptionsSupported,
 	CONTEXT_BOUND_SEARCH_DATASTORE_NAMESPACE,
+	CONTEXT_BOUND_SEARCH_DATASTORE_SCOPE,
 	datastoreSearchHitDocumentIdentityOrForced,
 	markSearchAdapterSource,
 	markSearchDocumentIdentity,
@@ -1616,7 +1618,8 @@ export class ActiveContext {
 				const indexKind = searchIndexAdapterKind(retained, name);
 				const adapterMeta = withDatastoreSearchNamespace(
 					withSearchIndexesForAdapter(safeModel, name, indexKind),
-					this.store(safeModel.store).datastoreNamespace
+					this.store(safeModel.store).datastoreNamespace,
+					datastoreSearchScopeForStore(this.store(safeModel.store))
 				);
 				const result = await retained.search(adapterMeta, safeQuery, safeOptions);
 				return normalizeContextSearchResult(
@@ -1634,7 +1637,8 @@ export class ActiveContext {
 				const indexKind = searchIndexAdapterKind(retained, name);
 				const adapterMeta = withDatastoreSearchNamespace(
 					withSearchIndexesForAdapter(safeModel, name, indexKind),
-					this.store(safeModel.store).datastoreNamespace
+					this.store(safeModel.store).datastoreNamespace,
+					datastoreSearchScopeForStore(this.store(safeModel.store))
 				);
 				const safeData = cloneSafeDataObject(data, 'context search index data');
 				projectSearchDocument(adapterMeta, indexKind, safeId, safeData, {
@@ -1653,7 +1657,8 @@ export class ActiveContext {
 				const indexKind = searchIndexAdapterKind(retained, name);
 				const adapterMeta = withDatastoreSearchNamespace(
 					withSearchIndexesForAdapter(safeModel, name, indexKind),
-					this.store(safeModel.store).datastoreNamespace
+					this.store(safeModel.store).datastoreNamespace,
+					datastoreSearchScopeForStore(this.store(safeModel.store))
 				);
 				if (!isTransactionScopedSearchAdapter(retained)) assertContextSearchIndexSupported(retained);
 				assertSearchWriteOptionsSupported(retained, safeOptions);
@@ -1714,6 +1719,9 @@ export class ActiveContext {
 		};
 		defineScopedCapabilities<SearchCapabilities>(handle, () => this.searchForRetainedHandle(name).capabilities);
 		defineDataProperty(handle, CONTEXT_BOUND_SEARCH_SOURCE, adapter, { enumerable: false, configurable: false });
+		defineDataProperty(handle, CONTEXT_BOUND_SEARCH_DATASTORE_SCOPE,
+			(model: ResolvedModelMeta) => datastoreSearchScopeForStore(this.store(model.store)),
+			{ enumerable: false, configurable: false });
 		defineDataProperty(
 			handle,
 			CONTEXT_BOUND_SEARCH_DATASTORE_NAMESPACE,
@@ -1737,9 +1745,8 @@ export class ActiveContext {
 			const adapterMeta = withSearchIndexesForAdapter(safeModels[index], name, indexKind);
 			adapterModels[index] = withDatastoreSearchNamespace(
 				adapterMeta,
-				adapterMeta.datastore?.ancestor
-					? this.internalStore(adapterMeta.store).datastoreNamespace
-					: undefined
+				this.internalStore(adapterMeta.store).datastoreNamespace,
+				datastoreSearchScopeForStore(this.internalStore(adapterMeta.store))
 			);
 		}
 		return adapterModels;
@@ -3758,9 +3765,8 @@ export class ActiveContext {
 				if (!adapter) throw new ActiveTsConfigurationError(`Search adapter "${safeName}" is not registered.`);
 				const routedMeta = withDatastoreSearchNamespace(
 					withSearchIndexesForAdapter(meta, safeName, searchIndexAdapterKind(adapter, safeName)),
-					meta.datastore?.ancestor
-						? this.internalStore(meta.store).datastoreNamespace
-						: undefined
+					this.internalStore(meta.store).datastoreNamespace,
+					datastoreSearchScopeForStore(this.internalStore(meta.store))
 				);
 				if (!routedMeta.searchIndexes.length) continue;
 				const list = mapGet(grouped, safeName) ?? [];

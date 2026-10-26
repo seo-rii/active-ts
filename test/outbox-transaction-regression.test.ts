@@ -50,6 +50,8 @@ class OutboxSecretAccount extends Model<OutboxSecretData> {}
 class OutboxDatastoreAccount extends Model<OutboxDatastoreAccountData> {}
 
 class ProjectMemoryStore extends MemoryStoreAdapter {
+	readonly datastoreDatabaseId = null;
+	readonly datastoreKeyEncoding = 'active-ts' as const;
 	override readonly datastoreProjectId: string;
 
 	constructor(projectId: string) {
