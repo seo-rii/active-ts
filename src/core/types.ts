@@ -180,7 +180,7 @@ export type SearchCapabilities = Partial<{
 export type StoreAdapter = {
 	kind: string;
 	/** Close resources created by this adapter; injected clients remain caller-owned. */
-	close?: () => Promise<void>;
+	close?: () => MaybePromise<void>;
 	capabilities?: StoreCapabilities;
 	cacheScope?: string;
 	datastoreNamespace?: string;
@@ -211,7 +211,7 @@ export type StoreAdapter = {
 export type CacheAdapter = {
 	kind: string;
 	/** Close resources created by this adapter; injected clients remain caller-owned. */
-	close?: () => Promise<void>;
+	close?: () => MaybePromise<void>;
 	getMany: (keys: string[]) => Promise<Array<any | undefined>>;
 	setMany: (entries: Array<[string, any]>, options?: CacheWriteOptions) => Promise<void>;
 	deleteMany: (keys: string[]) => Promise<void>;
