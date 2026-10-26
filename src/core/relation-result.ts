@@ -35,6 +35,47 @@ export type RelationOwnerLocalKeySnapshot = {
 	datastoreAncestor?: DatastoreKey;
 };
 
+/** Shared post-hook invariant boundary for eager, lazy, and grouped relation loading. */
+export type RelationLoadBoundary = {
+	ownerMeta: ResolvedModelMeta;
+	owner: any;
+	relation: RelationMeta;
+	ownerLocalKey: RelationOwnerLocalKeySnapshot;
+	ownerLocalKeyLabel?: string;
+	validateOwner: (label: string) => void;
+};
+
+export function validateRelationLoadBoundary(
+	context: ActiveContext,
+	boundary: RelationLoadBoundary,
+	resultSnapshot: RelationResultSnapshot,
+	result: unknown
+) {
+	const label = `afterRelationLoad ${boundary.ownerMeta.name}.${boundary.relation.name}`;
+	boundary.validateOwner(`${label} target`);
+	validateRelationOwnerLocalKeySnapshot(context, boundary.ownerLocalKey, boundary.owner, boundary.ownerLocalKeyLabel ?? `${label} target`);
+	validateRelationResultSnapshot(context, resultSnapshot, result, label);
+}
+
+export async function runAfterRelationLoad(
+	context: ActiveContext,
+	boundary: RelationLoadBoundary,
+	resultSnapshot: RelationResultSnapshot,
+	result: unknown,
+	afterHooks?: () => void
+) {
+	const after = await context.runHooks('afterRelationLoad', {
+		model: boundary.ownerMeta,
+		target: boundary.owner,
+		result,
+		operation: 'relation',
+		meta: { relation: boundary.relation.name }
+	});
+	afterHooks?.();
+	validateRelationLoadBoundary(context, boundary, resultSnapshot, after.result);
+	return after.result;
+}
+
 const MISSING_RELATION_LOCAL_KEY = 'missing:';
 
 export function snapshotRelationResult(

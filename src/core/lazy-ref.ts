@@ -11,8 +11,7 @@ import { assertPortableScalar, valueFor } from './query-utils.js';
 import {
 	snapshotRelationOwnerLocalKey,
 	snapshotRelationResult,
-	validateRelationOwnerLocalKeySnapshot,
-	validateRelationResultSnapshot
+	runAfterRelationLoad
 } from './relation-result.js';
 import { assertSafeEntityId } from './safe-keys.js';
 import { SET_ADD, SET_HAS, WEAKMAP_GET, WEAKMAP_SET } from './collection-intrinsics.js';
@@ -167,32 +166,19 @@ export class LazyRef<TModel = any> implements PromiseLike<TModel | TModel[] | nu
 				result,
 				`afterRelationLoad ${ownerMeta.name}.${this.relation.name}`
 			);
-			const after = await context.runHooks('afterRelationLoad', {
-				model: ownerMeta,
-				target: this.owner,
-				result,
-				operation: 'relation',
-				meta: { relation: this.relation.name }
-			});
-			this.scopedContext('load relations');
-			result = after.result as TModel | TModel[] | null;
-			context.validateModelInstance(ownerMeta, this.owner, `afterRelationLoad ${ownerMeta.name}.${this.relation.name} target`, {
-				expectedId: expectedOwnerId,
-				expectedDatastoreAncestor,
-				partial: false
-			});
-			validateRelationOwnerLocalKeySnapshot(
-				context,
-				ownerLocalKeySnapshot,
-				this.owner,
-				`afterRelationLoad ${ownerMeta.name}.${this.relation.name} target`
-			);
-			validateRelationResultSnapshot(
-				context,
-				resultSnapshot,
-				result,
-				`afterRelationLoad ${ownerMeta.name}.${this.relation.name}`
-			);
+			result = await runAfterRelationLoad(context, {
+				ownerMeta,
+				owner: this.owner,
+				relation: this.relation,
+				ownerLocalKey: ownerLocalKeySnapshot,
+				validateOwner: (label) => {
+					context.validateModelInstance(ownerMeta, this.owner, label, {
+						expectedId: expectedOwnerId,
+						expectedDatastoreAncestor,
+						partial: false
+					});
+				}
+			}, resultSnapshot, result, () => { this.scopedContext('load relations'); }) as TModel | TModel[] | null;
 		}
 		return result;
 	}
