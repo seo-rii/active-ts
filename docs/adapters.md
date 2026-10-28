@@ -1296,3 +1296,5 @@ JSON round trip without converting these IDs through JavaScript numbers. Applyin
 an int64 source, target, or ancestor requires the Datastore client's `int()` method.
 Key-wins repairs keep the branded logical ID in the entity payload; payload-wins
 repairs preserve the distinction between numeric IDs and decimal string names.
+
+SQLite schema application creates versioned expression indexes matching scalar equality/range predicates. Existing unique constraint indexes remain in place, and a separate lookup index is added without changing their null/missing semantics. Old nonunique `active_ts_` indexes from earlier releases are preserved; applications may remove them separately after reviewing their schema. Lookup indexes support filtering; a separate sort may still be needed for portable mixed-type ordering.
