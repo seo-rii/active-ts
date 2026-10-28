@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { assertWellFormedUnicode } from './unicode.js';
 import { ActiveContext, getDefaultContext } from './context.js';
 import { assertContextTransactionWritable, currentTransactionContext } from './context-internal.js';
 import { cacheAdapterSource, markCacheAdapterSource } from './cache-utils.js';
@@ -660,7 +661,7 @@ export class ActiveFunctionCache<TInput, TValue> {
 			typeof this.options.namespace === 'function'
 				? validateNamespace(await this.options.namespace(input))
 				: this.options.namespace;
-		const hash = createHash('sha256').update(raw).digest('base64url');
+		const hash = createHash('sha256').update(assertWellFormedUnicode(raw, 'Function cache key')).digest('base64url');
 		const key = namespace === undefined ? `${this.options.prefix}:${hash}` : `${this.options.prefix}:${namespace}:${hash}`;
 		return assertSafeCacheKey(key, 'function cache key');
 	}
