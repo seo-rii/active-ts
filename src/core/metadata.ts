@@ -451,11 +451,11 @@ function cloneRelationsMeta(relations: Map<string, RelationMeta>) {
 	return clone;
 }
 
-function cloneFieldCodecsMeta(fieldCodecs: Map<string, FieldCodec> | undefined) {
+function cloneFieldCodecsMeta(fieldCodecs: ReadonlyMap<string, Readonly<FieldCodec>> | undefined) {
 	const clone = new Map<string, FieldCodec>();
 	if (!fieldCodecs) return clone;
 	for (const [field, codec] of MAP_ENTRIES.call(fieldCodecs)) {
-		mapSet(clone, field, { ...codec });
+		mapSet(clone, field, Object.freeze({ ...codec }));
 	}
 	return clone;
 }
@@ -601,7 +601,7 @@ function freezeRelationMeta(relation: RelationMeta) {
 	Object.freeze(relation);
 }
 
-function freezeMetadataMap<K, V>(map: Map<K, V>, freezeValue?: (value: V) => void) {
+function freezeMetadataMap<K, V>(map: ReadonlyMap<K, V>, freezeValue?: (value: V) => void) {
 	if (freezeValue) {
 		for (const value of MAP_VALUES.call(map)) freezeValue(value);
 	}

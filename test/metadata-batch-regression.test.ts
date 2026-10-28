@@ -976,6 +976,22 @@ test('getModelMeta returns a frozen snapshot instead of live metadata', () => {
 	assert.equal(resolved.cache?.ttl, 30);
 });
 
+test('resolved field codecs remain frozen after cloning metadata', async () => {
+	class Record extends Model<{ id: number; name: string }> {}
+	defineModel('resolved_frozen_codec')
+		.fieldCodec('name', { name: 'prefix', encode: (value) => `stored:${value}`, decode: (value) => value.slice(7) })
+		.attach(Record);
+	const store = new MemoryStoreAdapter();
+	const context = createActiveTs({ stores: { default: store } });
+	const codec = context.meta(Record).fieldCodecs.get('name')!;
+	assert.equal(Object.isFrozen(codec), true);
+	assert.throws(() => { (codec as any).encode = () => 'corrupt'; }, TypeError);
+	assert.throws(() => { (codec as any).decode = () => 'corrupt'; }, TypeError);
+	await Record.use(context).create({ id: 1, name: 'expected' });
+	assert.equal(store.dump('resolved_frozen_codec')[0].name, 'stored:expected');
+	assert.equal((await Record.use(context).find(1).load())?.data.name, 'expected');
+});
+
 test('metadata application ignores inherited top-level schema fields', () => {
 	class InheritedTopLevelSchema extends Model<MetadataData> {}
 	Object.defineProperty(Object.prototype, 'entity', {
