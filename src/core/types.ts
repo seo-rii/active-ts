@@ -189,6 +189,8 @@ export type StoreAdapter = {
 	/** `null` denotes the default Datastore database; `undefined` means the database is unknown. */
 	datastoreDatabaseId?: string | null;
 	datastoreKeyEncoding?: 'active-ts' | 'native';
+	/** Whether cacheScope identifies a stable Datastore backend or only one client instance. */
+	datastoreCacheScopeStability?: 'stable' | 'client';
 	get: (model: ResolvedModelMeta, id: EntityId, options?: StoreReadOptions) => Promise<any | null>;
 	getMany: (
 		model: ResolvedModelMeta,
