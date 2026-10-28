@@ -134,7 +134,7 @@ import {
 	relationAncestorForOwner,
 	relationTargetJoinKeys
 } from './relation-ancestor.js';
-import { contextInternalStore, runTrackedContextOperation } from './context-internal.js';
+import { contextInternalStore, runTrackedContextOperation, validateContextReadConstructorResult } from './context-internal.js';
 import {
 	markDatastoreHistoricalModel,
 	MODEL_DATASTORE_WRITE_ANCESTOR,
@@ -969,7 +969,11 @@ function validateModelResultIdentities(
 					meta.datastore.ancestor({ model: meta, id: expected.id, data: item.data })
 				: retainedDatastoreAncestor;
 			const matches = options.exactDatastoreAncestor
-				? datastoreAncestorIdentitiesEqual(actual, expected.datastoreAncestor)
+				? datastoreAncestorIdentitiesEqual(
+						actual,
+						expected.datastoreAncestor,
+						contextInternalStore(context, meta.store).datastoreNamespace
+					)
 				: datastoreAncestorMatches(actual, expected.datastoreAncestor);
 			if (!matches) {
 				throw new ActiveTsValidationError(
@@ -2178,6 +2182,13 @@ async function preloadIncludes(
 						context,
 						{ persisted: true, [MODEL_PERSISTED_TOKEN]: true }
 					);
+					validateContextReadConstructorResult(
+						context,
+						targetMeta,
+						valueFor(snapshot.data, targetMeta.idField) as EntityId,
+						targetMeta.datastore?.ancestor ? snapshot.data : undefined,
+						isolated
+					);
 					if (snapshot.partial) markPartialModel(isolated as object);
 					if (snapshot.datastoreAncestor !== undefined) {
 						Object.defineProperty(isolated, MODEL_DATASTORE_WRITE_ANCESTOR, {
@@ -2293,8 +2304,14 @@ function datastoreAncestorMatches(left: DatastoreKey | undefined, right: Datasto
 	return datastoreScopedAncestorMatches(left, right);
 }
 
-function datastoreAncestorIdentitiesEqual(actual: DatastoreKey | undefined, expected: DatastoreKey) {
-	return actual !== undefined && datastoreKeyIdentity(normalizeDatastoreKey(actual)) === datastoreKeyIdentity(expected);
+function datastoreAncestorIdentitiesEqual(
+	actual: DatastoreKey | undefined,
+	expected: DatastoreKey,
+	namespace: string | undefined
+) {
+	return actual !== undefined &&
+		datastoreKeyIdentity(datastoreKeyWithNamespace(actual, namespace)) ===
+		datastoreKeyIdentity(datastoreKeyWithNamespace(expected, namespace));
 }
 
 function datastoreExpectedResultAncestor(
@@ -2586,11 +2603,7 @@ export class SearchBuilder<TModel extends { data: any }, TIncludes extends boole
 				}
 				const expectedIds = modelResultSnapshots(meta, list, 'afterSearch original result', { searchIdentityMeta: adapterMeta });
 				if (includes.length) {
-					const includeTasks: Array<Promise<void> | void> = [];
-					for (let index = 0; index < list.length; index++) {
-						includeTasks[index] = (list[index] as any).include(...includes);
-					}
-					await Promise.all(includeTasks);
+					await preloadIncludes(context, this.model, list, includes);
 					validateModelResultIdentities(context, meta, list, expectedIds, 'afterRelationLoad search result');
 				}
 				const result = { ...raw, list, count: list.length, total: staleHits ? undefined : raw.total };
@@ -2667,11 +2680,7 @@ export class SearchBuilder<TModel extends { data: any }, TIncludes extends boole
 			this.rememberSearchHitId(meta, idsByKey, id, hit);
 		}
 		const ids = iterableToArray(MAP_VALUES.call(idsByKey) as Iterable<EntityId>);
-		const loadTasks: Array<Promise<any>> = [];
-		for (let index = 0; index < ids.length; index++) {
-			loadTasks[index] = context.loadByIdFresh(this.model, ids[index], 'search');
-		}
-		const loaded = await Promise.all(loadTasks);
+		const loaded = await context.loadManyFresh(this.model, ids, 'search');
 		const list: TModel[] = [];
 		for (const item of loaded) {
 			if (item && (!revalidatePlan || filterRows([item.data], revalidatePlan, meta.idField).length)) {
