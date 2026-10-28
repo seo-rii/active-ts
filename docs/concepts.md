@@ -430,3 +430,16 @@ and indexes. Destructive changes are intentionally out of scope.
 
 `schemaMigration(models, name)` captures the same plans as a migration snapshot
 without applying them.
+
+## Cache key ownership
+
+Built-in entity cache keys are deterministic and retain no per-entity ownership
+history. A custom `cacheKey` resolver retains ownership pairs for the context's
+lifetime, including cache misses, so collisions and changing keys can be rejected.
+Cache TTL expiration and `clear()` do not discard this safety history.
+
+Long-lived contexts using custom resolvers can set `cacheKeyOwnerLimit` to a
+positive safe integer. Once reached, new owners fail with a configuration error;
+existing owners remain usable. Omit the option for the existing unlimited behavior,
+or use request-scoped contexts to bound the lifetime. Transaction ownership is
+staged and discarded on rollback; committed ownership shares the root's limit.

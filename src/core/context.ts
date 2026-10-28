@@ -281,7 +281,8 @@ const ACTIVE_TS_CONFIG_KEYS = [
 	'search',
 	'plugins',
 	'queryPlanner',
-	'cacheKey'
+	'cacheKey',
+	'cacheKeyOwnerLimit'
 ] as const;
 const ACTIVE_CONTEXT_OPTION_KEYS = ['skipPluginSetup'] as const;
 const SCHEMA_CONFIG_KEYS = ['autoSync'] as const;
@@ -1017,6 +1018,7 @@ export class ActiveContext {
 		const aggregate = ownValue(configRecord, 'aggregate') as ActiveTsConfig['aggregate'];
 		const queryPlanner = ownValue(configRecord, 'queryPlanner') as ActiveTsConfig['queryPlanner'];
 		const cacheKey = ownValue(configRecord, 'cacheKey') as ActiveTsConfig['cacheKey'];
+		const cacheKeyOwnerLimit = ownValue(configRecord, 'cacheKeyOwnerLimit') as number | undefined;
 		const lazyWarnings = ownValue(configRecord, 'lazyWarnings') as ActiveTsConfig['lazyWarnings'];
 		const defaultStore = assertSafeSchemaIdentifier(ownValue(configRecord, 'defaultStore') ?? 'default', 'default store adapter name');
 		const defaultCache = assertSafeSchemaIdentifier(ownValue(configRecord, 'defaultCache') ?? 'default', 'default cache adapter name');
@@ -1041,6 +1043,7 @@ export class ActiveContext {
 			aggregate: normalizeAggregateConfig(aggregate),
 			queryPlanner: normalizeQueryPlanner(queryPlanner),
 			cacheKey,
+			cacheKeyOwnerLimit,
 			lazyWarnings
 		};
 		this.maxBatchSize = normalizeMaxBatchSize(this.config.batch?.maxSize);
@@ -2757,6 +2760,7 @@ export class ActiveContext {
 										state.callbackOperationState.closed = 'finished';
 										await waitForContextOperations(state);
 										if (state.rollbackOnlyError !== undefined) throw state.rollbackOnlyError;
+										this.assertCacheKeyOwnerLimit(state.root.cacheKeyOwners, state.cacheKeyOwners);
 										for (const [key, owner] of state.cacheKeyOwners) {
 											this.assertStableEntityCacheKeyMaps(
 												parentState.cacheKeyOwners,
@@ -3050,6 +3054,7 @@ export class ActiveContext {
 						state.callbackOperationState.closed = 'finished';
 						await waitForContextOperations(state);
 						if (state.rollbackOnlyError !== undefined) throw state.rollbackOnlyError;
+						this.assertCacheKeyOwnerLimit(state.root.cacheKeyOwners, state.cacheKeyOwners);
 						return result;
 					} catch (error) {
 						state.callbackOperationState.closed = 'rolled back';
@@ -3326,7 +3331,8 @@ export class ActiveContext {
 				'scoped cache key'
 			)
 			: resolvedKey;
-		this.assertStableEntityCacheKey(owner, key);
+		// Built-in keys are injective and deterministic; only user resolvers need retained ownership.
+		if (customCacheKey !== undefined) this.assertStableEntityCacheKey(owner, key);
 		return key;
 	}
 
@@ -3376,11 +3382,13 @@ export class ActiveContext {
 			const state = this.transactionState;
 			this.assertStableEntityCacheKeyMaps(state.root.cacheKeyOwners, state.root.entityCacheKeys, owner, key);
 			this.assertStableEntityCacheKeyMaps(state.cacheKeyOwners, state.entityCacheKeys, owner, key);
+			this.assertCacheKeyOwnerLimit(state.root.cacheKeyOwners, state.cacheKeyOwners, key);
 			if (!mapHas(state.root.cacheKeyOwners, key)) mapSet(state.cacheKeyOwners, key, owner);
 			if (!mapHas(state.root.entityCacheKeys, owner)) mapSet(state.entityCacheKeys, owner, key);
 			return;
 		}
 		this.assertStableEntityCacheKeyMaps(this.cacheKeyOwners, this.entityCacheKeys, owner, key);
+		this.assertCacheKeyOwnerLimit(this.cacheKeyOwners, undefined, key);
 		mapSet(this.cacheKeyOwners, key, owner);
 		mapSet(this.entityCacheKeys, owner, key);
 	}
@@ -3411,7 +3419,27 @@ export class ActiveContext {
 		}
 	}
 
+	private assertCacheKeyOwnerLimit(
+		owners: Map<string, string>,
+		staged?: Map<string, string>,
+		additionalKey?: string
+	) {
+		const limit = this.config.cacheKeyOwnerLimit;
+		if (limit === undefined) return;
+		let count = MAP_SIZE.call(owners);
+		if (staged) {
+			for (const [key] of staged) if (!mapHas(owners, key)) count++;
+		}
+		if (additionalKey !== undefined && !mapHas(owners, additionalKey) && (!staged || !mapHas(staged, additionalKey))) count++;
+		if (count > limit) {
+			throw new ActiveTsConfigurationError(
+				`Custom cache key ownership exceeds cacheKeyOwnerLimit (${limit}). Use a new context or increase the limit.`
+			);
+		}
+	}
+
 	private mergeTransactionCacheKeyOwnership(state: TransactionState) {
+		this.assertCacheKeyOwnerLimit(this.cacheKeyOwners, state.cacheKeyOwners);
 		for (const [key, owner] of state.cacheKeyOwners) {
 			this.assertStableEntityCacheKeyMaps(this.cacheKeyOwners, this.entityCacheKeys, owner, key);
 		}
@@ -3913,6 +3941,10 @@ function assertActiveTsConfig(config: unknown): asserts config is ActiveTsConfig
 	const cacheKey = ownValue(value, 'cacheKey', 'active-ts config');
 	if (cacheKey !== undefined && typeof cacheKey !== 'function') {
 		throw new ActiveTsConfigurationError('cacheKey must be a function.');
+	}
+	const cacheKeyOwnerLimit = ownValue(value, 'cacheKeyOwnerLimit', 'active-ts config');
+	if (cacheKeyOwnerLimit !== undefined && (typeof cacheKeyOwnerLimit !== 'number' || !Number.isSafeInteger(cacheKeyOwnerLimit) || cacheKeyOwnerLimit <= 0)) {
+		throw new ActiveTsConfigurationError('cacheKeyOwnerLimit must be a positive safe integer.');
 	}
 }
 

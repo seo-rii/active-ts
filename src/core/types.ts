@@ -580,4 +580,6 @@ export type ActiveTsConfig = {
 	plugins?: ActiveTsPlugin[];
 	queryPlanner?: QueryPlanner;
 	cacheKey?: CacheKeyResolver;
+	/** Maximum retained custom cache key owners; omitted means no limit. Built-in keys retain no owners. */
+	cacheKeyOwnerLimit?: number;
 };
