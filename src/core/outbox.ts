@@ -1,3 +1,6 @@
+import { JSON_STRINGIFY } from './json-intrinsics.js';
+import { cloneJsonTransportPayload } from './native-payload.js';
+import { datastoreSearchScopeForStore, normalizeDatastoreSearchScope } from './datastore-search-scope.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { ActiveContext, assertOutsideActiveTransaction, isContextBoundSearchAdapter } from './context.js';
@@ -78,6 +81,7 @@ export type OutboxEvent = {
 	modelIdentity?: string;
 	modelDatastoreAncestor?: DatastoreKey;
 	modelDatastoreProjectId?: string;
+	modelDatastoreScope?: string;
 	operation: OutboxOperation;
 	data?: any;
 	dataEncoding?: 'public' | 'stored';
@@ -186,6 +190,7 @@ const OUTBOX_EVENT_KEYS = [
 	'modelIdentity',
 	'modelDatastoreAncestor',
 	'modelDatastoreProjectId',
+	'modelDatastoreScope',
 	'operation',
 	'data',
 	'dataEncoding',
@@ -1244,12 +1249,12 @@ function storeOutboxSearchRevisionId(event: OutboxEvent, documentIdentity: strin
 		);
 	}
 	const identity = documentIdentity ?? event.modelIdentity ?? (
-		event.modelDatastoreAncestor === undefined
+		event.modelDatastoreAncestor === undefined && event.modelDatastoreScope === undefined
 			? entityIdKey(event.modelId!)
-			: datastoreSearchDocumentIdentity({ name: event.model }, event.modelId!, event.modelDatastoreAncestor)
+			: datastoreSearchDocumentIdentity({ name: event.model, datastoreSearchScope: event.modelDatastoreScope }, event.modelId!, event.modelDatastoreAncestor)
 	);
 	return createHash('sha256')
-		.update(JSON.stringify([event.model, identity]))
+		.update(JSON_STRINGIFY(cloneJsonTransportPayload([event.model, identity])))
 		.digest('hex');
 }
 
@@ -1359,6 +1364,7 @@ function isOutboxSnapshotCurrent(current: OutboxEvent, snapshot: OutboxEvent) {
 		current.lastDeliveryError === snapshot.lastDeliveryError &&
 		current.modelIdentity === snapshot.modelIdentity &&
 		current.modelDatastoreProjectId === snapshot.modelDatastoreProjectId &&
+		current.modelDatastoreScope === snapshot.modelDatastoreScope &&
 		current.dataEncoding === snapshot.dataEncoding &&
 		current.reconcileFromStore === snapshot.reconcileFromStore &&
 		outboxDatastoreAncestorMatches(current.modelDatastoreAncestor, snapshot.modelDatastoreAncestor) &&
@@ -1381,6 +1387,7 @@ function isOutboxRequeueInsertCurrent(current: OutboxEvent, inserted: OutboxEven
 		current.lastDeliveryError === inserted.lastDeliveryError &&
 		current.modelIdentity === inserted.modelIdentity &&
 		current.modelDatastoreProjectId === inserted.modelDatastoreProjectId &&
+		current.modelDatastoreScope === inserted.modelDatastoreScope &&
 		current.dataEncoding === inserted.dataEncoding &&
 		current.reconcileFromStore === inserted.reconcileFromStore &&
 		outboxDatastoreAncestorMatches(current.modelDatastoreAncestor, inserted.modelDatastoreAncestor) &&
@@ -1401,9 +1408,9 @@ function outboxDatastoreAncestorMatches(left: DatastoreKey | undefined, right: D
 function outboxEntityOrderKeys(event: OutboxEvent) {
 	const keys: string[] = [];
 	if (event.modelIdentity !== undefined) keys[keys.length] = `${event.model}:${event.modelIdentity}`;
-	if (event.modelDatastoreAncestor !== undefined && event.modelId !== undefined) {
+	if ((event.modelDatastoreAncestor !== undefined || event.modelDatastoreScope !== undefined) && event.modelId !== undefined) {
 		const ancestorIdentity = datastoreSearchDocumentIdentity(
-			{ name: event.model },
+			{ name: event.model, datastoreSearchScope: event.modelDatastoreScope },
 			event.modelId,
 			event.modelDatastoreAncestor
 		);
@@ -1583,7 +1590,7 @@ function outboxIsNamespaceLessDatastoreAncestorEvent(event: OutboxEvent) {
 }
 
 function outboxDatastoreAliasKey(event: OutboxEvent, kind: 'identity-only' | 'namespace-less-ancestor') {
-	return `${event.model}:datastore-${kind}-namespace-alias:${entityIdKey(event.modelId!)}`;
+	return `${event.model}:datastore-${kind}-namespace-alias:${JSON_STRINGIFY(cloneJsonTransportPayload([event.modelDatastoreScope ?? null, entityIdKey(event.modelId!)]))}`;
 }
 
 function appendOutboxEntityOrderKey(keys: string[], key: string) {
@@ -1632,7 +1639,8 @@ export function createOutboxPlugin(options: OutboxPluginOptions): ActiveTsPlugin
 	) => {
 		const modelName = outboxHookModelName(model);
 		if (!modelName) return;
-		const resolvedMeta = resolvedOutboxMeta(model);
+		const rawMeta = resolvedOutboxMeta(model);
+		const resolvedMeta = rawMeta ? outboxScopedMeta(context, rawMeta) : undefined;
 		const datastoreIdentity = outboxDatastoreIdentity(
 			resolvedMeta,
 			modelId,
@@ -1650,6 +1658,7 @@ export function createOutboxPlugin(options: OutboxPluginOptions): ActiveTsPlugin
 			modelIdentity: datastoreIdentity.modelIdentity,
 			modelDatastoreAncestor: datastoreIdentity.modelDatastoreAncestor,
 			modelDatastoreProjectId: datastoreProjectIdForContext(context, resolvedMeta),
+			modelDatastoreScope: resolvedMeta?.datastoreSearchScope,
 			operation,
 			data: eventPayload.data,
 			dataEncoding: eventPayload.dataEncoding,
@@ -1764,8 +1773,11 @@ function outboxDatastoreIdentity(
 	target?: unknown,
 	namespace?: string
 ) {
-	if (!model?.datastore?.ancestor || modelId === undefined) {
+	if (!model || modelId === undefined) {
 		return { modelIdentity: undefined, modelDatastoreAncestor: undefined };
+	}
+	if (!model.datastore?.ancestor) {
+		return { modelIdentity: model.datastoreSearchScope === undefined ? undefined : datastoreSearchDocumentIdentity(model, modelId, undefined), modelDatastoreAncestor: undefined };
 	}
 	const ancestor = outboxTargetDatastoreAncestor(target) ?? (
 		data === undefined ? undefined : model.datastore.ancestor({ model, id: modelId, data })
@@ -2050,7 +2062,7 @@ export async function runSearchSyncWorker<TOutbox extends OutboxAdapter = Outbox
 					`Outbox event "${event.id}" references unregistered model "${event.model}".`
 				);
 			}
-			const meta = activeOptions.context ? activeOptions.context.meta(model) : legacyOutboxMeta(model, event.model);
+			const meta = outboxScopedMeta(activeOptions.context, activeOptions.context ? activeOptions.context.meta(model) : legacyOutboxMeta(model, event.model));
 			assertOutboxDatastoreProjectId(activeOptions.context, meta, event);
 			const searchRoutes = resolveSearchSyncAdapterRoutes(
 				activeOptions.context,
@@ -2561,6 +2573,7 @@ async function enqueueSearchSyncRepair(outbox: OutboxAdapter, event: OutboxEvent
 		modelIdentity: event.modelIdentity,
 		modelDatastoreAncestor: event.modelDatastoreAncestor,
 		modelDatastoreProjectId: event.modelDatastoreProjectId,
+		modelDatastoreScope: event.modelDatastoreScope,
 		operation: 'update',
 		reconcileFromStore: true,
 		createdAt: event.createdAt,
@@ -2922,12 +2935,13 @@ function outboxEventSearchDocumentIdentity(
 				`Outbox event "${event.id}" for non-Datastore model "${meta.name}" cannot include Datastore ancestor metadata.`
 			);
 		}
-		if (event.modelIdentity !== undefined) {
+		const scopedIdentity = meta.datastoreSearchScope === undefined ? undefined : datastoreSearchDocumentIdentity(meta, event.modelId!, undefined);
+		if (event.modelIdentity !== undefined && event.modelIdentity !== scopedIdentity) {
 			throw new ActiveTsConfigurationError(
 				`Outbox event "${event.id}" for non-Datastore model "${meta.name}" cannot include model identity metadata.`
 			);
 		}
-		return undefined;
+		return scopedIdentity;
 	}
 	const dataAncestor = data === undefined
 		? undefined
@@ -3053,11 +3067,17 @@ function outboxEventPayloadHasAncestorFields(meta: ResolvedModelMeta, data: unkn
 	return datastorePayloadHasAncestorFields(meta, data);
 }
 
+function outboxScopedMeta(context: unknown, meta: ResolvedModelMeta): ResolvedModelMeta {
+	if (!(context instanceof ActiveContext)) return meta;
+	const store = contextInternalStore(context, meta.store);
+	return withDatastoreSearchNamespace(meta, store.datastoreNamespace, datastoreSearchScopeForStore(store));
+}
+
 function datastoreNamespaceForContext(
 	context: ActiveContext | undefined | unknown,
 	meta: ResolvedModelMeta | undefined
 ) {
-	if (!(context instanceof ActiveContext) || !meta?.datastore?.ancestor) return undefined;
+	if (!(context instanceof ActiveContext) || !meta) return undefined;
 	return contextInternalStore(context, meta.store).datastoreNamespace;
 }
 
@@ -3074,6 +3094,10 @@ function assertOutboxDatastoreProjectId(
 	meta: ResolvedModelMeta,
 	event: OutboxEvent
 ) {
+	if (event.modelDatastoreScope !== meta.datastoreSearchScope &&
+		(event.modelDatastoreProjectId === undefined || event.modelDatastoreProjectId === datastoreProjectIdForContext(context, meta))) {
+		throw new ActiveTsConfigurationError(`Outbox event "${event.id}" Datastore scope does not match its context; rebuild legacy or differently scoped events before delivery.`);
+	}
 	if (event.modelDatastoreProjectId === undefined) return;
 	if (!context) {
 		throw new ActiveTsConfigurationError(
@@ -3457,6 +3481,7 @@ function sanitizeOutboxEvent(event: unknown, options: { requireModelId: boolean 
 	const modelIdentity = ownOptionValue(record, 'modelIdentity', 'Outbox event');
 	const modelDatastoreAncestor = ownOptionValue(record, 'modelDatastoreAncestor', 'Outbox event');
 	const modelDatastoreProjectId = ownOptionValue(record, 'modelDatastoreProjectId', 'Outbox event');
+	const modelDatastoreScope = normalizeDatastoreSearchScope(ownOptionValue(record, 'modelDatastoreScope', 'Outbox event'));
 	const data = ownOptionValue(record, 'data', 'Outbox event');
 	const dataEncoding = ownOptionValue(record, 'dataEncoding', 'Outbox event');
 	const reconcileFromStore = ownOptionValue(record, 'reconcileFromStore', 'Outbox event');
@@ -3523,6 +3548,7 @@ function sanitizeOutboxEvent(event: unknown, options: { requireModelId: boolean 
 		createdAt,
 		data: data === undefined ? undefined : cloneSafeData(data)
 	};
+	if (modelDatastoreScope !== undefined) normalized.modelDatastoreScope = modelDatastoreScope;
 	if (modelId !== undefined) normalized.modelId = modelId as EntityId;
 	if (modelIdentity !== undefined) normalized.modelIdentity = modelIdentity as string;
 	if (safeModelDatastoreAncestor !== undefined) normalized.modelDatastoreAncestor = safeModelDatastoreAncestor;

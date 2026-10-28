@@ -1,3 +1,4 @@
+import { datastoreSearchScopeForStore, normalizeDatastoreCacheScopeStability } from '../../core/datastore-search-scope.js';
 import type { QueryResult, ResolvedModelMeta, SearchAdapter, StoreAdapter } from '../../core/types.js';
 import {
 	assertPlainDataObject,
@@ -92,7 +93,7 @@ export function createNativeSearchAdapter(store: StoreAdapter): SearchAdapter {
 					throw new ActiveTsConfigurationError(`Store adapter "${wrapped.kind}" does not support native search payloads.`);
 				if (options.cursor !== undefined && !storeCapabilities.cursor)
 					throw new ActiveTsConfigurationError(`Store adapter "${wrapped.kind}" does not support native search cursors.`);
-				const searchModel = withDatastoreSearchNamespace(model, wrapped.datastoreNamespace);
+				const searchModel = withDatastoreSearchNamespace(model, wrapped.datastoreNamespace, datastoreSearchScopeForStore(wrapped));
 				if (options.native !== undefined) {
 					return normalizeNativeSearchResult(
 						searchModel,
@@ -277,6 +278,13 @@ function normalizeNativeSearchStore(store: StoreAdapter) {
 		kind,
 		query: query.bind(store) as StoreAdapter['query'],
 		datastoreNamespace,
+		cacheScope: adapterMember(store, 'cacheScope', { allowOwnAccessor: allowContextAccessors }) as StoreAdapter['cacheScope'],
+		datastoreProjectId: adapterMember(store, 'datastoreProjectId', { allowOwnAccessor: allowContextAccessors }) as StoreAdapter['datastoreProjectId'],
+		datastoreDatabaseId: adapterMember(store, 'datastoreDatabaseId', { allowOwnAccessor: allowContextAccessors }) as StoreAdapter['datastoreDatabaseId'],
+		datastoreKeyEncoding: adapterMember(store, 'datastoreKeyEncoding', { allowOwnAccessor: allowContextAccessors }) as StoreAdapter['datastoreKeyEncoding'],
+		datastoreCacheScopeStability: normalizeDatastoreCacheScopeStability(
+			adapterMember(store, 'datastoreCacheScopeStability', { allowOwnAccessor: allowContextAccessors }), 'Native search store'
+		),
 		capabilities: capabilities as StoreAdapter['capabilities'] | undefined
 	});
 }

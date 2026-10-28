@@ -6,6 +6,7 @@ import {
 	createSchemaMigration,
 	executeSchemaGroups
 } from './context-schema.js';
+import { datastoreSearchScopeForStore, normalizeDatastoreCacheScopeStability } from './datastore-search-scope.js';
 import { BatchLoader } from './batch-loader.js';
 import {
 	ActiveTsCommittedTransactionError,
@@ -68,6 +69,7 @@ import {
 	assertSearchOptionsSupported,
 	assertSearchWriteOptionsSupported,
 	CONTEXT_BOUND_SEARCH_DATASTORE_NAMESPACE,
+	CONTEXT_BOUND_SEARCH_DATASTORE_SCOPE,
 	datastoreSearchHitDocumentIdentityOrForced,
 	markSearchAdapterSource,
 	markSearchDocumentIdentity,
@@ -637,6 +639,14 @@ function assertStoreAdapter(adapter: unknown, context: string): asserts adapter 
 		throw new ActiveTsConfigurationError(
 			`${context}.datastoreKeyEncoding could not be snapshotted: ${safeErrorMessage(error)}`
 		);
+	}
+	const datastoreCacheScopeStability = normalizeDatastoreCacheScopeStability(
+		adapterMember(record, 'datastoreCacheScopeStability', context), context
+	);
+	try {
+		defineAdapterProperty(record, 'datastoreCacheScopeStability', datastoreCacheScopeStability, datastoreCacheScopeStability !== undefined);
+	} catch (error) {
+		throw new ActiveTsConfigurationError(`${context}.datastoreCacheScopeStability could not be snapshotted: ${safeErrorMessage(error)}`);
 	}
 	for (const property of ['get', 'getMany', 'query', 'create', 'update', 'delete']) {
 		snapshotFunctionProperty(record, property, context);
@@ -1351,6 +1361,7 @@ export class ActiveContext {
 			datastoreProjectId: adapter.datastoreProjectId,
 			datastoreDatabaseId: adapter.datastoreDatabaseId,
 			datastoreKeyEncoding: adapter.datastoreKeyEncoding,
+			datastoreCacheScopeStability: adapter.datastoreCacheScopeStability,
 			get: (model, id, options) => this.trackOperation(async () => {
 				const safeModel = snapshotAdapterModel(model, 'context store get model metadata');
 				assertSafeEntityId(id, 'context store get id');
@@ -1626,7 +1637,8 @@ export class ActiveContext {
 				const indexKind = searchIndexAdapterKind(retained, name);
 				const adapterMeta = withDatastoreSearchNamespace(
 					withSearchIndexesForAdapter(safeModel, name, indexKind),
-					this.store(safeModel.store).datastoreNamespace
+					this.store(safeModel.store).datastoreNamespace,
+					datastoreSearchScopeForStore(this.store(safeModel.store))
 				);
 				const result = await retained.search(adapterMeta, safeQuery, safeOptions);
 				return normalizeContextSearchResult(
@@ -1644,7 +1656,8 @@ export class ActiveContext {
 				const indexKind = searchIndexAdapterKind(retained, name);
 				const adapterMeta = withDatastoreSearchNamespace(
 					withSearchIndexesForAdapter(safeModel, name, indexKind),
-					this.store(safeModel.store).datastoreNamespace
+					this.store(safeModel.store).datastoreNamespace,
+					datastoreSearchScopeForStore(this.store(safeModel.store))
 				);
 				const safeData = cloneSafeDataObject(data, 'context search index data');
 				projectSearchDocument(adapterMeta, indexKind, safeId, safeData, {
@@ -1663,7 +1676,8 @@ export class ActiveContext {
 				const indexKind = searchIndexAdapterKind(retained, name);
 				const adapterMeta = withDatastoreSearchNamespace(
 					withSearchIndexesForAdapter(safeModel, name, indexKind),
-					this.store(safeModel.store).datastoreNamespace
+					this.store(safeModel.store).datastoreNamespace,
+					datastoreSearchScopeForStore(this.store(safeModel.store))
 				);
 				if (!isTransactionScopedSearchAdapter(retained)) assertContextSearchIndexSupported(retained);
 				assertSearchWriteOptionsSupported(retained, safeOptions);
@@ -1724,6 +1738,9 @@ export class ActiveContext {
 		};
 		defineScopedCapabilities<SearchCapabilities>(handle, () => this.searchForRetainedHandle(name).capabilities);
 		defineDataProperty(handle, CONTEXT_BOUND_SEARCH_SOURCE, adapter, { enumerable: false, configurable: false });
+		defineDataProperty(handle, CONTEXT_BOUND_SEARCH_DATASTORE_SCOPE,
+			(model: ResolvedModelMeta) => datastoreSearchScopeForStore(this.store(model.store)),
+			{ enumerable: false, configurable: false });
 		defineDataProperty(
 			handle,
 			CONTEXT_BOUND_SEARCH_DATASTORE_NAMESPACE,
@@ -1747,9 +1764,8 @@ export class ActiveContext {
 			const adapterMeta = withSearchIndexesForAdapter(safeModels[index], name, indexKind);
 			adapterModels[index] = withDatastoreSearchNamespace(
 				adapterMeta,
-				adapterMeta.datastore?.ancestor
-					? this.internalStore(adapterMeta.store).datastoreNamespace
-					: undefined
+				this.internalStore(adapterMeta.store).datastoreNamespace,
+				datastoreSearchScopeForStore(this.internalStore(adapterMeta.store))
 			);
 		}
 		return adapterModels;
@@ -3735,9 +3751,8 @@ export class ActiveContext {
 				if (!adapter) throw new ActiveTsConfigurationError(`Search adapter "${safeName}" is not registered.`);
 				const routedMeta = withDatastoreSearchNamespace(
 					withSearchIndexesForAdapter(meta, safeName, searchIndexAdapterKind(adapter, safeName)),
-					meta.datastore?.ancestor
-						? this.internalStore(meta.store).datastoreNamespace
-						: undefined
+					this.internalStore(meta.store).datastoreNamespace,
+					datastoreSearchScopeForStore(this.internalStore(meta.store))
 				);
 				if (!routedMeta.searchIndexes.length) continue;
 				const list = mapGet(grouped, safeName) ?? [];
@@ -4145,6 +4160,7 @@ function createTransactionReadOnlyStore(
 		datastoreProjectId: adapter.datastoreProjectId,
 		datastoreDatabaseId: adapter.datastoreDatabaseId,
 		datastoreKeyEncoding: adapter.datastoreKeyEncoding,
+		datastoreCacheScopeStability: adapter.datastoreCacheScopeStability,
 		capabilities,
 		get: (model, id, options) => {
 			const safeModel = snapshotAdapterModel(model, 'transaction read-only store model metadata');
@@ -4207,6 +4223,7 @@ function createTransactionScopedStore(adapter: StoreAdapter, source?: StoreAdapt
 			? source?.datastoreDatabaseId
 			: adapter.datastoreDatabaseId,
 		datastoreKeyEncoding: adapter.datastoreKeyEncoding ?? source?.datastoreKeyEncoding,
+		datastoreCacheScopeStability: adapter.datastoreCacheScopeStability ?? source?.datastoreCacheScopeStability,
 		capabilities: Object.freeze({ ...(adapter.capabilities ?? {}), transaction: false }),
 		get: (...args) => adapter.get(...args),
 		getMany: (...args) => adapter.getMany(...args),
@@ -4243,6 +4260,7 @@ function createTransactionReadOnlyScopedStore(
 			? source.datastoreDatabaseId
 			: adapter.datastoreDatabaseId,
 		datastoreKeyEncoding: adapter.datastoreKeyEncoding ?? source.datastoreKeyEncoding,
+		datastoreCacheScopeStability: adapter.datastoreCacheScopeStability ?? source.datastoreCacheScopeStability,
 		capabilities: Object.freeze({ ...(adapter.capabilities ?? {}), transaction: false, native: false }),
 		get: (model, id, options) => {
 			const safeModel = snapshotAdapterModel(model, 'transaction read-only scoped store model metadata');
@@ -4330,6 +4348,7 @@ function createContextBoundTransactionStore(adapter: StoreAdapter, source: Store
 		? source.datastoreDatabaseId
 		: adapter.datastoreDatabaseId;
 	const datastoreKeyEncoding = adapter.datastoreKeyEncoding ?? source.datastoreKeyEncoding;
+	const datastoreCacheScopeStability = adapter.datastoreCacheScopeStability ?? source.datastoreCacheScopeStability;
 	const cacheScope = adapter.cacheScope ?? source.cacheScope;
 	const trustedDatastoreEntityKeys = storeTrustsDatastoreEntityKeyRows(adapter) || storeTrustsDatastoreEntityKeyRows(source);
 	const handle: StoreAdapter = {
@@ -4339,6 +4358,7 @@ function createContextBoundTransactionStore(adapter: StoreAdapter, source: Store
 		datastoreProjectId,
 		datastoreDatabaseId,
 		datastoreKeyEncoding,
+		datastoreCacheScopeStability,
 		capabilities: Object.freeze({ ...(adapter.capabilities ?? {}), transaction: false }),
 		get: async (model, id, options) => {
 			const safeModel = snapshotAdapterModel(model, 'context store transaction get model metadata');

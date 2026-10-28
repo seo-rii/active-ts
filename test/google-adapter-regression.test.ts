@@ -4743,6 +4743,8 @@ test('Datastore transaction buffered writes ignore stale entity key markers when
 test('Datastore ancestor model outbox includeData uses fallback payload inside transactions', async () => {
 	const calls: string[] = [];
 	const client = datastoreClient({
+		options: { projectId: 'outbox-scope-test', servicePath: 'datastore.googleapis.com', port: 443 },
+		getDatabaseId: () => undefined,
 		transaction: () => ({
 			run: async () => {
 				calls[calls.length] = 'run';
@@ -10387,6 +10389,8 @@ test('Search include reloads Datastore ancestor models with hit-derived ancestor
 	let queryCount = 0;
 	const datastore = await createDatastoreStoreAdapter({
 		client: datastoreClient({
+			options: { projectId: 'search-include-scope-test', servicePath: 'datastore.googleapis.com', port: 443 },
+			getDatabaseId: () => undefined,
 			key: (input: unknown) => ({ input }),
 			createQuery,
 			runQuery: async () => {
@@ -10403,7 +10407,7 @@ test('Search include reloads Datastore ancestor models with hit-derived ancestor
 		search: { memory: search }
 	});
 	const Record = DatastoreSearchRecord.use(context) as unknown as typeof DatastoreSearchRecord;
-	await search.index(context.meta(DatastoreSearchRecord), 7, {
+	await context.searchAdapter('memory').index(context.meta(DatastoreSearchRecord), 7, {
 		id: 7,
 		parentId: 10,
 		childId: 5,

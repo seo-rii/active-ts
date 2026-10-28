@@ -34,6 +34,8 @@ import {
 	createDatastoreStoreAdapter,
 	inventoryDatastoreIds
 } from '../../build/src/adapters/store/datastore.js';
+import { datastoreSearchScopeForStore } from '../../build/src/core/datastore-search-scope.js';
+import { withDatastoreSearchNamespace } from '../../build/src/core/search-utils.js';
 import { createFirestoreStoreAdapter } from '../../build/src/adapters/store/firestore.js';
 import { createMongoStoreAdapter } from '../../build/src/adapters/store/mongodb.js';
 import { createPostgresStoreAdapter } from '../../build/src/adapters/store/postgresql.js';
@@ -1180,6 +1182,8 @@ if (targets.has('datastore') && targets.has('elasticsearch')) {
 		});
 		const Record = IntegrationDatastoreOutboxSearchRecord.use(context);
 		const meta = context.meta(IntegrationDatastoreOutboxSearchRecord);
+		const store = context.store(meta.store);
+		const searchMeta = withDatastoreSearchNamespace(meta, store.datastoreNamespace, datastoreSearchScopeForStore(store));
 		const leftAncestor = datastoreKey(parentKind, 10, { namespace });
 		const rightAncestor = datastoreKey(parentKind, 20, { namespace });
 		await Record.create({ id: 1, parentId: 10, title: 'backend left needle' });
@@ -1190,6 +1194,7 @@ if (targets.has('datastore') && targets.has('elasticsearch')) {
 				id: event.id,
 				operation: event.operation,
 				modelIdentity: event.modelIdentity,
+				modelDatastoreScope: event.modelDatastoreScope,
 				modelDatastoreAncestor: event.modelDatastoreAncestor,
 				hasData: event.data !== undefined
 			})),
@@ -1197,14 +1202,16 @@ if (targets.has('datastore') && targets.has('elasticsearch')) {
 				{
 					id: 'datastore-outbox-search-1',
 					operation: 'create',
-					modelIdentity: datastoreSearchDocumentIdentity(meta, 1, leftAncestor),
+					modelIdentity: datastoreSearchDocumentIdentity(searchMeta, 1, leftAncestor),
+					modelDatastoreScope: searchMeta.datastoreSearchScope,
 					modelDatastoreAncestor: leftAncestor,
 					hasData: false
 				},
 				{
 					id: 'datastore-outbox-search-2',
 					operation: 'create',
-					modelIdentity: datastoreSearchDocumentIdentity(meta, 1, rightAncestor),
+					modelIdentity: datastoreSearchDocumentIdentity(searchMeta, 1, rightAncestor),
+					modelDatastoreScope: searchMeta.datastoreSearchScope,
 					modelDatastoreAncestor: rightAncestor,
 					hasData: false
 				}
@@ -1223,9 +1230,14 @@ if (targets.has('datastore') && targets.has('elasticsearch')) {
 		assert.ok(Number.isSafeInteger(createdRevisionTotal) && createdRevisionTotal > 0);
 		const indexName = `${indexPrefix}${meta.name}`.toLowerCase();
 		await elasticsearchClient.indices.refresh({ index: indexName });
-		const indexed = await search.search(meta, 'needle', { limit: 10 });
+		const indexed = await context.searchAdapter('elasticsearch').search(meta, 'needle', { limit: 10 });
 		assert.deepEqual(
 			indexed.list.map((item) => `${item.id}:${item.parentId}`).sort(),
+			['1:10', '1:20']
+		);
+		const publicIndexed = await Record.search('needle').limit(10).load();
+		assert.deepEqual(
+			publicIndexed.list.map((item) => `${item.data.id}:${item.data.parentId}`).sort(),
 			['1:10', '1:20']
 		);
 
@@ -1236,6 +1248,7 @@ if (targets.has('datastore') && targets.has('elasticsearch')) {
 				id: event.id,
 				operation: event.operation,
 				modelIdentity: event.modelIdentity,
+				modelDatastoreScope: event.modelDatastoreScope,
 				modelDatastoreAncestor: event.modelDatastoreAncestor,
 				hasData: event.data !== undefined
 			})),
@@ -1243,7 +1256,8 @@ if (targets.has('datastore') && targets.has('elasticsearch')) {
 				{
 					id: 'datastore-outbox-search-3',
 					operation: 'delete',
-					modelIdentity: datastoreSearchDocumentIdentity(meta, 1, leftAncestor),
+					modelIdentity: datastoreSearchDocumentIdentity(searchMeta, 1, leftAncestor),
+					modelDatastoreScope: searchMeta.datastoreSearchScope,
 					modelDatastoreAncestor: leftAncestor,
 					hasData: false
 				}
@@ -1263,9 +1277,14 @@ if (targets.has('datastore') && targets.has('elasticsearch')) {
 			createdRevisionTotal + 1
 		);
 		await elasticsearchClient.indices.refresh({ index: indexName });
-		const afterDelete = await search.search(meta, 'needle', { limit: 10 });
+		const afterDelete = await context.searchAdapter('elasticsearch').search(meta, 'needle', { limit: 10 });
 		assert.deepEqual(
 			afterDelete.list.map((item) => `${item.id}:${item.parentId}`).sort(),
+			['1:20']
+		);
+		const publicAfterDelete = await Record.search('needle').limit(10).load();
+		assert.deepEqual(
+			publicAfterDelete.list.map((item) => `${item.data.id}:${item.data.parentId}`).sort(),
 			['1:20']
 		);
 	} finally {
