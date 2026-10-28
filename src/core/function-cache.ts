@@ -65,6 +65,7 @@ type MemoryEntry<TValue> = {
 	expires?: number;
 	staleUntil?: number;
 	epoch: number;
+	publicationEpoch: number;
 };
 type FunctionCacheRuntime = {
 	adapter?: CacheAdapter;
@@ -81,7 +82,7 @@ type FunctionCachePersistentRead<TValue> = {
 };
 type FunctionCacheWriteIntent =
 	| { mode: 'authoritative' }
-	| { mode: 'backfill'; expectedVersion?: string };
+	| { mode: 'backfill'; expectedVersion?: string; expectedPublicationEpoch?: number; refresh?: boolean };
 const FUNCTION_CACHE_OPTION_KEYS = [
 	'prefix',
 	'factory',
@@ -98,9 +99,13 @@ const FUNCTION_CACHE_OPTION_KEYS = [
 const FUNCTION_CACHE_MEMORY_OPTION_KEYS = ['ttl', 'maxEntries'] as const;
 const FUNCTION_CACHE_GET_OPTION_KEYS = ['refresh'] as const;
 const FUNCTION_CACHE_INVALIDATION_EPOCH_LIMIT = 4096;
-const functionCacheInvalidationEpochs = new Map<string, number>();
+// Invalidations reject old reads; refreshes fence publication while preserving those reads.
+// Share the bounded registry so refresh history does not grow independently.
+type FunctionCacheEpochs = { invalidation: number; publication: number };
+const functionCacheInvalidationEpochs = new Map<string, FunctionCacheEpochs>();
 const functionCacheInvalidationFailures = new WeakMap<object, Set<string>>();
 const functionCachePendingInvalidations = new Map<string, number>();
+const functionCachePendingWrites = new Map<string, Promise<void>>();
 const functionCacheTransactionScopes = new WeakMap<ActiveContext, number>();
 const DATE_GET_TIME = Date.prototype.getTime;
 const DATE_TO_ISO_STRING = Date.prototype.toISOString;
@@ -158,6 +163,15 @@ export class ActiveFunctionCache<TInput, TValue> {
 		const epoch = this.invalidationEpoch(key);
 		const bypassCache = this.shouldBypassCacheForTransaction();
 		const flightScope = this.inFlightScope();
+		let publicationEpoch = this.publicationEpoch(key);
+		if (getOptions.refresh && !bypassCache) {
+			if (this.options.singleFlight !== false) {
+				const flightKey = this.inFlightKey(key, getOptions, epoch, flightScope, publicationEpoch);
+				const active = MAP_GET.call(this.inFlight, flightKey) as Promise<TValue> | undefined;
+				if (active) return cloneFunctionCacheValue(await active);
+			}
+			publicationEpoch = this.bumpPublicationEpoch(key);
+		}
 		if (!bypassCache && !getOptions.refresh && this.options.consistency !== 'distributed') {
 			const local = this.memoryGet(key, { allowStale: true });
 			if (local.found && !local.stale) {
@@ -179,10 +193,10 @@ export class ActiveFunctionCache<TInput, TValue> {
 			}
 		}
 		if (this.options.singleFlight !== false) {
-			const flightKey = this.inFlightKey(key, getOptions, epoch, flightScope);
+			const flightKey = this.inFlightKey(key, getOptions, epoch, flightScope, publicationEpoch);
 			const active = MAP_GET.call(this.inFlight, flightKey) as Promise<TValue> | undefined;
 			if (active) return cloneFunctionCacheValue(await active);
-			const pending = this.getAfterMemoryMiss(input, key, getOptions, epoch, bypassCache);
+			const pending = this.getAfterMemoryMiss(input, key, getOptions, epoch, bypassCache, publicationEpoch);
 			MAP_SET.call(this.inFlight, flightKey, pending);
 			try {
 				return await pending;
@@ -190,7 +204,7 @@ export class ActiveFunctionCache<TInput, TValue> {
 				MAP_DELETE.call(this.inFlight, flightKey);
 			}
 		}
-		return await this.getAfterMemoryMiss(input, key, getOptions, epoch, bypassCache);
+		return await this.getAfterMemoryMiss(input, key, getOptions, epoch, bypassCache, publicationEpoch);
 	}
 
 	private async getAfterMemoryMiss(
@@ -198,7 +212,8 @@ export class ActiveFunctionCache<TInput, TValue> {
 		key: string,
 		getOptions: FunctionCacheGetOptions,
 		expectedEpoch: number,
-		bypassCache: boolean
+		bypassCache: boolean,
+		expectedPublicationEpoch: number
 	) {
 		let expectedVersion: string | undefined;
 		if (!bypassCache && !getOptions.refresh) {
@@ -206,20 +221,24 @@ export class ActiveFunctionCache<TInput, TValue> {
 			expectedVersion = cached?.version;
 			if (cached?.hit !== undefined && this.invalidationEpochUnchanged(key, expectedEpoch)) {
 				this.stats.cacheHits++;
-				this.memorySet(key, cached.hit.stored);
+				if (this.publicationEpochUnchanged(key, expectedPublicationEpoch)) this.memorySet(key, cached.hit.stored);
 				return cached.hit.value;
 			}
 		} else if (!bypassCache && this.options.consistency === 'distributed') {
-			expectedVersion = await this.cacheVersion(key);
+			expectedVersion = await this.refreshCacheVersion(key);
 		}
 		this.stats.misses++;
-		return await this.compute(input, key, this.invalidationEpoch(key), expectedVersion);
+		const publicationEpoch = this.invalidationEpochUnchanged(key, expectedEpoch)
+			? expectedPublicationEpoch
+			: this.publicationEpoch(key);
+		return await this.compute(input, key, this.invalidationEpoch(key), expectedVersion, publicationEpoch, getOptions.refresh === true);
 	}
 
 	async peek(input: TInput) {
 		if (this.shouldBypassCacheForTransaction()) return undefined;
 		const key = await this.keyFor(input);
 		const epoch = this.invalidationEpoch(key);
+		const publicationEpoch = this.publicationEpoch(key);
 		const local = this.options.consistency === 'distributed'
 			? { found: false as const, value: undefined }
 			: this.memoryGet(key);
@@ -230,7 +249,7 @@ export class ActiveFunctionCache<TInput, TValue> {
 		}
 		const cached = await this.cacheGet(key);
 		if (cached?.hit === undefined || !this.invalidationEpochUnchanged(key, epoch)) return undefined;
-		this.memorySet(key, cached.hit.stored);
+		if (this.publicationEpochUnchanged(key, publicationEpoch)) this.memorySet(key, cached.hit.stored);
 		return cached.hit.value;
 	}
 
@@ -351,56 +370,64 @@ export class ActiveFunctionCache<TInput, TValue> {
 			if (!transactionContext?.isInTransaction()) this.poisonFailedPreWriteSet(key, adapter);
 			throw error;
 		}
-		if (!this.invalidationEpochUnchanged(key, expectedEpoch)) {
-			if (intent.mode === 'backfill') this.diagnosticCounters.backfillEpochConflicts++;
-			return value;
-		}
 		if (transactionContext?.isInTransaction()) return value;
-		if (adapter) {
-			try {
-				const distributed = this.distributedAdapter(adapter);
-				if (distributed) {
-					if (intent.mode === 'authoritative') {
-						await distributed.setMany([[key, cacheValue]], { ttl: this.options.ttl });
-					} else {
-						if (intent.expectedVersion === undefined) {
-							this.diagnosticCounters.backfillMissingVersions++;
-							return value;
-						}
-						const results = normalizeCacheVersionedSetResult(
-							await distributed.setManyVersioned(
-								[[key, cacheValue, intent.expectedVersion]],
-								{ ttl: this.options.ttl }
-							),
-							1,
-							`Function cache adapter "${adapter.kind}" setManyVersioned`
-						);
-						if (!results[0]) {
-							this.diagnosticCounters.backfillVersionConflicts++;
-							return value;
-						}
-					}
-				} else {
-					await adapter.setMany([[key, cacheValue]], { ttl: this.options.ttl });
-				}
-			} catch (error) {
-				markInvalidationFailure(adapter, key);
-				throw error;
+		const published = await serializeFunctionCacheWrite(key, async () => {
+			if (!this.invalidationEpochUnchanged(key, expectedEpoch) ||
+				(intent.mode === 'backfill' && !this.publicationEpochUnchanged(key, intent.expectedPublicationEpoch))) {
+				if (intent.mode === 'backfill') this.diagnosticCounters.backfillEpochConflicts++;
+				return false;
 			}
-			if (!this.invalidationEpochUnchanged(key, expectedEpoch)) {
+			if (adapter) {
 				try {
 					const distributed = this.distributedAdapter(adapter);
-					if (distributed) await distributed.invalidateMany([key]);
-					else await adapter.deleteMany([key]);
+					if (distributed) {
+						if (intent.mode === 'authoritative') {
+							await distributed.setMany([[key, cacheValue]], { ttl: this.options.ttl });
+						} else {
+							if (intent.expectedVersion === undefined) {
+								this.diagnosticCounters.backfillMissingVersions++;
+								return false;
+							}
+							const results = normalizeCacheVersionedSetResult(
+								await distributed.setManyVersioned(
+									[[key, cacheValue, intent.expectedVersion]],
+									{ ttl: this.options.ttl }
+								),
+								1,
+								`Function cache adapter "${adapter.kind}" setManyVersioned`
+							);
+							if (!results[0]) {
+								this.diagnosticCounters.backfillVersionConflicts++;
+								return false;
+							}
+						}
+					} else {
+						await adapter.setMany([[key, cacheValue]], { ttl: this.options.ttl });
+					}
 				} catch (error) {
 					markInvalidationFailure(adapter, key);
 					throw error;
 				}
-				return value;
+				if (!this.invalidationEpochUnchanged(key, expectedEpoch)) {
+					try {
+						const distributed = this.distributedAdapter(adapter);
+						if (distributed) await distributed.invalidateMany([key]);
+						else await adapter.deleteMany([key]);
+					} catch (error) {
+						markInvalidationFailure(adapter, key);
+						throw error;
+					}
+					return false;
+				}
+				clearInvalidationFailure(adapter, key);
 			}
-			clearInvalidationFailure(adapter, key);
-		}
-		if (this.options.consistency !== 'distributed') this.memorySet(key, cacheValue);
+			if (intent.mode === 'backfill' && !this.publicationEpochUnchanged(key, intent.expectedPublicationEpoch)) return false;
+			// Fence reads and factories that started while this refresh was computing too.
+			if (intent.mode === 'backfill' && intent.refresh) this.bumpPublicationEpoch(key);
+			if (this.options.consistency !== 'distributed') this.memorySet(key, cacheValue);
+			return true;
+		});
+		if (!published) return value;
 		if (context) {
 			try {
 				await context.runHooks('afterCacheSet', {
@@ -484,16 +511,23 @@ export class ActiveFunctionCache<TInput, TValue> {
 		};
 	}
 
-	private async cacheVersion(key: string) {
+	private async refreshCacheVersion(key: string) {
 		const adapter = this.adapter();
 		const distributed = this.distributedAdapter(adapter);
 		if (!adapter) return undefined;
 		if (!distributed) return undefined;
 		if (hasPendingInvalidation(key)) return undefined;
-		if (hasInvalidationFailure(adapter, key)) {
-			this.diagnosticCounters.recoveryAttempts++;
-			await this.invalidateResolvedKey(key);
-		}
+		if (hasInvalidationFailure(adapter, key)) this.diagnosticCounters.recoveryAttempts++;
+		await serializeFunctionCacheWrite(key, async () => {
+			try {
+				await distributed.invalidateMany([key]);
+				clearInvalidationFailure(adapter, key);
+			} catch (error) {
+				markInvalidationFailure(adapter, key);
+				throw error;
+			}
+		});
+		if (hasPendingInvalidation(key) || hasInvalidationFailure(adapter, key)) return undefined;
 		const snapshots = normalizeCacheVersionedValues(
 			await distributed.getManyVersioned([key]),
 			1,
@@ -529,19 +563,22 @@ export class ActiveFunctionCache<TInput, TValue> {
 		return sanitizeFunctionCacheValue(result, 'afterCacheGet result');
 	}
 
-	private async compute(input: TInput, key: string, expectedEpoch: number, expectedVersion?: string) {
+	private async compute(input: TInput, key: string, expectedEpoch: number, expectedVersion?: string, expectedPublicationEpoch = this.publicationEpoch(key), refresh = false) {
 		const value = await this.options.factory(input);
 		await this.setResolvedKey(key, value, expectedEpoch, this.currentRuntime(), {
 			mode: 'backfill',
-			expectedVersion
+			expectedVersion,
+			expectedPublicationEpoch,
+			refresh
 		});
 		return value;
 	}
 
 	private async refreshInBackground(input: TInput, key: string, expectedEpoch: number) {
-		const flightKey = this.inFlightKey(key, { refresh: true }, expectedEpoch, this.inFlightScope());
+		const publicationEpoch = this.publicationEpoch(key);
+		const flightKey = this.inFlightKey(key, { refresh: true }, expectedEpoch, this.inFlightScope(), publicationEpoch);
 		if (MAP_HAS.call(this.inFlight, flightKey)) return;
-		const pending = this.compute(input, key, expectedEpoch);
+		const pending = this.compute(input, key, expectedEpoch, undefined, publicationEpoch, true);
 		MAP_SET.call(this.inFlight, flightKey, pending);
 		try {
 			await pending;
@@ -552,20 +589,38 @@ export class ActiveFunctionCache<TInput, TValue> {
 		}
 	}
 
-	private inFlightKey(key: string, options: FunctionCacheGetOptions, epoch: number, scope: string) {
-		return `${scope}\0${options.refresh ? 'refresh' : 'normal'}\0${epoch}\0${key}`;
+	private inFlightKey(key: string, options: FunctionCacheGetOptions, epoch: number, scope: string, publicationEpoch: number) {
+		return `${scope}\0${options.refresh ? 'refresh' : 'normal'}\0${epoch}\0${options.refresh ? '' : publicationEpoch}\0${key}`;
 	}
 
 	private invalidationEpoch(key: string) {
-		return (MAP_GET.call(functionCacheInvalidationEpochs, key) as number | undefined) ?? functionCacheDefaultInvalidationEpoch;
+		return (MAP_GET.call(functionCacheInvalidationEpochs, key) as FunctionCacheEpochs | undefined)?.invalidation ?? functionCacheDefaultInvalidationEpoch;
+	}
+
+	private publicationEpoch(key: string) {
+		return (MAP_GET.call(functionCacheInvalidationEpochs, key) as FunctionCacheEpochs | undefined)?.publication ?? functionCacheDefaultInvalidationEpoch;
+	}
+
+	private bumpPublicationEpoch(key: string) {
+		const epoch = this.publicationEpoch(key) + 1;
+		this.setEpochs(key, { invalidation: this.invalidationEpoch(key), publication: epoch });
+		return epoch;
+	}
+
+	private publicationEpochUnchanged(key: string, expectedEpoch: number | undefined) {
+		return expectedEpoch === undefined || this.publicationEpoch(key) === expectedEpoch;
 	}
 
 	private bumpInvalidationEpoch(key: string) {
-		const epoch = this.invalidationEpoch(key) + 1;
-		if (MAP_HAS.call(functionCacheInvalidationEpochs, key)) MAP_DELETE.call(functionCacheInvalidationEpochs, key);
-		MAP_SET.call(functionCacheInvalidationEpochs, key, epoch);
-		pruneFunctionCacheInvalidationEpochs();
+		const epoch = Math.max(this.invalidationEpoch(key), this.publicationEpoch(key)) + 1;
+		this.setEpochs(key, { invalidation: epoch, publication: epoch });
 		return epoch;
+	}
+
+	private setEpochs(key: string, epochs: FunctionCacheEpochs) {
+		if (MAP_HAS.call(functionCacheInvalidationEpochs, key)) MAP_DELETE.call(functionCacheInvalidationEpochs, key);
+		MAP_SET.call(functionCacheInvalidationEpochs, key, epochs);
+		pruneFunctionCacheInvalidationEpochs();
 	}
 
 	private invalidationEpochUnchanged(key: string, expectedEpoch: number | undefined) {
@@ -575,7 +630,7 @@ export class ActiveFunctionCache<TInput, TValue> {
 	private memoryGet(key: string, options: { allowStale?: boolean } = {}): { found: boolean; stale: boolean; value?: TValue } {
 		const entry = MAP_GET.call(this.memory, key) as MemoryEntry<TValue> | undefined;
 		if (!entry) return { found: false, stale: false };
-		if (entry.epoch !== this.invalidationEpoch(key)) {
+		if (entry.epoch !== this.invalidationEpoch(key) || entry.publicationEpoch !== this.publicationEpoch(key)) {
 			MAP_DELETE.call(this.memory, key);
 			return { found: false, stale: false };
 		}
@@ -598,7 +653,7 @@ export class ActiveFunctionCache<TInput, TValue> {
 			expires && this.options.staleWhileRevalidate
 				? expires + this.options.staleWhileRevalidate * 1000
 				: undefined;
-		MAP_SET.call(this.memory, key, { value: cloneFunctionCacheValue(value), expires, staleUntil, epoch: this.invalidationEpoch(key) });
+		MAP_SET.call(this.memory, key, { value: cloneFunctionCacheValue(value), expires, staleUntil, epoch: this.invalidationEpoch(key), publicationEpoch: this.publicationEpoch(key) });
 		const maxEntries = this.options.memory?.maxEntries;
 		if (maxEntries && MAP_SIZE.call(this.memory) > maxEntries) {
 			const first = MAP_KEYS.call(this.memory).next().value;
@@ -708,6 +763,22 @@ export class ActiveFunctionCache<TInput, TValue> {
 		const hash = createHash('sha256').update(assertWellFormedUnicode(raw, 'Function cache key')).digest('base64url');
 		const key = namespace === undefined ? `${this.options.prefix}:${hash}` : `${this.options.prefix}:${namespace}:${hash}`;
 		return assertSafeCacheKey(key, 'function cache key');
+	}
+}
+
+// Keep pending writes transient and ordered across cache instances sharing a key.
+// Hooks run outside this queue so they can call cache APIs without holding it.
+async function serializeFunctionCacheWrite<T>(key: string, write: () => Promise<T>): Promise<T> {
+	const previous = MAP_GET.call(functionCachePendingWrites, key) as Promise<void> | undefined;
+	let release!: () => void;
+	const pending = new Promise<void>(resolve => { release = resolve; });
+	MAP_SET.call(functionCachePendingWrites, key, pending);
+	if (previous) await previous;
+	try {
+		return await write();
+	} finally {
+		release();
+		if (MAP_GET.call(functionCachePendingWrites, key) === pending) MAP_DELETE.call(functionCachePendingWrites, key);
 	}
 }
 
@@ -1013,7 +1084,8 @@ function pruneFunctionCacheInvalidationEpochs() {
 		const next = (MAP_KEYS.call(functionCacheInvalidationEpochs) as IterableIterator<string>).next();
 		if (next.done) return;
 		const key = next.value;
-		const epoch = (MAP_GET.call(functionCacheInvalidationEpochs, key) as number | undefined) ?? functionCacheDefaultInvalidationEpoch;
+		const epochs = MAP_GET.call(functionCacheInvalidationEpochs, key) as FunctionCacheEpochs;
+		const epoch = Math.max(epochs.invalidation, epochs.publication);
 		MAP_DELETE.call(functionCacheInvalidationEpochs, key);
 		functionCacheDefaultInvalidationEpoch = Math.max(functionCacheDefaultInvalidationEpoch, epoch + 1);
 	}
