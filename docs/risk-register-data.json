@@ -1,0 +1,358 @@
+{
+  "schemaVersion": 1,
+  "reviewedCommit": "bcabf3ca03312225f8261b96971dbaee4cd737df",
+  "reviewedAt": "2026-10-26",
+  "findings": [
+    {
+      "id": "BUG-203",
+      "priority": "P1",
+      "title": "Read validator input mutation can change record identity",
+      "kind": "bug",
+      "verification": "reproduced",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/50"
+    },
+    {
+      "id": "BUG-204",
+      "priority": "P2",
+      "title": "Custom constructors can change a loaded record identity",
+      "kind": "bug",
+      "verification": "reproduced",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/54"
+    },
+    {
+      "id": "BUG-205",
+      "priority": "P2",
+      "title": "Resolved field codec objects remain mutable",
+      "kind": "bug",
+      "verification": "reproduced",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/64"
+    },
+    {
+      "id": "BUG-206",
+      "priority": "P3",
+      "title": "Rejected validator configuration leaves partial metadata changes",
+      "kind": "bug",
+      "verification": "reproduced",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/68"
+    },
+    {
+      "id": "BUG-207",
+      "priority": "P2",
+      "title": "Empty search include disagrees with the full-model return type",
+      "kind": "bug",
+      "verification": "reproduced",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/72"
+    },
+    {
+      "id": "BUG-208",
+      "priority": "P2",
+      "title": "Soft-delete helper lifetime escapes transaction operation tracking",
+      "kind": "bug",
+      "verification": "reproduced",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/80"
+    },
+    {
+      "id": "BUG-209",
+      "priority": "P2",
+      "title": "Function cache keys alias malformed Unicode strings",
+      "kind": "bug",
+      "verification": "reproduced",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/49"
+    },
+    {
+      "id": "BUG-210",
+      "priority": "P2",
+      "title": "Redis cache keys and prefixes alias malformed Unicode strings",
+      "kind": "bug",
+      "verification": "reproduced",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/52"
+    },
+    {
+      "id": "BUG-211",
+      "priority": "P2",
+      "title": "Meilisearch cursors omit query identity and page size",
+      "kind": "bug",
+      "verification": "reproduced",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/55"
+    },
+    {
+      "id": "BUG-212",
+      "priority": "P3",
+      "title": "Malformed memory cache delete batches partially mutate",
+      "kind": "bug",
+      "verification": "reproduced",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/58"
+    },
+    {
+      "id": "BUG-213",
+      "priority": "P2",
+      "title": "An empty memory search scope clears every index",
+      "kind": "bug",
+      "verification": "reproduced",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/63"
+    },
+    {
+      "id": "BUG-214",
+      "priority": "P2",
+      "title": "Distributed function caches cannot recover through fresh computation",
+      "kind": "bug",
+      "verification": "reproduced",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/65"
+    },
+    {
+      "id": "BUG-215",
+      "priority": "P2",
+      "title": "SQLite average can overflow for a finite expected result",
+      "kind": "bug",
+      "verification": "reproduced",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/53"
+    },
+    {
+      "id": "BUG-216",
+      "priority": "P2",
+      "title": "SQLite sorting accepts arrays and objects",
+      "kind": "bug",
+      "verification": "reproduced",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/67"
+    },
+    {
+      "id": "BUG-217",
+      "priority": "P2",
+      "title": "SQLite Unicode comparisons diverge from portable ordering",
+      "kind": "bug",
+      "verification": "reproduced",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/71"
+    },
+    {
+      "id": "BUG-218",
+      "priority": "P1",
+      "title": "Malformed Unicode entity IDs can alias Firestore documents",
+      "kind": "bug",
+      "verification": "reproduced",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/62"
+    },
+    {
+      "id": "BUG-219",
+      "priority": "P1",
+      "title": "Datastore automatic cache scope omits the physical endpoint",
+      "kind": "bug",
+      "verification": "reproduced",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/87"
+    },
+    {
+      "id": "BUG-220",
+      "priority": "P2",
+      "title": "Integration harnesses swallow falsy rejection values",
+      "kind": "bug",
+      "verification": "reproduced",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/51"
+    },
+    {
+      "id": "BUG-221",
+      "priority": "P2",
+      "title": "Nested test context wrappers restore an outer installation",
+      "kind": "bug",
+      "verification": "reproduced",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/56"
+    },
+    {
+      "id": "BUG-222",
+      "priority": "P2",
+      "title": "Fixture writes leave negative cache entries intact",
+      "kind": "bug",
+      "verification": "reproduced",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/66"
+    },
+    {
+      "id": "BUG-223",
+      "priority": "P2",
+      "title": "Package builds retain outputs from deleted sources",
+      "kind": "bug",
+      "verification": "reproduced",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/69"
+    },
+    {
+      "id": "BUG-159",
+      "priority": "P1",
+      "title": "Search revisions reserved after reads can publish stale state last",
+      "kind": "bug",
+      "verification": "reproduced",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/74"
+    },
+    {
+      "id": "BUG-160",
+      "priority": "P1",
+      "title": "Datastore search identities omit complete physical scope",
+      "kind": "bug",
+      "verification": "reproduced",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/94"
+    },
+    {
+      "id": "ARCH-010",
+      "priority": "P2",
+      "title": "Entity cache ownership maps retain high-cardinality built-in keys",
+      "kind": "improvement",
+      "verification": "reproduced",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/89"
+    },
+    {
+      "id": "ARCH-011",
+      "priority": "P2",
+      "title": "SQLite query expressions do not use generated indexes",
+      "kind": "improvement",
+      "verification": "reproduced",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/79"
+    },
+    {
+      "id": "ARCH-012",
+      "priority": "P2",
+      "title": "Limited memory queries still use quadratic sorting",
+      "kind": "improvement",
+      "verification": "reproduced",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/95"
+    },
+    {
+      "id": "ARCH-013",
+      "priority": "P2",
+      "title": "Search includes refresh owners and relations per hit",
+      "kind": "improvement",
+      "verification": "reproduced",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/100"
+    },
+    {
+      "id": "ARCH-014",
+      "priority": "P3",
+      "title": "Context schema and cache coordination need separate responsibilities",
+      "kind": "improvement",
+      "verification": "source_review",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/101"
+    },
+    {
+      "id": "ARCH-015",
+      "priority": "P3",
+      "title": "Relation loading repeats identity and hook boundary validation",
+      "kind": "improvement",
+      "verification": "source_review",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/104"
+    },
+    {
+      "id": "ARCH-016",
+      "priority": "P3",
+      "title": "Outbox storage, lease, revision and worker responsibilities are coupled",
+      "kind": "improvement",
+      "verification": "source_review",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/96"
+    },
+    {
+      "id": "ARCH-017",
+      "priority": "P3",
+      "title": "Search cursor fingerprints need one shared implementation",
+      "kind": "improvement",
+      "verification": "source_review",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/98"
+    },
+    {
+      "id": "ARCH-018",
+      "priority": "P3",
+      "title": "Cache batch validation and failure recovery diagnostics diverge",
+      "kind": "improvement",
+      "verification": "source_review",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/108"
+    },
+    {
+      "id": "ARCH-019",
+      "priority": "P3",
+      "title": "Internally created SDK resources need an ownership-aware close API",
+      "kind": "improvement",
+      "verification": "source_review",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/92"
+    },
+    {
+      "id": "ARCH-020",
+      "priority": "P3",
+      "title": "Testing contexts, contracts and harnesses share one implementation module",
+      "kind": "improvement",
+      "verification": "source_review",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/102"
+    },
+    {
+      "id": "ARCH-021",
+      "priority": "P3",
+      "title": "Datastore physical identity and runtime responsibilities are coupled",
+      "kind": "improvement",
+      "verification": "source_review",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/97"
+    },
+    {
+      "id": "TEST-016",
+      "priority": "P2",
+      "title": "Soft-delete unary condition tests exercise string equality instead",
+      "kind": "improvement",
+      "verification": "source_review",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/106"
+    },
+    {
+      "id": "TEST-017",
+      "priority": "P2",
+      "title": "Adapter parity contracts omit important boundary fixtures",
+      "kind": "improvement",
+      "verification": "source_review",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/103"
+    },
+    {
+      "id": "TEST-018",
+      "priority": "P2",
+      "title": "Failed test reset settles before other cleanup finishes",
+      "kind": "improvement",
+      "verification": "reproduced",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/73"
+    },
+    {
+      "id": "DOC-006",
+      "priority": "P2",
+      "title": "Published risk metrics do not reflect the current audit",
+      "kind": "improvement",
+      "verification": "source_review",
+      "status": "resolved",
+      "pullRequest": "https://github.com/seo-rii/active-ts/pull/107"
+    }
+  ]
+}

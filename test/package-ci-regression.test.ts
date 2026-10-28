@@ -635,56 +635,35 @@ test('security docs describe validation before clone boundaries', () => {
 	assert.doesNotMatch(security, /`structuredClone` implementation before\s+checking reserved keys/);
 });
 
-test('risk register dashboard matches archived rows', () => {
+test('risk register separates current review data from the historical archive', () => {
 	const dashboard = readFileSync('docs/risk-register.md', 'utf8');
 	const archive = readFileSync('docs/risk-register-archive.md', 'utf8');
-	const rows: Array<{ id: number; status: string }> = [];
-	const activeRows: Array<{ id: string; status: string }> = [];
+	const data = JSON.parse(readFileSync('docs/risk-register-data.json', 'utf8')) as {
+		reviewedCommit: string;
+		findings: Array<{ id: string; status: string; pullRequest: string | null }>;
+	};
 	let previousId = 0;
-
+	let historicalRows = 0;
 	for (const line of archive.split('\n')) {
-		const row = /^\| R-(\d{3,4}) \| [^|]+ \| [^|]+ \| [^|]+ \| [^|]+ \| [^|]+ \| [^|]+ \| ([^|]+) \|$/.exec(line);
-		if (row) {
-			const id = Number(row[1]);
-			assert.ok(id > previousId, `Risk register id R-${row[1]} must be greater than the previous row`);
-			rows.push({ id, status: row[2].trim() });
-			previousId = id;
-		}
+		const row = /^\| R-(\d{3,4}) \|/.exec(line);
+		if (!row) continue;
+		const id = Number(row[1]);
+		assert.ok(id > previousId, `Historical risk R-${row[1]} must follow the previous row`);
+		previousId = id;
+		historicalRows++;
 	}
-
-	for (const line of dashboard.split('\n')) {
-		const row = /^\| ((?:BUG|DOC|ARCH|TEST)-\d{3}) \| [^|]+ \| [^|]+ \| [^|]+ \| [^|]+ \| [^|]+ \| [^|]+ \| ([^|]+) \|$/.exec(line);
-		if (row) activeRows.push({ id: row[1], status: row[2].trim() });
+	assert.ok(historicalRows > 0, 'Historical details must remain available.');
+	const active = data.findings.filter(finding => finding.status !== 'resolved');
+	const dashboardIds = [...dashboard.matchAll(/^\| ((?:BUG|DOC|ARCH|TEST)-\d{3,}) \|/gm)].map(row => row[1]);
+	assert.deepEqual(dashboardIds.sort(), active.map(finding => finding.id).sort());
+	assert.match(dashboard, new RegExp(`\\| Active findings \\| ${active.length} \\|`));
+	assert.ok(dashboard.includes(data.reviewedCommit));
+	for (const finding of active) {
+		if (finding.pullRequest) assert.ok(dashboard.includes(`](${finding.pullRequest})`));
 	}
-
-	const historicalStatusCounts = rows.reduce<Record<string, number>>((counts, row) => {
-		counts[row.status] = (counts[row.status] ?? 0) + 1;
-		return counts;
-	}, {});
-	const activeStatusCounts = activeRows.reduce<Record<string, number>>((counts, row) => {
-		counts[row.status] = (counts[row.status] ?? 0) + 1;
-		return counts;
-	}, {});
-	const dashboardMetrics = new Map(
-		[...dashboard.matchAll(/^\| ([A-Za-z ]+) \| ([0-9,]+|R-\d{4}) \|$/gm)].map((match) => [
-			match[1],
-			match[2]
-		])
-	);
-
-	assert.equal(rows.length, Number(dashboardMetrics.get('Total historical risks')?.replaceAll(',', '')));
-	assert.equal(historicalStatusCounts.Mitigated, Number(dashboardMetrics.get('Mitigated historical risks')?.replaceAll(',', '')));
-	assert.equal(activeStatusCounts.Open ?? 0, Number(dashboardMetrics.get('Open risks')?.replaceAll(',', '')));
-	assert.equal(activeStatusCounts['In Progress'] ?? 0, Number(dashboardMetrics.get('In progress risks')?.replaceAll(',', '')));
-	assert.equal(activeStatusCounts.Accepted ?? 0, Number(dashboardMetrics.get('Accepted risks')?.replaceAll(',', '')));
-	assert.equal(`R-${String(Math.max(...rows.map((row) => row.id))).padStart(4, '0')}`, dashboardMetrics.get('Latest historical risk id'));
 	assert.match(dashboard, /\[risk-register-archive\.md\]\(risk-register-archive\.md\)/);
 	assert.match(archive, /\[risk-register\.md\]\(risk-register\.md\)/);
-	if (activeRows.length === 0) {
-		assert.match(dashboard, /\| _None_ \| - \| No open risks at this time\./);
-	} else {
-		assert.doesNotMatch(dashboard, /\| _None_ \| - \| No open risks at this time\./);
-	}
+	assert.match(readFileSync('.github/workflows/ci.yml', 'utf8'), /node --test scripts\/render-risk-register\.test\.mjs/);
 });
 
 test('package root export keeps internal helpers out of the public surface', async () => {
