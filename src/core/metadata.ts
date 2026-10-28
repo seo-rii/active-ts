@@ -54,6 +54,7 @@ import {
 	validateSearchIndexProjectionWithDatastoreAncestorFields
 } from './model-metadata-invariants.js';
 import { OBJECT_ENTRIES } from './object-intrinsics.js';
+import { assertSchemaNameOrigin, copySchemaNameOrigin } from './schema-names.js';
 
 const metadata = new WeakMap<ModelConstructor, ModelMeta>();
 const appliedStaticSchemas = new WeakMap<ModelConstructor, ModelMeta>();
@@ -197,6 +198,7 @@ export function addIndexMeta(model: ModelConstructor, index: IndexMeta) {
 	assertModelConstructor(model);
 	const meta = ensureModelMeta(model);
 	const safeIndex = sanitizeIndex(index);
+	assertSchemaNameOrigin('index', safeIndex, meta.indexes);
 	const existing = meta.indexes.findIndex((item) => item.name === safeIndex.name);
 	if (existing >= 0) meta.indexes[existing] = safeIndex;
 	else meta.indexes.push(safeIndex);
@@ -207,6 +209,7 @@ export function addSearchIndexMeta(model: ModelConstructor, index: SearchIndexMe
 	assertModelConstructor(model);
 	const meta = ensureModelMeta(model);
 	const safeIndex = sanitizeSearchIndex(index);
+	assertSchemaNameOrigin('search index', safeIndex, meta.searchIndexes);
 	const existing = meta.searchIndexes.findIndex((item) => searchIndexKey(item) === searchIndexKey(safeIndex));
 	if (existing >= 0) meta.searchIndexes[existing] = safeIndex;
 	else meta.searchIndexes.push(safeIndex);
@@ -294,6 +297,7 @@ export function applyModelMeta(model: ModelConstructor, next: Partial<ModelMeta>
 		const safeIndexes = snapshotMetadataArray(indexes, 'model metadata.indexes') as IndexMeta[];
 		for (const index of safeIndexes) {
 			const safeIndex = sanitizeIndex(index);
+			assertSchemaNameOrigin('index', safeIndex, draft.indexes);
 			const existing = draft.indexes.findIndex((item) => item.name === safeIndex.name);
 			if (existing >= 0) draft.indexes[existing] = safeIndex;
 			else draft.indexes.push(safeIndex);
@@ -303,6 +307,7 @@ export function applyModelMeta(model: ModelConstructor, next: Partial<ModelMeta>
 		const safeSearchIndexes = snapshotMetadataArray(searchIndexes, 'model metadata.searchIndexes') as SearchIndexMeta[];
 		for (const index of safeSearchIndexes) {
 			const safeIndex = sanitizeSearchIndex(index);
+			assertSchemaNameOrigin('search index', safeIndex, draft.searchIndexes);
 			const existing = draft.searchIndexes.findIndex((item) => searchIndexKey(item) === searchIndexKey(safeIndex));
 			if (existing >= 0) draft.searchIndexes[existing] = safeIndex;
 			else draft.searchIndexes.push(safeIndex);
@@ -421,11 +426,11 @@ function cloneIndexesMeta(indexes: IndexMeta[]) {
 	const clone: IndexMeta[] = [];
 	for (let index = 0; index < indexes.length; index++) {
 		const item = indexes[index];
-		clone[index] = {
+		clone[index] = copySchemaNameOrigin(item, {
 			...item,
 			fields: [...item.fields],
 			...(item.directions === undefined ? {} : { directions: [...item.directions] })
-		};
+		});
 	}
 	return clone;
 }
@@ -434,10 +439,10 @@ function cloneSearchIndexesMeta(indexes: SearchIndexMeta[]) {
 	const clone: SearchIndexMeta[] = [];
 	for (let index = 0; index < indexes.length; index++) {
 		const item = indexes[index];
-		clone[index] = {
+		clone[index] = copySchemaNameOrigin(item, {
 			...item,
 			fields: [...item.fields]
-		};
+		});
 	}
 	return clone;
 }
@@ -636,12 +641,12 @@ function sanitizeIndex(index: IndexMeta): IndexMeta {
 	if (unique !== undefined && typeof unique !== 'boolean') {
 		throw new ActiveTsConfigurationError('index unique must be a boolean.');
 	}
-	return {
+	return copySchemaNameOrigin(index, {
 		name: assertSafeSchemaIdentifier(name, 'index name'),
 		fields: sanitizeFieldPathList(safeFields, 'index field'),
 		...(safeDirections === undefined ? {} : { directions: safeDirections }),
 		unique: unique as boolean | undefined
-	};
+	});
 }
 
 function sanitizeSearchIndex(index: SearchIndexMeta): SearchIndexMeta {
@@ -661,11 +666,11 @@ function sanitizeSearchIndex(index: SearchIndexMeta): SearchIndexMeta {
 		sanitizeFieldPathList(safeFields, 'search field'),
 		'search fields'
 	);
-	return {
+	return copySchemaNameOrigin(index, {
 		adapter: sanitizeAdapterName(adapter as string | undefined, 'search adapter name'),
 		name: assertSafeSchemaIdentifier(name, 'search index name'),
 		fields: fields
-	};
+	});
 }
 
 function sanitizeRelation(relation: RelationMeta, overrideName?: string): RelationMeta {
