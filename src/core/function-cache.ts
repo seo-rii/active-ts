@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { assertWellFormedUnicode } from './unicode.js';
 import { ActiveContext, getDefaultContext } from './context.js';
-import { assertContextTransactionWritable, currentTransactionContext } from './context-internal.js';
+import { assertContextTransactionWritable, contextDefaultCacheName, currentTransactionContext } from './context-internal.js';
 import { cacheAdapterSource, markCacheAdapterSource } from './cache-utils.js';
 import {
 	assertCacheableValue,
@@ -681,14 +681,15 @@ export class ActiveFunctionCache<TInput, TValue> {
 		const cache = this.options.cache;
 		if (cache === false) return undefined;
 		if (cache && typeof cache !== 'string') return cache;
-		return transactionContext.cacheForDeferredTask(cache ?? 'default');
+		return transactionContext.cacheForDeferredTask(cache ?? contextDefaultCacheName(transactionContext));
 	}
 
 	private adapter(context?: ActiveContext) {
 		const cache = this.options.cache;
 		if (cache === false) return undefined;
 		if (cache && typeof cache !== 'string') return cache;
-		return (context ?? this.context()).cache(cache ?? 'default');
+		const activeContext = context ?? this.context();
+		return activeContext.cache(cache ?? contextDefaultCacheName(activeContext));
 	}
 
 	private distributedAdapter(adapter: CacheAdapter | undefined) {

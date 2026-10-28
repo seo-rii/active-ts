@@ -1231,6 +1231,7 @@ export class ActiveContext {
 		return {
 			store: (name) => this.internalStore(name),
 			cache: (name) => this.internalCache(name),
+			defaultCacheName: () => this.config.defaultCache,
 			searchAdapter: (name) => this.internalSearchAdapter(name),
 			assertWritable: (operation) => this.assertTransactionWritable(operation),
 			markRollbackOnly: (error) => this.markTransactionRollbackOnly(error),
