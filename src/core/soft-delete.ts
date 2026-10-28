@@ -1,4 +1,5 @@
 import { ActiveContext, getDefaultContext } from './context.js';
+import { runTrackedContextOperation } from './context-internal.js';
 import { ActiveTsConfigurationError, ActiveTsValidationError } from './errors.js';
 import { BOUND_CONTEXT, staticMarkerValue } from './model-markers.js';
 import { setPath, valueFor } from './query-utils.js';
@@ -69,36 +70,38 @@ export function createSoftDeletePlugin(options: SoftDeleteOptions = {}): ActiveT
 	};
 }
 
-export async function softDelete<TModel extends { data: any }>(
+export function softDelete<TModel extends { data: any }>(
 	model: ModelConstructor<TModel>,
 	id: EntityId,
 	context?: ActiveContext,
 	options: SoftDeleteOptions = {}
 ) {
-	options = validateSoftDeleteOptions(options);
-	const activeContext = contextForModel(model, context);
-	const field = assertSafeFieldPath(options.field ?? 'deletedAt', 'soft-delete field');
-	const loaded = await activeContext.loadByIdFresh(model, id);
-	if (!loaded) return null;
-	setPath((loaded as any).data, field, softDeleteTimestamp(options));
-	await (loaded as any).save();
-	return loaded;
+	return runTrackedContextOperation(() => contextForModel(model, context), async (activeContext) => {
+		const safeOptions = validateSoftDeleteOptions(options);
+		const field = assertSafeFieldPath(safeOptions.field ?? 'deletedAt', 'soft-delete field');
+		const loaded = await activeContext.loadByIdFresh(model, id);
+		if (!loaded) return null;
+		setPath((loaded as any).data, field, softDeleteTimestamp(safeOptions));
+		await (loaded as any).save();
+		return loaded;
+	});
 }
 
-export async function restore<TModel extends { data: any }>(
+export function restore<TModel extends { data: any }>(
 	model: ModelConstructor<TModel>,
 	id: EntityId,
 	context?: ActiveContext,
 	options: SoftDeleteOptions = {}
 ) {
-	options = validateSoftDeleteOptions(options);
-	const activeContext = contextForModel(model, context);
-	const field = assertSafeFieldPath(options.field ?? 'deletedAt', 'soft-delete field');
-	const loaded = await activeContext.loadByIdFresh(model, id);
-	if (!loaded) return null;
-	setPath((loaded as any).data, field, null);
-	await (loaded as any).save();
-	return loaded;
+	return runTrackedContextOperation(() => contextForModel(model, context), async (activeContext) => {
+		const safeOptions = validateSoftDeleteOptions(options);
+		const field = assertSafeFieldPath(safeOptions.field ?? 'deletedAt', 'soft-delete field');
+		const loaded = await activeContext.loadByIdFresh(model, id);
+		if (!loaded) return null;
+		setPath((loaded as any).data, field, null);
+		await (loaded as any).save();
+		return loaded;
+	});
 }
 
 function constrainWhere(where: HookPlan['where'], field: string, constraint: SoftDeleteConstraint, context: string) {

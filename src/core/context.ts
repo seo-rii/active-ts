@@ -1,3 +1,11 @@
+import {
+	assertStoreSchemaPlanSupported,
+	assertStoreSchemaModelsSupported,
+	assertSearchSchemaPlanSupported,
+	assertSearchSchemaPlanModelInvariants,
+	createSchemaMigration,
+	executeSchemaGroups
+} from './context-schema.js';
 import { BatchLoader } from './batch-loader.js';
 import {
 	ActiveTsCommittedTransactionError,
@@ -34,7 +42,7 @@ import {
 	clonePortableDataObject,
 	defineDataProperty
 } from './safe-keys.js';
-import { assertNoOverlappingFieldPaths, entityIdKey, valueFor } from './query-utils.js';
+import { entityIdKey, valueFor } from './query-utils.js';
 import { isPartialModel, markPartialModel } from './partial-model.js';
 import { applyFieldTypeTransforms, normalizeAggregatePlanFieldTypes, normalizeQueryPlanFieldTypes } from './field-types.js';
 import {
@@ -53,7 +61,7 @@ import {
 } from './datastore-key.js';
 import { searchCapability, storeCapability } from './capabilities.js';
 import { isSoftDeletePlanGuardHook } from './soft-delete-guard.js';
-import { datastoreSchemaAncestorModes, normalizeSchemaModels, normalizeSchemaPlan } from './schema-utils.js';
+import { normalizeSchemaModels, normalizeSchemaPlan } from './schema-utils.js';
 import { normalizeStoreSchemaApplyOptions } from './schema-options.js';
 import {
 	assertSafeSearchQuery,
@@ -77,7 +85,6 @@ import {
 import { snapshotArrayInput } from './array-input.js';
 import { cloneNativePayload } from './native-payload.js';
 import { clonePlanMeta } from './plan-meta.js';
-import { dateIsoString } from './date-intrinsics.js';
 import {
 	iterableToArray,
 	MAP_CLEAR,
@@ -160,7 +167,6 @@ import {
 	type SearchCapabilities,
 	type SearchAdapter,
 	type SearchOptions,
-	type SortDirection,
 	type StoreCapabilities,
 	type StoreAdapter,
 	type StoreReadOptions,
@@ -281,7 +287,8 @@ const ACTIVE_TS_CONFIG_KEYS = [
 	'search',
 	'plugins',
 	'queryPlanner',
-	'cacheKey'
+	'cacheKey',
+	'cacheKeyOwnerLimit'
 ] as const;
 const ACTIVE_CONTEXT_OPTION_KEYS = ['skipPluginSetup'] as const;
 const SCHEMA_CONFIG_KEYS = ['autoSync'] as const;
@@ -1017,6 +1024,7 @@ export class ActiveContext {
 		const aggregate = ownValue(configRecord, 'aggregate') as ActiveTsConfig['aggregate'];
 		const queryPlanner = ownValue(configRecord, 'queryPlanner') as ActiveTsConfig['queryPlanner'];
 		const cacheKey = ownValue(configRecord, 'cacheKey') as ActiveTsConfig['cacheKey'];
+		const cacheKeyOwnerLimit = ownValue(configRecord, 'cacheKeyOwnerLimit') as number | undefined;
 		const lazyWarnings = ownValue(configRecord, 'lazyWarnings') as ActiveTsConfig['lazyWarnings'];
 		const defaultStore = assertSafeSchemaIdentifier(ownValue(configRecord, 'defaultStore') ?? 'default', 'default store adapter name');
 		const defaultCache = assertSafeSchemaIdentifier(ownValue(configRecord, 'defaultCache') ?? 'default', 'default cache adapter name');
@@ -1041,6 +1049,7 @@ export class ActiveContext {
 			aggregate: normalizeAggregateConfig(aggregate),
 			queryPlanner: normalizeQueryPlanner(queryPlanner),
 			cacheKey,
+			cacheKeyOwnerLimit,
 			lazyWarnings
 		};
 		this.maxBatchSize = normalizeMaxBatchSize(this.config.batch?.maxSize);
@@ -1215,7 +1224,8 @@ export class ActiveContext {
 			searchAdapter: (name) => this.internalSearchAdapter(name),
 			assertWritable: (operation) => this.assertTransactionWritable(operation),
 			markRollbackOnly: (error) => this.markTransactionRollbackOnly(error),
-			trackOperation: (run) => this.trackOperation(run)
+			trackOperation: (run) => this.trackOperation(run),
+			validateReadConstructorResult
 		};
 	}
 
@@ -1834,42 +1844,66 @@ export class ActiveContext {
 				this.assertTransactionOpen('load by id from store');
 				assertModelConstructor(model, 'loadByIdFresh model');
 				assertSafeEntityId(id, 'loadByIdFresh id');
+				return (await this.loadManyFresh(model, [id], operation, options))[0] ?? null;
+			}
+		));
+	}
+
+	loadManyFresh<TModel>(
+		model: ModelConstructor<TModel>,
+		ids: EntityId[],
+		operation?: ActiveTsHookPayload['operation'],
+		options?: StoreReadOptions
+	): Promise<Array<TModel | null>> {
+		return contextOperationPromise(() => this.runTrackedScopedOperation(
+			'load models from store',
+			(scoped) => scoped.loadManyFresh(model, ids, operation, options),
+			async () => {
+				this.assertTransactionOpen('load models from store');
+				assertModelConstructor(model, 'loadManyFresh model');
+				ids = assertSafeEntityIdArray(ids, 'loadManyFresh ids');
 				const meta = this.meta(model);
 				assertDirectIdReadAllowed(meta);
 				const store = this.internalStore(meta.store);
 				const safeOptions = options === undefined
 					? undefined
-					: normalizeStoreReadOptions(options, 'loadByIdFresh store read options');
+					: normalizeStoreReadOptions(options, 'loadManyFresh store read options');
 				if (safeOptions !== undefined) {
-					assertContextStoreReadOptionsSupported(store, safeOptions, 'loadByIdFresh store read options');
+					assertContextStoreReadOptionsSupported(store, safeOptions, 'loadManyFresh store read options');
 				}
 				const readPolicy = safeOptions?.meta !== undefined &&
 					Object.prototype.hasOwnProperty.call(safeOptions.meta, 'datastoreRead')
 					? normalizeDatastoreReadPolicy(
 							safeOptions.meta.datastoreRead,
-							'loadByIdFresh store read options.meta.datastoreRead'
+							'loadManyFresh store read options.meta.datastoreRead'
 						)
 					: undefined;
-				await this.runHooks('beforeRead', { model: meta, ids: [id], operation: 'read' });
-				let loaded = sanitizeReadResult(
-					await store.getMany(meta, [id], safeOptions),
-					[id],
-					meta.idField,
-					`Store adapter "${store.kind}" getMany`
-				);
-				const afterRead = await this.runHooks('afterRead', {
-					model: meta,
-					ids: [id],
-					result: loaded,
-					operation: 'read'
-				});
-				loaded = sanitizeReadResult(afterRead.result, [id], meta.idField, 'afterRead');
-				const item = this.instantiate(model, loaded[0] ?? null);
-				if (item) {
-					if (readPolicy?.readTime !== undefined) markDatastoreHistoricalModel(item as object, readPolicy.readTime);
-					await this.runAfterInstantiateHooks(meta, item as any, operation);
+				const result: Array<TModel | null> = [];
+				for (const chunk of chunkItems(ids, this.maxBatchSize)) {
+					await this.runHooks('beforeRead', { model: meta, ids: cloneArray(chunk), operation: 'read' });
+					let loaded = sanitizeReadResult(
+						await store.getMany(meta, chunk, safeOptions),
+						chunk,
+						meta.idField,
+						`Store adapter "${store.kind}" getMany`
+					);
+					const afterRead = await this.runHooks('afterRead', {
+						model: meta,
+						ids: cloneArray(chunk),
+						result: loaded,
+						operation: 'read'
+					});
+					loaded = sanitizeReadResult(afterRead.result, chunk, meta.idField, 'afterRead');
+					for (let index = 0; index < loaded.length; index++) {
+						const item = this.instantiate(model, loaded[index]);
+						if (item) {
+							if (readPolicy?.readTime !== undefined) markDatastoreHistoricalModel(item as object, readPolicy.readTime);
+							await this.runAfterInstantiateHooks(meta, item as any, operation);
+						}
+						result[result.length] = item as TModel | null;
+					}
 				}
-				return item as TModel | null;
+				return result;
 			}
 		));
 	}
@@ -2235,7 +2269,9 @@ export class ActiveContext {
 			}
 			captureConstructorData(cloneSafeDataObject(data, `${meta.name} constructor data`));
 		}
+		const originalData = meta.datastore?.ancestor ? cloneSafeDataObject(data, `${meta.name} constructor input`) : undefined;
 		const item = new model(data, this, { persisted: true, [MODEL_PERSISTED_TOKEN]: true });
+		validateReadConstructorResult(meta, id, originalData, item);
 		return options.partial ? markPartialModel(item as object) as TModel : item;
 	}
 
@@ -2310,9 +2346,10 @@ export class ActiveContext {
 		if (!meta.validator || meta.readValidation === 'off') return decoded;
 		let validated: any;
 		try {
-			validated = meta.validator(decoded);
+			validated = meta.validator(cloneSafeData(decoded));
 			const clean = cloneSafeDataObject(validated, `${meta.name} read data`);
 			assertReadValidatorPreservesId(meta, decoded, clean);
+			assertReadTransformPreservesAncestor(meta, decoded, clean, 'read validator');
 			return clean;
 		} catch (error) {
 			const message = `Read validation failed for ${meta.name}: ${safeErrorMessage(error)}`;
@@ -2413,41 +2450,12 @@ export class ActiveContext {
 				this.assertTransactionOpen('plan schema changes');
 				this.assertNotInTransaction('plan schema changes');
 				const safeModels = normalizeModelList(models, 'schemaPlan models');
-				const grouped = this.groupModelsByStore(safeModels);
-				const plans: SchemaPlan[] = [];
-				for (const [storeName, metas] of grouped) {
-					const store = this.internalStore(storeName);
-					assertStoreSchemaModelsSupported(store, metas);
-					const schema = store.schema;
-					if (schema) {
-						const plan = routeSchemaPlan(
-							normalizeSchemaPlan(await schema.plan(metas), `Store adapter "${storeName}" schema plan`),
-							storeName
-						);
-						assertStoreSchemaPlanSupported(store, plan);
-						plans.push(plan);
-					} else {
-						const plan = manualStoreSchemaPlan(storeName, store, metas);
-						if (plan.changes.length) plans.push(plan);
-					}
-				}
-				for (const [searchName, metas] of this.groupModelsBySearch(safeModels)) {
-					const adapter = this.internalSearchAdapter(searchName);
-					const schema = adapter.schema;
-					if (schema) {
-						const plan = routeSchemaPlan(
-							normalizeSchemaPlan(await schema.plan(metas), `Search adapter "${searchName}" schema plan`),
-							searchName
-						);
-						assertSearchSchemaPlanSupported(adapter, plan);
-						assertSearchSchemaPlanModelInvariants(plan, metas, `Search adapter "${searchName}" schema plan`);
-						plans.push(plan);
-					} else {
-						const plan = manualSearchSchemaPlan(searchName, adapter, metas);
-						if (plan.changes.length) plans.push(plan);
-					}
-				}
-				return plans;
+				return executeSchemaGroups(
+					this.groupModelsByStore(safeModels),
+					() => this.groupModelsBySearch(safeModels),
+					(name) => this.internalStore(name),
+					(name) => this.internalSearchAdapter(name)
+				);
 			}
 		));
 	}
@@ -2463,49 +2471,13 @@ export class ActiveContext {
 				const applyOptions = normalizeSchemaApplyOptions(options);
 				const mode = applyOptions.mode ?? this.config.schema?.autoSync;
 				if (!mode || mode === 'off') return [];
-				const grouped = this.groupModelsByStore(safeModels);
-				const plans: SchemaPlan[] = [];
-				for (const [storeName, metas] of grouped) {
-					const store = this.internalStore(storeName);
-					assertStoreSchemaModelsSupported(store, metas);
-					const schema = store.schema;
-					if (schema) {
-						const plan = routeSchemaPlan(
-							normalizeSchemaPlan(await schema.apply(metas, { mode }), `Store adapter "${storeName}" schema apply plan`),
-							storeName
-						);
-						assertStoreSchemaPlanSupported(store, plan);
-						plans.push(plan);
-					} else {
-						const plan = manualStoreSchemaPlan(storeName, store, metas);
-						if (plan.changes.length) plans.push(plan);
-					}
-				}
-				for (const [searchName, metas] of this.groupModelsBySearch(safeModels)) {
-					const adapter = this.internalSearchAdapter(searchName);
-					const schema = adapter.schema;
-					if (schema) {
-						const plan = routeSchemaPlan(
-							normalizeSchemaPlan(await schema.apply(metas, { mode }), `Search adapter "${searchName}" schema apply plan`),
-							searchName
-						);
-						assertSearchSchemaPlanSupported(adapter, plan);
-						assertSearchSchemaPlanModelInvariants(plan, metas, `Search adapter "${searchName}" schema apply plan`);
-						plans.push(plan);
-					} else if (adapter.syncSchema) {
-						const plan = routeSchemaPlan(
-							normalizeSchemaPlan(await adapter.syncSchema(metas), `Search adapter "${searchName}" legacy schema apply plan`),
-							searchName
-						);
-						assertSearchSchemaPlanSupported(adapter, plan);
-						assertSearchSchemaPlanModelInvariants(plan, metas, `Search adapter "${searchName}" legacy schema apply plan`);
-						plans.push(plan);
-					} else {
-						const plan = manualSearchSchemaPlan(searchName, adapter, metas);
-						if (plan.changes.length) plans.push(plan);
-					}
-				}
-				return plans;
+				return executeSchemaGroups(
+					this.groupModelsByStore(safeModels),
+					() => this.groupModelsBySearch(safeModels),
+					(name) => this.internalStore(name),
+					(name) => this.internalSearchAdapter(name),
+					mode
+				);
 			}
 		));
 	}
@@ -2527,27 +2499,7 @@ export class ActiveContext {
 				const safeModels = normalizeModelList(models, 'schemaMigration models');
 				const safeName = assertSafeSchemaIdentifier(name, 'migration name');
 				const plans = await this.schemaPlan(safeModels);
-				const changes: Array<SchemaChange & { adapter: string }> = [];
-				for (let planIndex = 0; planIndex < plans.length; planIndex++) {
-					const plan = plans[planIndex];
-					const adapter = plan.route ?? plan.adapter;
-					for (let changeIndex = 0; changeIndex < plan.changes.length; changeIndex++) {
-						changes[changes.length] = { adapter, ...plan.changes[changeIndex] };
-					}
-				}
-				const summary: string[] = [];
-				for (let index = 0; index < changes.length; index++) {
-					const change = changes[index];
-					summary[index] = `${change.adapter}:${change.type}:${change.target}`;
-				}
-				return {
-					name: safeName,
-					createdAt: dateIsoString(new Date()),
-					plans,
-					changes,
-					empty: changes.length === 0,
-					summary
-				};
+				return createSchemaMigration(safeName, plans);
 			}
 		));
 	}
@@ -2752,6 +2704,7 @@ export class ActiveContext {
 										state.callbackOperationState.closed = 'finished';
 										await waitForContextOperations(state);
 										if (state.rollbackOnlyError !== undefined) throw state.rollbackOnlyError;
+										this.assertCacheKeyOwnerLimit(state.root.cacheKeyOwners, state.cacheKeyOwners);
 										for (const [key, owner] of state.cacheKeyOwners) {
 											this.assertStableEntityCacheKeyMaps(
 												parentState.cacheKeyOwners,
@@ -3045,6 +2998,7 @@ export class ActiveContext {
 						state.callbackOperationState.closed = 'finished';
 						await waitForContextOperations(state);
 						if (state.rollbackOnlyError !== undefined) throw state.rollbackOnlyError;
+						this.assertCacheKeyOwnerLimit(state.root.cacheKeyOwners, state.cacheKeyOwners);
 						return result;
 					} catch (error) {
 						state.callbackOperationState.closed = 'rolled back';
@@ -3321,7 +3275,8 @@ export class ActiveContext {
 				'scoped cache key'
 			)
 			: resolvedKey;
-		this.assertStableEntityCacheKey(owner, key);
+		// Built-in keys are injective and deterministic; only user resolvers need retained ownership.
+		if (customCacheKey !== undefined) this.assertStableEntityCacheKey(owner, key);
 		return key;
 	}
 
@@ -3371,11 +3326,13 @@ export class ActiveContext {
 			const state = this.transactionState;
 			this.assertStableEntityCacheKeyMaps(state.root.cacheKeyOwners, state.root.entityCacheKeys, owner, key);
 			this.assertStableEntityCacheKeyMaps(state.cacheKeyOwners, state.entityCacheKeys, owner, key);
+			this.assertCacheKeyOwnerLimit(state.root.cacheKeyOwners, state.cacheKeyOwners, key);
 			if (!mapHas(state.root.cacheKeyOwners, key)) mapSet(state.cacheKeyOwners, key, owner);
 			if (!mapHas(state.root.entityCacheKeys, owner)) mapSet(state.entityCacheKeys, owner, key);
 			return;
 		}
 		this.assertStableEntityCacheKeyMaps(this.cacheKeyOwners, this.entityCacheKeys, owner, key);
+		this.assertCacheKeyOwnerLimit(this.cacheKeyOwners, undefined, key);
 		mapSet(this.cacheKeyOwners, key, owner);
 		mapSet(this.entityCacheKeys, owner, key);
 	}
@@ -3406,7 +3363,27 @@ export class ActiveContext {
 		}
 	}
 
+	private assertCacheKeyOwnerLimit(
+		owners: Map<string, string>,
+		staged?: Map<string, string>,
+		additionalKey?: string
+	) {
+		const limit = this.config.cacheKeyOwnerLimit;
+		if (limit === undefined) return;
+		let count = MAP_SIZE.call(owners);
+		if (staged) {
+			for (const [key] of staged) if (!mapHas(owners, key)) count++;
+		}
+		if (additionalKey !== undefined && !mapHas(owners, additionalKey) && (!staged || !mapHas(staged, additionalKey))) count++;
+		if (count > limit) {
+			throw new ActiveTsConfigurationError(
+				`Custom cache key ownership exceeds cacheKeyOwnerLimit (${limit}). Use a new context or increase the limit.`
+			);
+		}
+	}
+
 	private mergeTransactionCacheKeyOwnership(state: TransactionState) {
+		this.assertCacheKeyOwnerLimit(this.cacheKeyOwners, state.cacheKeyOwners);
 		for (const [key, owner] of state.cacheKeyOwners) {
 			this.assertStableEntityCacheKeyMaps(this.cacheKeyOwners, this.entityCacheKeys, owner, key);
 		}
@@ -3908,6 +3885,10 @@ function assertActiveTsConfig(config: unknown): asserts config is ActiveTsConfig
 	const cacheKey = ownValue(value, 'cacheKey', 'active-ts config');
 	if (cacheKey !== undefined && typeof cacheKey !== 'function') {
 		throw new ActiveTsConfigurationError('cacheKey must be a function.');
+	}
+	const cacheKeyOwnerLimit = ownValue(value, 'cacheKeyOwnerLimit', 'active-ts config');
+	if (cacheKeyOwnerLimit !== undefined && (typeof cacheKeyOwnerLimit !== 'number' || !Number.isSafeInteger(cacheKeyOwnerLimit) || cacheKeyOwnerLimit <= 0)) {
+		throw new ActiveTsConfigurationError('cacheKeyOwnerLimit must be a positive safe integer.');
 	}
 }
 
@@ -5321,183 +5302,6 @@ function assertContextDatastoreDirectWriteAllowed(model: ResolvedModelMeta, opti
 	);
 }
 
-function assertStoreSchemaPlanSupported(store: StoreAdapter, plan: SchemaPlan) {
-	if (storeCapability(store.capabilities, 'uniqueIndex')) return;
-	for (const change of plan.changes) {
-		if (change.type !== 'create-index' || change.unique !== true) continue;
-		throw new ActiveTsConfigurationError(
-			`Store adapter "${store.kind}" does not support unique indexes in schema plans. Unsupported index "${change.name}" on "${change.target}".`
-		);
-	}
-}
-
-function assertStoreSchemaModelsSupported(store: StoreAdapter, models: ResolvedModelMeta[]) {
-	const unique = firstUniqueIndexModel(models);
-	if (!unique) return;
-	if (!storeCapability(store.capabilities, 'uniqueIndex')) {
-		throw new ActiveTsConfigurationError(
-			`Store adapter "${store.kind}" does not support unique indexes in schema plans. Unsupported index "${unique.index.name}" on "${unique.model.name}".`
-		);
-	}
-	if (!store.schema) {
-		throw new ActiveTsConfigurationError(
-			`Store adapter "${store.kind}" advertises unique indexes but does not expose schema planning. Unsupported index "${unique.index.name}" on "${unique.model.name}".`
-		);
-	}
-}
-
-function manualStoreSchemaPlan(route: string, store: StoreAdapter, models: ResolvedModelMeta[]): SchemaPlan {
-	const changes: SchemaPlan['changes'] = [];
-	const datastoreIndexes = storeCapability(store.capabilities, 'datastoreAncestor');
-	for (let modelIndex = 0; modelIndex < models.length; modelIndex++) {
-		const model = models[modelIndex];
-		const ancestorModes: readonly (boolean | undefined)[] = datastoreIndexes
-			? datastoreSchemaAncestorModes(model.datastore?.ancestor !== undefined)
-			: [undefined];
-		for (let modeIndex = 0; modeIndex < ancestorModes.length; modeIndex++) {
-			const ancestor = ancestorModes[modeIndex];
-			for (let indexIndex = 0; indexIndex < model.indexes.length; indexIndex++) {
-				const index = model.indexes[indexIndex];
-				const runtimeIndex = datastoreIndexes
-					? datastoreRuntimeSchemaIndex(model, index.fields, index.directions)
-					: { fields: index.fields, directions: index.directions };
-				changes[changes.length] = {
-					type: 'create-index' as const,
-					target: model.name,
-					name: index.name,
-					fields: runtimeIndex.fields,
-					...(runtimeIndex.directions === undefined ? {} : { directions: runtimeIndex.directions }),
-					...(ancestor === undefined ? {} : { ancestor }),
-					unique: index.unique
-				};
-			}
-		}
-	}
-	return routeSchemaPlan(
-		normalizeSchemaPlan(
-			{
-				adapter: store.kind,
-				status: 'manual',
-				note: `Store adapter "${route}" does not expose schema planning. Apply declared indexes manually or use an adapter with schema hooks.`,
-				changes
-			},
-			`Store adapter "${route}" manual schema plan`
-		),
-		route
-	);
-}
-
-function datastoreRuntimeSchemaIndex(
-	model: ResolvedModelMeta,
-	rawFields: readonly string[],
-	rawDirections: readonly SortDirection[] | undefined
-) {
-	const fields: string[] = [];
-	for (let index = 0; index < rawFields.length; index++) {
-		fields[index] = assertSafeDatastoreSchemaField(rawFields[index], 'Datastore schema index field');
-	}
-	const directions = schemaIndexDirections(rawDirections, fields.length);
-	let hasIdField = false;
-	for (let index = 0; index < fields.length; index++) {
-		if (fields[index] !== model.idField) continue;
-		hasIdField = true;
-		break;
-	}
-	if (!hasIdField) {
-		fields[fields.length] = assertSafeDatastoreSchemaField(model.idField, 'Datastore schema index field');
-		directions[directions.length] = 'asc';
-	}
-	return { fields, directions };
-}
-
-function assertSafeDatastoreSchemaField(field: unknown, context: string) {
-	const safeField = assertSafeFieldPath(field, context);
-	if (safeField.includes('/')) throw new ActiveTsValidationError(`${context} "${safeField}" cannot contain "/".`);
-	return safeField;
-}
-
-function schemaIndexDirections(directions: readonly SortDirection[] | undefined, fieldCount: number) {
-	const safeDirections: SortDirection[] = [];
-	for (let index = 0; index < fieldCount; index++) safeDirections[index] = directions?.[index] ?? 'asc';
-	return safeDirections;
-}
-
-function manualSearchSchemaPlan(route: string, adapter: SearchAdapter, models: ResolvedModelMeta[]): SchemaPlan {
-	const changes: SchemaPlan['changes'] = [];
-	for (let modelIndex = 0; modelIndex < models.length; modelIndex++) {
-		const model = models[modelIndex];
-		for (let indexIndex = 0; indexIndex < model.searchIndexes.length; indexIndex++) {
-			const index = model.searchIndexes[indexIndex];
-			changes[changes.length] = {
-				type: 'create-search-index' as const,
-				target: model.name,
-				name: index.name,
-				fields: index.fields
-			};
-		}
-	}
-	assertSearchSchemaIndexingSupported(adapter, changes, route);
-	return routeSchemaPlan(
-		normalizeSchemaPlan(
-			{
-				adapter: adapter.kind,
-				status: 'manual',
-				note: `Search adapter "${route}" does not expose schema planning. Apply declared search indexes manually or use an adapter with schema hooks.`,
-				changes
-			},
-			`Search adapter "${route}" manual schema plan`
-		),
-		route
-	);
-}
-
-function firstUniqueIndexModel(models: ResolvedModelMeta[]) {
-	for (let modelIndex = 0; modelIndex < models.length; modelIndex++) {
-		const model = models[modelIndex];
-		for (let indexIndex = 0; indexIndex < model.indexes.length; indexIndex++) {
-			const index = model.indexes[indexIndex];
-			if (index.unique === true) return { model, index };
-		}
-	}
-	return undefined;
-}
-
-function assertSearchSchemaPlanSupported(adapter: SearchAdapter, plan: SchemaPlan) {
-	assertSearchSchemaIndexingSupported(adapter, plan.changes, plan.route ?? adapter.kind);
-}
-
-function assertSearchSchemaPlanModelInvariants(plan: SchemaPlan, models: ResolvedModelMeta[], context: string) {
-	for (let index = 0; index < plan.changes.length; index++) {
-		const change = plan.changes[index];
-		if (change.type !== 'create-search-index') continue;
-		const model = schemaPlanTargetModel(models, change.target);
-		if (!model) continue;
-		assertNoOverlappingFieldPaths(
-			[model.idField, ...change.fields, ...(model.datastore?.ancestorFields ?? [])],
-			`${context}.changes[${index}].fields`
-		);
-	}
-}
-
-function schemaPlanTargetModel(models: ResolvedModelMeta[], target: string) {
-	for (let index = 0; index < models.length; index++) {
-		if (models[index].name === target) return models[index];
-	}
-	return undefined;
-}
-
-function assertSearchSchemaIndexingSupported(
-	adapter: SearchAdapter,
-	changes: SchemaPlan['changes'],
-	route: string
-) {
-	if (!hasCreateSearchIndexChange(changes)) return;
-	if (searchCapability(adapter.capabilities, 'index')) return;
-	throw new ActiveTsConfigurationError(
-		`Search adapter "${route}" does not support indexing and cannot plan search indexes.`
-	);
-}
-
 function collectWhereEntries(plan: Pick<QueryPlan, 'where' | 'or'>): QueryPlan['where'] {
 	const entries: QueryPlan['where'] = [];
 	for (let index = 0; index < plan.where.length; index++) entries[index] = plan.where[index];
@@ -5525,12 +5329,6 @@ function hasUntaggedSearchIndex(indexes: ResolvedModelMeta['searchIndexes']) {
 	return false;
 }
 
-function hasCreateSearchIndexChange(changes: SchemaPlan['changes']) {
-	for (let index = 0; index < changes.length; index++) {
-		if (changes[index].type === 'create-search-index') return true;
-	}
-	return false;
-}
 
 function isRangeOperator(op: QueryPlan['where'][number]['op']) {
 	return op === '>' || op === '>=' || op === '<' || op === '<=' || op === 'between';
@@ -5544,12 +5342,6 @@ function normalizeMaxBatchSize(value: number | undefined) {
 	return value;
 }
 
-function routeSchemaPlan(plan: SchemaPlan, route: string): SchemaPlan {
-	return {
-		...plan,
-		route: assertSafeSchemaIdentifier(route, 'schema adapter route')
-	};
-}
 
 function chunkItems<T>(items: T[], size: number) {
 	const chunks: T[][] = [];
@@ -5723,6 +5515,33 @@ function assertReadValidatorPreservesId(meta: ResolvedModelMeta, before: Record<
 	assertSafeEntityId(afterId, `${meta.name}.${meta.idField}`);
 	if (entityIdKey(beforeId) !== entityIdKey(afterId)) {
 		throw new ActiveTsValidationError(`${meta.name} read validator cannot change id field "${meta.idField}".`);
+	}
+}
+
+function validateReadConstructorResult(
+	meta: ResolvedModelMeta,
+	id: EntityId,
+	before: Record<string, unknown> | undefined,
+	item: unknown
+) {
+	const constructedData = modelDataValue(item, `${meta.name} constructor result`);
+	assertResultMatchesId(constructedData, id, meta.idField, `${meta.name} constructor result`);
+	if (before) assertReadTransformPreservesAncestor(meta, before, constructedData, 'constructor');
+}
+
+function assertReadTransformPreservesAncestor(
+	meta: ResolvedModelMeta,
+	before: Record<string, unknown>,
+	after: Record<string, unknown>,
+	operation: string
+) {
+	if (!meta.datastore?.ancestor) return;
+	const id = valueFor(before, meta.idField) as EntityId;
+	const expected = datastorePayloadResolvedAncestor(meta, id, before, operation);
+	if (expected === undefined) return;
+	const actual = datastorePayloadResolvedAncestor(meta, id, after, operation);
+	if (actual === undefined || datastoreKeyIdentity(expected) !== datastoreKeyIdentity(actual)) {
+		throw new ActiveTsValidationError(`${meta.name} ${operation} cannot change the Datastore ancestor.`);
 	}
 }
 

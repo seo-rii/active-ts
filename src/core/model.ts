@@ -9,8 +9,7 @@ import { entityIdKey, valueFor } from './query-utils.js';
 import {
 	snapshotRelationOwnerLocalKey,
 	snapshotRelationResult,
-	validateRelationOwnerLocalKeySnapshot,
-	validateRelationResultSnapshot
+	runAfterRelationLoad
 } from './relation-result.js';
 import { FindBuilder, normalizeIncludeSpecs, QueryBuilder, SearchBuilder } from './query.js';
 import type { AggregateComparableValue, AggregateFieldConstraint } from './query.js';
@@ -368,31 +367,19 @@ export abstract class Model<TData extends Record<string, any> = Record<string, a
 								await (result as any).include(...nested);
 							}
 						}
-						const after = await context.runHooks('afterRelationLoad', {
-							model: meta,
-							target: this,
-							result,
-							operation: 'relation',
-							meta: { relation }
-						});
-						result = after.result as any;
-						context.validateModelInstance(meta, this as any, `afterRelationLoad ${meta.name}.${relation} target`, {
-							expectedId,
-							expectedDatastoreAncestor,
-							partial: false
-						});
-						validateRelationOwnerLocalKeySnapshot(
-							context,
-							ownerLocalKeySnapshot,
-							this,
-							`afterRelationLoad ${meta.name}.${relation} target`
-						);
-						validateRelationResultSnapshot(
-							context,
-							resultSnapshot,
-							result,
-							`afterRelationLoad ${meta.name}.${relation}`
-						);
+						result = await runAfterRelationLoad(context, {
+							ownerMeta: meta,
+							owner: this,
+							relation: relationMeta,
+							ownerLocalKey: ownerLocalKeySnapshot,
+							validateOwner: (label) => {
+								context.validateModelInstance(meta, this as any, label, {
+									expectedId,
+									expectedDatastoreAncestor,
+									partial: false
+								});
+							}
+						}, resultSnapshot, result) as any;
 						ref.prime(result, { full: nested.length > 0 });
 					} catch (error) {
 						ref.clear();

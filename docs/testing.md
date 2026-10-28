@@ -58,6 +58,13 @@ Helpers operate on the current test context:
 
 - `seed(Model, rows)` - insert multiple rows
 - `fixture(Model, row)` - insert one row and return it
+
+Fixture writes invalidate the attempted model IDs in the entity cache, including
+cached misses and reads already being backfilled. Seeding bypasses model write
+validation and lifecycle hooks, but maintains cache invalidation. If a custom
+fixture helper writes only part of a batch before rejecting, all attempted IDs
+are invalidated before the original error is returned. Combined write and
+invalidation failures are reported together as an `AggregateError`.
 - `snapshotStore(Model?)` - inspect memory store contents
 - `resetTestContext(Model?)` - clear one model or all memory state; `await`
   this when adapters provide async cleanup helpers

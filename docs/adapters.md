@@ -1,5 +1,15 @@
 # Adapters
 
+Adapters created by the PostgreSQL, MongoDB, and Redis/Valkey factories expose
+an optional `close()` lifecycle method. Retain the factory result and call
+`await adapter.close?.()` after application work and transactions have stopped.
+It closes only the pool/client created internally by that factory. An injected
+`pool` or `client` remains caller-owned, so adapter close is a no-op for those
+resources. Concurrent calls share one attempt, successful calls are idempotent,
+and a failed close can be retried. Transaction handles do not own their parent
+connection. Context and middleware handles do not transfer resource ownership;
+close the original factory result.
+
 Adapters isolate active-ts from backend SDKs. Applications register adapters in
 an `ActiveContext`; models select adapters by metadata or by context defaults.
 

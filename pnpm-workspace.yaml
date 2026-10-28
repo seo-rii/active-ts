@@ -8,4 +8,4 @@ overrides:
   '@opentelemetry/core': 2.8.0
   brace-expansion: 2.1.7
   protobufjs: 7.6.5
-  undici: 7.29.1
+  undici: 7.30.1

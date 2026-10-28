@@ -12,6 +12,11 @@ peer ranges. A package version alone does not identify an unpublished local buil
 Publishing an existing npm version still requires a new version; a manifest does
 not permit replacing an immutable published version.
 
+The `prepack` lifecycle removes the local `build` directory before compiling
+from source. This also removes JavaScript, declarations, and maps left behind
+by deleted or renamed sources in a reused checkout. Ordinary `pnpm build`
+remains available for development; packaging always starts with fresh output.
+
 For a local review artifact outside the checkout:
 
 ```sh

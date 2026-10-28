@@ -182,6 +182,11 @@ export function assertSafeEntityId(id: unknown, context = 'Entity id'): asserts 
 	if (isDatastoreInt64Id(id)) return;
 	if (typeof id === 'string') {
 		if (!id) throw new ActiveTsValidationError(`${context} cannot be an empty string.`);
+		// In Unicode mode this range matches unpaired surrogates, but not valid pairs.
+		// UTF-8 backends otherwise replace distinct malformed ids with the same U+FFFD.
+		if (/[\uD800-\uDFFF]/u.test(id)) {
+			throw new ActiveTsValidationError(`${context} must contain well-formed Unicode.`);
+		}
 		if (Buffer.byteLength(id, 'utf8') > MAX_ENTITY_ID_BYTES) {
 			throw new ActiveTsValidationError(`${context} is too long.`);
 		}

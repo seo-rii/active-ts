@@ -13,6 +13,44 @@ import {
 import { BOUND_CONTEXT, SOURCE_MODEL } from '../src/core/model-markers.js';
 import { createTestContext, seed, withTestContext } from '../src/testing/index.js';
 
+test('read constructors cannot substitute another persisted row identity', async () => {
+	for (const mutateInput of [false, true]) {
+		class Record extends Model<{ id: number; name: string }> {
+			constructor(data: { id: number; name: string }, context?: any, options?: any) {
+				if (mutateInput) data.id = 2;
+				super({ ...data, id: 2 }, context, options);
+			}
+		}
+		const name = `constructor_read_identity_${mutateInput}`;
+		defineModel(name).attach(Record);
+		const store = new MemoryStoreAdapter();
+		const context = createActiveTs({ stores: { default: store } });
+		await store.seed(name, [{ id: 1, name: 'one' }, { id: 2, name: 'two' }]);
+		await assert.rejects(() => Record.use(context).find(1).load(), /constructor result.*must match/);
+		await assert.rejects(() => Record.use(context).query().load(), /constructor result.*must match/);
+		assert.deepEqual(store.dump(name), [{ id: 1, name: 'one' }, { id: 2, name: 'two' }]);
+	}
+});
+
+test('read constructors cannot move Datastore ancestors but may transform nonidentity data', () => {
+	type Data = { id: number; tenant: string; label: string };
+	class Record extends Model<Data> {
+		constructor(data: Data, context?: any, options?: any) {
+			super({ ...data, tenant: 'other' }, context, options);
+		}
+	}
+	defineModel<Data>('constructor_ancestor_identity')
+		.datastore({ ancestorFields: ['tenant'], ancestor: ({ data }) => ({ path: [{ kind: 'Tenant', id: data!.tenant }] }) })
+		.attach(Record);
+	const context = createActiveTs({ stores: { default: new MemoryStoreAdapter() } });
+	assert.throws(() => context.instantiate(Record, { id: 1, tenant: 'original', label: 'label' }), /constructor cannot change the Datastore ancestor/);
+	class LabelRecord extends Model<Data> {
+		constructor(data: Data, context?: any, options?: any) { super({ ...data, label: data.label.toUpperCase() }, context, options); }
+	}
+	defineModel<Data>('constructor_nonidentity_transform').attach(LabelRecord);
+	assert.equal(context.instantiate(LabelRecord, { id: 1, tenant: 'original', label: 'label' })?.data.label, 'LABEL');
+});
+
 type IdentityAccountData = {
 	id: number;
 	handle: string;
