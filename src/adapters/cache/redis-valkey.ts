@@ -1,3 +1,4 @@
+import { normalizeCacheKeys as snapshotCacheKeys, normalizeCacheEntries as snapshotCacheEntries, normalizeCacheWriteOptions as snapshotCacheWriteOptions } from '../../core/cache-input.js';
 import { randomBytes } from 'node:crypto';
 import { assertWellFormedUnicode } from '../../core/unicode.js';
 import { optionalImport } from '../../core/optional-import.js';
@@ -22,7 +23,6 @@ export type RedisValkeyOptions = {
 	maxPayloadBytes?: number;
 };
 const REDIS_VALKEY_OPTION_KEYS = ['client', 'url', 'prefix', 'codec', 'maxPayloadBytes'] as const;
-const CACHE_WRITE_OPTION_KEYS = ['ttl'] as const;
 const UTF8_BYTE_LENGTH = Buffer.byteLength;
 const TYPED_ARRAY_BYTE_LENGTH = Object.getOwnPropertyDescriptor(
 	Object.getPrototypeOf(Uint8Array.prototype), 'byteLength'
@@ -321,50 +321,25 @@ function normalizeRedisVersion(value: string | Buffer, context: string) {
 	return normalizeCacheVersion(Buffer.isBuffer(value) ? value.toString('utf8') : value, context);
 }
 
-function normalizeCacheKeys(keys: unknown, context: string): string[] {
-	const rawKeys = snapshotArrayInput<string>(keys, context);
-	const safeKeys: string[] = [];
-	for (let index = 0; index < rawKeys.length; index++) {
-		safeKeys[index] = assertWellFormedUnicode(assertSafeCacheKey(rawKeys[index], `${context}[${index}]`), `${context}[${index}]`);
-	}
-	return safeKeys;
+function normalizeRedisCacheKey(value: unknown, context: string) {
+	return assertWellFormedUnicode(assertSafeCacheKey(value, context), context);
+}
+
+function normalizeCacheKeys(keys: unknown, context: string) {
+	return snapshotCacheKeys(keys, context, normalizeRedisCacheKey);
 }
 
 function normalizeCacheEntries(entries: unknown, context: string): Array<[string, any]> {
-	const rawEntries = snapshotArrayInput<unknown>(entries, context);
-	const safeEntries: Array<[string, any]> = [];
-	const keys = new Set<string>();
-	for (let index = 0; index < rawEntries.length; index++) {
-		const entry = rawEntries[index];
-		if (!Array.isArray(entry) || entry.length !== 2) {
-			throw new ActiveTsValidationError(`${context} must contain [key, value] entries.`);
-		}
-		const tuple = snapshotArrayInput(entry, `${context}[${index}]`);
-		const key = assertWellFormedUnicode(assertSafeCacheKey(tuple[0], `${context}[${index}] key`), `${context}[${index}] key`);
-		if (SET_HAS.call(keys, key)) {
-			throw new ActiveTsValidationError(`${context} contains duplicate key "${key}".`);
-		}
-		SET_ADD.call(keys, key);
-		assertCacheableValue(tuple[1]);
-		safeEntries[index] = [key, structuredClone(tuple[1])];
+	const snapshot = snapshotCacheEntries(entries, context, normalizeRedisCacheKey);
+	for (let index = 0; index < snapshot.length; index++) {
+		assertCacheableValue(snapshot[index][1]);
+		snapshot[index][1] = structuredClone(snapshot[index][1]);
 	}
-	return safeEntries;
+	return snapshot;
 }
 
 function normalizeCacheWriteOptions(options: unknown, context: string): CacheWriteOptions {
-	if (options === undefined) return { ttl: undefined };
-	if (!options || typeof options !== 'object' || Array.isArray(options)) {
-		throw new ActiveTsValidationError(`${context} must be a plain object.`);
-	}
-	const prototype = Object.getPrototypeOf(options);
-	if (prototype !== Object.prototype && prototype !== null) {
-		throw new ActiveTsValidationError(`${context} must be a plain object.`);
-	}
-	assertNoSymbolOptions(options as Record<string, unknown>, context);
-	assertKnownOptions(options as Record<string, unknown>, CACHE_WRITE_OPTION_KEYS, context);
-	return {
-		ttl: ownOptionValue(options as Record<string, unknown>, 'ttl')
-	};
+	return snapshotCacheWriteOptions(options, context, 'ttl');
 }
 
 function assertRedisGetManyResult(value: unknown, expected: number): Array<string | Buffer | null> {

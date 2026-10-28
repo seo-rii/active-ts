@@ -116,6 +116,28 @@ export class ActiveFunctionCache<TInput, TValue> {
 		invalidations: 0
 	};
 
+	private readonly diagnosticCounters = {
+		failedKeyBypasses: 0,
+		recoveryAttempts: 0,
+		backfillEpochConflicts: 0,
+		backfillMissingVersions: 0,
+		backfillVersionConflicts: 0
+	};
+
+	/** Counter snapshot; adapterFailedKeys is shared by caches using this adapter. */
+	diagnostics() {
+		const adapter = this.adapter();
+		const failures = adapter
+			? WEAKMAP_GET.call(functionCacheInvalidationFailures, cacheFailureSource(adapter)) as Set<string> | undefined
+			: undefined;
+		return {
+			...this.diagnosticCounters,
+			memoryEntries: MAP_SIZE.call(this.memory),
+			inFlightEntries: MAP_SIZE.call(this.inFlight),
+			adapterFailedKeys: failures ? SET_SIZE.call(failures) : 0
+		};
+	}
+
 	private readonly memory = new Map<string, MemoryEntry<TValue>>();
 	private readonly inFlight = new Map<string, Promise<TValue>>();
 	private readonly options: FunctionCacheOptions<TInput, TValue>;
@@ -329,7 +351,10 @@ export class ActiveFunctionCache<TInput, TValue> {
 			if (!transactionContext?.isInTransaction()) this.poisonFailedPreWriteSet(key, adapter);
 			throw error;
 		}
-		if (!this.invalidationEpochUnchanged(key, expectedEpoch)) return value;
+		if (!this.invalidationEpochUnchanged(key, expectedEpoch)) {
+			if (intent.mode === 'backfill') this.diagnosticCounters.backfillEpochConflicts++;
+			return value;
+		}
 		if (transactionContext?.isInTransaction()) return value;
 		if (adapter) {
 			try {
@@ -338,7 +363,10 @@ export class ActiveFunctionCache<TInput, TValue> {
 					if (intent.mode === 'authoritative') {
 						await distributed.setMany([[key, cacheValue]], { ttl: this.options.ttl });
 					} else {
-						if (intent.expectedVersion === undefined) return value;
+						if (intent.expectedVersion === undefined) {
+							this.diagnosticCounters.backfillMissingVersions++;
+							return value;
+						}
 						const results = normalizeCacheVersionedSetResult(
 							await distributed.setManyVersioned(
 								[[key, cacheValue, intent.expectedVersion]],
@@ -347,7 +375,10 @@ export class ActiveFunctionCache<TInput, TValue> {
 							1,
 							`Function cache adapter "${adapter.kind}" setManyVersioned`
 						);
-						if (!results[0]) return value;
+						if (!results[0]) {
+							this.diagnosticCounters.backfillVersionConflicts++;
+							return value;
+						}
 					}
 				} else {
 					await adapter.setMany([[key, cacheValue]], { ttl: this.options.ttl });
@@ -414,7 +445,11 @@ export class ActiveFunctionCache<TInput, TValue> {
 		if (!adapter) return undefined;
 		if (hasPendingInvalidation(key)) return undefined;
 		if (hasInvalidationFailure(adapter, key)) {
-			if (!distributed) return undefined;
+			if (!distributed) {
+				this.diagnosticCounters.failedKeyBypasses++;
+				return undefined;
+			}
+			this.diagnosticCounters.recoveryAttempts++;
 			// A fresh fence must invalidate older fills before accepting a version
 			// for recovery. Reading the poisoned value's version alone is unsafe.
 			await this.invalidateResolvedKey(key);
@@ -455,7 +490,10 @@ export class ActiveFunctionCache<TInput, TValue> {
 		if (!adapter) return undefined;
 		if (!distributed) return undefined;
 		if (hasPendingInvalidation(key)) return undefined;
-		if (hasInvalidationFailure(adapter, key)) await this.invalidateResolvedKey(key);
+		if (hasInvalidationFailure(adapter, key)) {
+			this.diagnosticCounters.recoveryAttempts++;
+			await this.invalidateResolvedKey(key);
+		}
 		const snapshots = normalizeCacheVersionedValues(
 			await distributed.getManyVersioned([key]),
 			1,
@@ -965,7 +1003,8 @@ export function createFunctionCache<TInput, TValue>(options: FunctionCacheOption
 export function getFunctionCacheDiagnostics() {
 	return {
 		invalidationEpochs: MAP_SIZE.call(functionCacheInvalidationEpochs),
-		invalidationEpochLimit: FUNCTION_CACHE_INVALIDATION_EPOCH_LIMIT
+		invalidationEpochLimit: FUNCTION_CACHE_INVALIDATION_EPOCH_LIMIT,
+		pendingInvalidationKeys: MAP_SIZE.call(functionCachePendingInvalidations)
 	};
 }
 
