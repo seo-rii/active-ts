@@ -643,7 +643,7 @@ export class MemoryStoreAdapter implements StoreAdapter {
 	snapshot(modelName: string): any[];
 	snapshot(): Record<string, any[]>;
 	snapshot(modelName?: string) {
-		if (modelName) return this.dump(modelName);
+		if (modelName !== undefined) return this.dump(modelName);
 		const snapshot: Record<string, any[]> = {};
 		for (const [name, collection] of MAP_ENTRIES.call(this.collections) as Iterable<[string, Map<string, any>]>) {
 			const rows: any[] = [];
@@ -657,7 +657,7 @@ export class MemoryStoreAdapter implements StoreAdapter {
 	}
 
 	reset(modelName?: string) {
-		if (modelName) {
+		if (modelName !== undefined) {
 			modelName = assertSafeSchemaIdentifier(modelName, 'memory collection name');
 			const collection = mapGet(this.collections, modelName);
 			let firstRevision = 0;
