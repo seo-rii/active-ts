@@ -65,8 +65,9 @@ import {
 	snapshotRelationOwnerLocalKey,
 	snapshotRelationResult,
 	type RelationOwnerLocalKeySnapshot,
-	validateRelationOwnerLocalKeySnapshot,
-	validateRelationResultSnapshot
+	type RelationLoadBoundary,
+	runAfterRelationLoad,
+	validateRelationLoadBoundary
 } from './relation-result.js';
 import {
 	normalizeAggregateFieldTypes,
@@ -2158,8 +2159,7 @@ async function preloadIncludes(
 			const relationResultUses = new Map<any, number>();
 			const relatedForNested: any[] = [];
 			const nestedParentSnapshots: Array<{
-				item: any;
-				localKeySnapshot: RelationOwnerLocalKeySnapshot;
+				boundary: RelationLoadBoundary;
 				result: any;
 				resultSnapshot: ReturnType<typeof snapshotRelationResult>;
 			}> = [];
@@ -2209,41 +2209,23 @@ async function preloadIncludes(
 					result,
 					`afterRelationLoad ${ownerMeta.name}.${relationName}`
 				);
-				const after = await context.runHooks('afterRelationLoad', {
-					model: ownerMeta,
-					target: item,
-					result,
-					operation: 'relation',
-					meta: { relation: relationName }
-				});
-				result = after.result;
-				validateModelResultIdentities(
-					context,
+				const boundary: RelationLoadBoundary = {
 					ownerMeta,
-					[item],
-					expectedOwnerIds,
-					`afterRelationLoad ${ownerMeta.name}.${relationName} target`,
-					{ exactDatastoreAncestor: true }
-				);
-				validateRelationOwnerLocalKeySnapshot(
-					context,
-					localKeySnapshot,
-					item,
-					`afterRelationLoad ${ownerMeta.name}.${relationName} target item`
-				);
-				validateRelationResultSnapshot(
-					context,
-					resultSnapshot,
-					result,
-					`afterRelationLoad ${ownerMeta.name}.${relationName}`
-				);
+					owner: item,
+					relation,
+					ownerLocalKey: localKeySnapshot,
+					ownerLocalKeyLabel: `afterRelationLoad ${ownerMeta.name}.${relationName} target item`,
+					validateOwner: (label) => validateModelResultIdentities(
+						context, ownerMeta, [item], expectedOwnerIds, label, { exactDatastoreAncestor: true }
+					)
+				};
+				result = await runAfterRelationLoad(context, boundary, resultSnapshot, result);
 				item.ref(relationName).prime(result, { full: nested.length > 0 });
 				if (Array.isArray(result)) relatedForNested.push(...result);
 				else if (result) relatedForNested.push(result);
 				if (nested.length) {
 					nestedParentSnapshots[nestedParentSnapshots.length] = {
-						item,
-						localKeySnapshot,
+						boundary,
 						result,
 						resultSnapshot
 					};
@@ -2251,27 +2233,8 @@ async function preloadIncludes(
 			}
 			if (nested.length && relatedForNested.length) {
 				await preloadIncludes(context, target, relatedForNested, nested);
-				for (const { item, localKeySnapshot, result, resultSnapshot } of nestedParentSnapshots) {
-					validateModelResultIdentities(
-						context,
-						ownerMeta,
-						[item],
-						expectedOwnerIds,
-						`afterRelationLoad ${ownerMeta.name}.${relationName} target`,
-						{ exactDatastoreAncestor: true }
-					);
-					validateRelationOwnerLocalKeySnapshot(
-						context,
-						localKeySnapshot,
-						item,
-						`afterRelationLoad ${ownerMeta.name}.${relationName} target item`
-					);
-					validateRelationResultSnapshot(
-						context,
-						resultSnapshot,
-						result,
-						`afterRelationLoad ${ownerMeta.name}.${relationName}`
-					);
+				for (const { boundary, result, resultSnapshot } of nestedParentSnapshots) {
+					validateRelationLoadBoundary(context, boundary, resultSnapshot, result);
 				}
 			}
 		} catch (error) {
