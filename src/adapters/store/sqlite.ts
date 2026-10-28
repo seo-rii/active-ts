@@ -90,7 +90,7 @@ function fieldSql(field: string) {
 		}
 	}
 	const path = literal('$' + segments.map((segment) => `.${JSON_STRINGIFY(segment)}`).join(''));
-	return { type: `json_type(data, ${path})`, value: `json_extract(data, ${path})` };
+	return { type: `json_type(data, ${path})`, value: `json_extract(data, ${path})`, jsonValue: `data -> ${path}` };
 }
 
 function scalarCondition(field: ReturnType<typeof fieldSql>, value: unknown, params: SQLInputValue[], operator = '=') {
@@ -107,7 +107,7 @@ function scalarCondition(field: ReturnType<typeof fieldSql>, value: unknown, par
 		throw new ActiveTsValidationError('SQLite predicates require portable scalar operands.');
 	}
 	params.push(bound);
-	const comparable = typeof value === 'string' ? `active_ts_string_order_key(json_quote(${field.value}))` : field.value;
+	const comparable = typeof value === 'string' ? `active_ts_string_order_key(${field.jsonValue})` : field.value;
 	return `(${kind} and ${comparable} ${operator} ?)`;
 }
 
@@ -120,7 +120,7 @@ function sqliteStringOrderKey(value: unknown): Buffer | null {
 }
 
 // node:sqlite passes TEXT function arguments through a NUL-terminated API.
-// JSON quoting preserves embedded NULs until after the native boundary.
+// Raw JSON text preserves escaped NULs and lone surrogates until after that boundary.
 function sqliteJsonStringOrderKey(value: unknown): Buffer | null {
 	return typeof value === 'string' ? sqliteStringOrderKey(JSON_PARSE(value)) : null;
 }
@@ -342,7 +342,7 @@ export async function createSqliteStoreAdapter(input: SqliteStoreOptions = {}): 
 				const order = sortWithStableId(plan, model.idField).map((sort) => {
 					const field = fieldSql(sort.field);
 					const direction = sort.direction === 'desc' ? 'desc' : 'asc';
-					const value = `case when ${field.type} = 'text' then active_ts_string_order_key(json_quote(${field.value})) else ${field.value} end`;
+					const value = `case when ${field.type} = 'text' then active_ts_string_order_key(${field.jsonValue}) else ${field.value} end`;
 					return `active_ts_sort_rank(${field.type}) ${direction}, (${value}) ${direction}`;
 				}).join(', ');
 				for (const field of plan.select ?? []) fieldSql(field);
@@ -377,7 +377,7 @@ export async function createSqliteStoreAdapter(input: SqliteStoreOptions = {}): 
 					// REAL arithmetic follows the portable JS-number contract and avoids SQLite's
 					// integer overflow / node:sqlite's rejection of integers outside the safe range.
 					const scalar = numeric ? `cast(${field.value} as real)` : type === 'string'
-						? `active_ts_string_order_key(json_quote(${field.value}))` : field.value;
+						? `active_ts_string_order_key(${field.jsonValue})` : field.value;
 					const value = `case when ${valid} then ${scalar} end`;
 					if (spec.op === 'avg') {
 						// Bound the accumulated sum by dividing every input by a power
