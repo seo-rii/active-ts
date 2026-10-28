@@ -679,18 +679,20 @@ function offsetSql(offset: number | undefined) {
 	return ` offset ${offset}`;
 }
 
-function numericAggregateSql(field: string, params: any[]) {
+function numericAggregateSql(field: string, params: any[], type = 'double precision') {
 	const path = jsonPathParam(field, params);
 	const json = `data #> ${path}`;
 	const text = `data #>> ${path}`;
-	return `(case when ${json} is null or jsonb_typeof(${json}) = 'null' then null when jsonb_typeof(${json}) = 'number' then ${text} else 'active-ts-invalid-numeric-aggregate' end)::double precision`;
+	return `(case when ${json} is null or jsonb_typeof(${json}) = 'null' then null when jsonb_typeof(${json}) = 'number' then ${text} else 'active-ts-invalid-numeric-aggregate' end)::${type}`;
 }
 
 function aggregateSql(model: ResolvedModelMeta, spec: AggregateSpec, params: any[]) {
 	const alias = quote(spec.as);
 	if (spec.op === 'count') return `count(*)::double precision as ${alias}`;
 	if (spec.op === 'sum' || spec.op === 'avg') {
-		const numericValue = numericAggregateSql(spec.field!, params);
+		// A finite mean can have a sum outside the double-precision range.
+		// Accumulate averages as numeric and convert only the final result.
+		const numericValue = numericAggregateSql(spec.field!, params, spec.op === 'avg' ? 'numeric' : 'double precision');
 		if (spec.op === 'sum') return `coalesce(sum(${numericValue}), 0)::double precision as ${alias}`;
 		return `avg(${numericValue})::double precision as ${alias}`;
 	}
