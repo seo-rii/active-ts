@@ -17,6 +17,7 @@ import {
 	type StoreAdapter
 } from '../src/index.js';
 import { createSqliteStoreAdapter } from '../src/adapters/store/sqlite.js';
+import { aggregateRows } from '../src/core/aggregate.js';
 import { runStoreAdapterContract } from '../src/testing/index.js';
 
 const emptyPlan: QueryPlan = { where: [], or: [], sort: [], include: [] };
@@ -162,6 +163,17 @@ test('SQLite supports Model codec filtering, nested projection and date hydratio
 	assert.equal((await store.get(context.meta(Encoded), 1)).token, 'encoded:secret');
 	assert.deepEqual((await Records.query().select('profile.score').first())?.data, { id: 1, profile: { score: 3 } });
 	assert.equal(await Records.sum('profile.score'), 3);
+});
+
+test('SQLite average CTEs do not shadow model tables with the same names', async (t) => {
+	for (const name of ['active_ts_rows', 'active_ts_scale', 'active_ts_scales']) {
+		const { store, model } = await fixture(t, metadata(name));
+		await store.create(model, 1, { id: 1, score: 10 });
+		await store.create(model, 2, { id: 2, score: 20 });
+		assert.deepEqual(await store.aggregate!(model, {
+			where: [], or: [], aggregates: [{ op: 'avg', field: 'score', as: 'mean' }]
+		}), { mean: 15 });
+	}
 });
 
 test('SQLite aggregates count missing input rows without including them in numeric inputs', async (t) => {
@@ -518,4 +530,22 @@ test('SQLite numeric aggregates preserve finite JavaScript numbers beyond safe i
 		{ op: 'sum', field: 'score', as: 'sum' }, { op: 'avg', field: 'score', as: 'avg' },
 		{ op: 'min', field: 'score', as: 'min' }, { op: 'max', field: 'score', as: 'max' }
 	] }), { sum: score * 2, avg: score, min: score, max: score });
+});
+
+test('SQLite average preserves finite extremes, cancellation and subnormal residues', async (t) => {
+	const { store, model } = await fixture(t);
+	const spec = [{ op: 'avg' as const, field: 'score', as: 'mean' }];
+	const cases = [
+		[1e308, 1e308], [-1e308, -1e308], [Number.MAX_VALUE, Number.MAX_VALUE],
+		[1e308, 1, -1e308], [Number.MIN_VALUE, Number.MIN_VALUE],
+		[1e308, Number.MIN_VALUE * 4, -1e308], [], [null, null]
+	];
+	let id = 0;
+	for (const [group, values] of cases.entries()) {
+		const rows = values.map((score) => ({ id: id++, group, score }));
+		for (const row of rows) await store.create(model, row.id, row);
+		assert.deepEqual(await store.aggregate!(model, {
+			where: [{ field: 'group', op: '=', value: group }], or: [], aggregates: spec
+		}), aggregateRows(rows, spec));
+	}
 });

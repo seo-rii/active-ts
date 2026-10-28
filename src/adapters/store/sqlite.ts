@@ -337,6 +337,7 @@ export async function createSqliteStoreAdapter(input: SqliteStoreOptions = {}): 
 				const specs = assertAggregateSpecsCompatibleWithModel(model, plan.aggregates, 'SQLite aggregate');
 				assertNoAggregateFieldCodecSpecs(model, specs, 'SQLite aggregate');
 				const columns: string[] = [];
+				const hasAverage = specs.some((spec) => spec.op === 'avg');
 				for (let i = 0; i < specs.length; i++) {
 					const spec = specs[i];
 					if (spec.op === 'count') { columns.push(`count(*) as ${quote(`v${i}`)}`); continue; }
@@ -349,17 +350,44 @@ export async function createSqliteStoreAdapter(input: SqliteStoreOptions = {}): 
 					const valid = numeric ? `${field.type} in ('integer', 'real')` : `${field.type} = 'text'`;
 					// REAL arithmetic follows the portable JS-number contract and avoids SQLite's
 					// integer overflow / node:sqlite's rejection of integers outside the safe range.
-					columns.push(`${spec.op}(case when ${valid} then ${numeric ? `cast(${field.value} as real)` : field.value} end) as ${quote(`v${i}`)}`);
+					const value = `case when ${valid} then ${numeric ? `cast(${field.value} as real)` : field.value} end`;
+					if (spec.op === 'avg') {
+						// Bound the accumulated sum by dividing every input by a power
+						// of two at least as large as the row count. Retain subnormal
+						// rounding residues in original units, as the portable reducer does.
+						columns.push(`total((${value}) / scale) as ${quote(`v${i}`)}`);
+						columns.push(`total((${value}) - ((${value}) / scale) * scale) as ${quote(`r${i}`)}`);
+						columns.push(`count(${value}) as ${quote(`n${i}`)}`);
+						columns.push(`max(scale) as ${quote(`s${i}`)}`);
+					} else columns.push(`${spec.op}(${value}) as ${quote(`v${i}`)}`);
 					columns.push(`count(case when ${field.type} is not null and ${field.type} != 'null' and not (${valid}) then 1 end) as ${quote(`e${i}`)}`);
 				}
 				const params: SQLInputValue[] = [];
-				const sql = `select ${columns.length ? columns.join(', ') : 'count(*)'} from ${table(model)} where ${whereSql(plan, params)}`;
+				const source = `select data from main.${table(model)} where ${whereSql(plan, params)}`;
+				// Keep the row scan and the average's count in one SQLite statement
+				// and snapshot. Recursive doubling needs at most 64 small scale rows.
+				const prefix = hasAverage
+					? `with recursive active_ts_rows as materialized (${source}), active_ts_scales(value) as (select 1.0 union all select value * 2 from active_ts_scales where value < (select count(*) from active_ts_rows)), active_ts_scale as (select max(value) as scale from active_ts_scales) `
+					: '';
+				const from = hasAverage ? 'active_ts_rows cross join active_ts_scale' : `(${source})`;
+				const sql = `${prefix}select ${columns.length ? columns.join(', ') : 'count(*)'} from ${from}`;
 				return execute(() => {
 					const row = get(sql, params)!;
 					const result: Record<string, unknown> = {};
 					for (let i = 0; i < specs.length; i++) {
 						if (Number(row[`e${i}`] ?? 0) > 0) throw new ActiveTsValidationError(`SQLite aggregate "${specs[i].as}" requires numeric values for number aggregates or text values for string/date min/max.`);
-						defineDataProperty(result, specs[i].as, row[`v${i}`], { enumerable: true, configurable: true, writable: true });
+						let value = row[`v${i}`];
+						if (specs[i].op === 'avg') {
+							const count = Number(row[`n${i}`]);
+							const normalized = Number(value);
+							const scale = Number(row[`s${i}`]);
+							const remainder = Number(row[`r${i}`]);
+							const sum = normalized * scale;
+							value = count === 0 ? null : Number.isFinite(sum)
+								? (sum + remainder) / count
+								: (normalized / count) * scale + remainder / count;
+						}
+						defineDataProperty(result, specs[i].as, value, { enumerable: true, configurable: true, writable: true });
 					}
 					return normalizeAggregateRow(result, specs, 'SQLite aggregate');
 				});
