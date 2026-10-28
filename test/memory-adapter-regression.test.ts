@@ -851,3 +851,36 @@ test('memory test snapshots do not create missing collections or indexes', () =>
 	assert.throws(() => search.clear('__unsafe'), /memory search model name/);
 	assert.deepEqual(search.snapshot(), {});
 });
+
+
+test('Memory sorts large ordered and reversed inputs with stable page boundaries', async () => {
+	const count = 4096;
+	for (const reversed of [false, true]) {
+		const store = new MemoryStoreAdapter();
+		const rows = Array.from({ length: count }, (_, index) => {
+			const id = reversed ? count - index - 1 : index;
+			return { id, score: Math.floor(id / 3) };
+		});
+		await store.seed(meta, rows);
+		const base = { where: [], or: [], sort: [{ field: 'score', direction: 'desc' as const }], include: [], limit: 7 };
+		const expected = [...rows].sort((a, b) => b.score - a.score || a.id - b.id).map((row) => row.id);
+		const first = await store.query(meta, base);
+		const next = await store.query(meta, { ...base, cursor: first.cursor });
+		const offset = await store.query(meta, { ...base, offset: 7 });
+		assert.deepEqual(first.list.map((row) => row.id), expected.slice(0, 7));
+		assert.deepEqual(next.list.map((row) => row.id), expected.slice(7, 14));
+		assert.deepEqual(offset.list, next.list);
+		assert.equal(first.more, true);
+		assert.equal(rows[0].id, reversed ? count - 1 : 0);
+	}
+});
+
+test('Memory validates all sort keys even for a single invalid row or a small page', async () => {
+	for (const count of [1, 3]) {
+		const store = new MemoryStoreAdapter();
+		await store.seed(meta, Array.from({ length: count }, (_, id) => ({ id, score: id === count - 1 ? {} : id })));
+		await assert.rejects(store.query(meta, {
+			where: [], or: [], sort: [{ field: 'score', direction: 'asc' }], include: [], limit: 1
+		}), /Sort and cursor values/);
+	}
+});
