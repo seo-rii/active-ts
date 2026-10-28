@@ -172,11 +172,35 @@ test('soft delete constraints cannot be bypassed by explicit deletedAt filters',
 		{ id: 2, tenantId: 'a', status: 'closed', amount: 20, deletedAt: '2026-05-13T00:00:00.000Z' }
 	]);
 
-	const defaultScope = await Record.query().where('deletedAt', 'isNotNull').load();
-	assert.deepEqual(defaultScope.list.map((item) => item.data.id), []);
+	const deletedControl = await Record.withDeleted().where({ deletedAt: ['isNotNull'] }).load();
+	assert.deepEqual(deletedControl.list.map((item) => item.data.id), [2]);
+	const liveControl = await Record.withDeleted().where({ deletedAt: ['isNull'] }).load();
+	assert.deepEqual(liveControl.list.map((item) => item.data.id), [1]);
+	await assertExplicitSoftDeleteFilterGuard(Record, 'live');
+	await assertExplicitSoftDeleteFilterGuard(Record, 'deleted');
+});
 
-	const onlyDeleted = await Record.onlyDeleted().where('deletedAt', 'isNull').load();
-	assert.deepEqual(onlyDeleted.list.map((item) => item.data.id), []);
+async function assertExplicitSoftDeleteFilterGuard(Record: typeof ScopedSoftRecord, scope: 'live' | 'deleted') {
+	const query = scope === 'live'
+		? Record.query().where({ deletedAt: ['isNotNull'] })
+		: Record.onlyDeleted().where({ deletedAt: ['isNull'] });
+	assert.deepEqual((await query.load()).list.map((item) => item.data.id), []);
+}
+
+test('explicit unary filter assertions detect removal of the soft-delete query guard', async () => {
+	const store = new MemoryStoreAdapter();
+	const plugin = createSoftDeletePlugin({ models: ['scoped_soft_record'] });
+	// Local mutant: remove the guard from this plugin instance, without changing production code.
+	const { beforeQuery: _guard, ...hooks } = plugin.hooks!;
+	const context = createActiveTs({ stores: { default: store }, plugins: [{ ...plugin, hooks }] });
+	const Record = ScopedSoftRecord.use(context) as typeof ScopedSoftRecord;
+	await store.seed('scoped_soft_record', [
+		{ id: 1, tenantId: 'a', status: 'open', amount: 10, deletedAt: null },
+		{ id: 2, tenantId: 'a', status: 'closed', amount: 20, deletedAt: '2026-05-13T00:00:00.000Z' }
+	]);
+	for (const scope of ['live', 'deleted'] as const) {
+		await assert.rejects(() => assertExplicitSoftDeleteFilterGuard(Record, scope), { code: 'ERR_ASSERTION' });
+	}
 });
 
 test('soft delete plugin materializes deletedAt null on created rows', async () => {
