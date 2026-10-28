@@ -63,6 +63,8 @@ export type TestContextSnapshot = {
 let lazyWarningCaptureActive = false;
 const TEST_CONTEXT_OPTION_KEYS = ['store', 'cache', 'search', 'preset', 'lazyLoadWarnings', 'config'] as const;
 const TEST_CONTEXT_CONFIG_FORBIDDEN_KEYS = ['stores', 'caches', 'search'] as const;
+const TEST_CONTEXT_OVERLAP_MESSAGE =
+	'ActiveTestContext.install() mutates process-global state and cannot overlap. Use withTestContext(context, fn, { install: false }) with bound models for parallel tests.';
 
 export class ActiveTestContext {
 	readonly store: StoreAdapter;
@@ -102,9 +104,7 @@ export class ActiveTestContext {
 			);
 		}
 		if (ActiveTestContext.installedContext) {
-			throw new ActiveTsConfigurationError(
-				'ActiveTestContext.install() mutates process-global state and cannot overlap. Use withTestContext(context, fn, { install: false }) with bound models for parallel tests.'
-			);
+			throw new ActiveTsConfigurationError(TEST_CONTEXT_OVERLAP_MESSAGE);
 		}
 		resetLazyLoadWarnings();
 		this.previousContext = getCurrentDefaultContext();
@@ -263,6 +263,13 @@ function snapshotTestingSnapshot(value: unknown, adapter: string) {
 }
 
 const currentTestContext = new AsyncLocalStorage<ActiveTestContext>();
+type TestContextInstallation = {
+	context: ActiveTestContext;
+	callbacks: number;
+	restoreWhenIdle: boolean;
+};
+const currentInstallation = new AsyncLocalStorage<TestContextInstallation>();
+let activeInstallation: TestContextInstallation | undefined;
 
 export function createTestContext(options: TestContextOptions = {}) {
 	return new ActiveTestContext(options);
@@ -280,12 +287,27 @@ export async function withTestContext<T>(
 	const withOptions = normalizeWithTestContextOptions(options);
 	return await currentTestContext.run(context, async () => {
 		if (withOptions.install === false) return await fn(context);
+		if (activeInstallation && (
+			currentInstallation.getStore() !== activeInstallation || activeInstallation.context !== context
+		)) {
+			throw new ActiveTsConfigurationError(TEST_CONTEXT_OVERLAP_MESSAGE);
+		}
 		const alreadyInstalled = ActiveTestContext.hasInstalledContext(context);
 		context.install();
+		const installation = activeInstallation ?? {
+			context,
+			callbacks: 0,
+			restoreWhenIdle: !alreadyInstalled
+		};
+		activeInstallation = installation;
+		installation.callbacks++;
 		try {
-			return await fn(context);
+			return await currentInstallation.run(installation, () => fn(context));
 		} finally {
-			if (!alreadyInstalled) context.restore();
+			if (--installation.callbacks === 0) {
+				activeInstallation = undefined;
+				if (installation.restoreWhenIdle) context.restore();
+			}
 		}
 	});
 }

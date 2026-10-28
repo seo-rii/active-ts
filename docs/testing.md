@@ -34,7 +34,10 @@ await withTestContext(createTestContext(), async (ctx) => {
 
 The previous default context is restored automatically after the callback.
 Global installation mutates `console.warn` and the default active-ts context, so
-overlapping installs are rejected. For parallel tests, use bound models with the
+independent overlapping calls are rejected, including calls using the same
+context. Nested calls using the same context share the global installation until
+all their callbacks finish. A caller-owned manual installation remains installed
+after its helper callbacks finish. For parallel tests, use bound models with the
 async-local helper context and disable global installation:
 
 ```ts doc-test=fragment
