@@ -33,7 +33,8 @@ import {
 	assertSafeOffset,
 	assertSafeResultCount,
 	assertSafeSchemaIdentifier,
-	cloneSafeDataObject
+	cloneSafeDataObject,
+	defineDataProperty
 } from './safe-keys.js';
 import { OBJECT_ENTRIES } from './object-intrinsics.js';
 import {
@@ -2125,6 +2126,7 @@ async function preloadIncludes(
 			}
 			const sharedRelationResultSnapshots = new Map<any, {
 				data: Record<string, any>;
+				resultData: Record<string, any>;
 				partial: boolean;
 				datastoreAncestor?: DatastoreKey;
 			}>();
@@ -2146,6 +2148,7 @@ async function preloadIncludes(
 							source.data,
 							`${targetMeta.name} shared relation result data`
 						),
+						resultData: cloneSafeDataObject(source.data, `${targetMeta.name} shared relation query result data`),
 						partial: isPartialModel(source),
 						datastoreAncestor: scopedAncestor === undefined
 							? undefined
@@ -2199,6 +2202,15 @@ async function preloadIncludes(
 						});
 					}
 					await context.runAfterInstantiateHooks(targetMeta, isolated, 'query');
+					// Replay construction for per-instance state, then preserve the validated
+					// query result, including transformations made by afterQuery.
+					const resultData = cloneSafeDataObject(snapshot.resultData, `${targetMeta.name} relation query result data`);
+					for (const key of Object.keys(isolated.data)) {
+						if (!Object.prototype.hasOwnProperty.call(resultData, key)) delete isolated.data[key];
+					}
+					for (const key of Object.keys(resultData)) {
+						defineDataProperty(isolated.data, key, resultData[key], { enumerable: true, configurable: true, writable: true });
+					}
 					isolatedItems[index] = isolated;
 				}
 				let result = Array.isArray(sharedResult) ? isolatedItems : isolatedItems[0] ?? null;
