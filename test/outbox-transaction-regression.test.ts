@@ -358,7 +358,7 @@ test('outbox plugin binds events to the model store Datastore project', async ()
 	assert.equal(event.modelDatastoreProjectId, 'project-a');
 	assert.equal(await runSearchSyncWorker({ outbox, search, models: [OutboxAccount], context }), 1);
 	assert.deepEqual(
-		(await search.search(context.meta(OutboxAccount), 'project-bound', {})).list.map((row) => row.id),
+		(await context.searchAdapter('memory').search(context.meta(OutboxAccount), 'project-bound', {})).list.map((row) => row.id),
 		[811]
 	);
 });
