@@ -10,6 +10,7 @@ import {
 	ActiveTsNotFoundError,
 	ActiveTsValidationError,
 	Model,
+	MemoryStoreAdapter,
 	createActiveTs,
 	defineModel,
 	type QueryPlan,
@@ -567,4 +568,62 @@ test('SQLite validates every matching sort value before applying the page limit'
 			sort: [{ field: 'score', direction: 'asc' }], limit: 1
 		})).list, [{ id: 1, score: 1 }]);
 	}
+});
+
+test('SQLite Unicode comparisons, pages and extrema follow JavaScript UTF-16 order', async (t) => {
+	const model = metadata('active_sqlite_unicode_order', { fieldTypes: new Map([['label', 'string']]) });
+	const { store } = await fixture(t, model);
+	const labels = ['\uE000', '\u{10000}', '\uD7FF', '\uD7FFx', '\u{10FFFF}', '\uFFFF', '', 'a', 'aa', 'a\0z'];
+	for (const [id, label] of labels.entries()) await store.create(model, id, { id, label });
+	const ordered = [...labels].sort();
+	for (const direction of ['asc', 'desc'] as const) {
+		const expected = direction === 'asc' ? ordered : [...ordered].reverse();
+		assert.deepEqual((await store.query(model, {
+			...emptyPlan, sort: [{ field: 'label', direction }], offset: 2, limit: 5
+		})).list.map((row) => row.label), expected.slice(2, 7));
+	}
+	for (const bound of labels) {
+		for (const op of ['=', '>', '<'] as const) {
+			const matches = labels.filter((value) => op === '=' ? value === bound : op === '>' ? value > bound : value < bound);
+			assert.deepEqual((await store.query(model, {
+				...emptyPlan, where: [{ field: 'label', op, value: bound }], sort: [{ field: 'label', direction: 'asc' }]
+			})).list.map((row) => row.label), matches.sort());
+		}
+	}
+	assert.deepEqual(await store.aggregate!(model, { where: [], or: [], aggregates: [
+		{ op: 'min', field: 'label', as: 'min' }, { op: 'max', field: 'label', as: 'max' }
+	] }), { min: ordered[0], max: ordered.at(-1) });
+});
+
+test('SQLite JSON string keys preserve lone surrogates without replacement-character aliases', async (t) => {
+	const model = metadata('active_sqlite_surrogate_values', {
+		indexes: [{ name: 'label', fields: ['label'] }],
+		fieldTypes: new Map([['label', 'string']])
+	});
+	const { store } = await fixture(t, model);
+	const reference = new MemoryStoreAdapter();
+	const labels = ['\ud800', '\ud801', '\ufffd', '\ufffd\ufffd\ufffd', '\u{10000}', '\udfff', 'prefix\ud800suffix', 'a\0z', ''];
+	for (const [id, label] of labels.entries()) {
+		for (const target of [store, reference]) await target.create(model, id, { id, label });
+	}
+	const ids = (result: { list: any[] }) => result.list.map((row) => row.id);
+	for (const value of labels) {
+		for (const op of ['=', '!=', '<', '<=', '>', '>='] as const) {
+			const plan: QueryPlan = { ...emptyPlan, where: [{ field: 'label', op, value }], sort: [{ field: 'label', direction: 'asc' }] };
+			assert.deepEqual(ids(await store.query(model, plan)), ids(await reference.query(model, plan)), `${op} ${JSON.stringify(value)}`);
+		}
+	}
+	const range: QueryPlan = { ...emptyPlan, where: [{ field: 'label', op: 'between', value: '\ud800', value2: '\udfff' }], sort: [{ field: 'label', direction: 'asc' }] };
+	assert.deepEqual(ids(await store.query(model, range)), ids(await reference.query(model, range)));
+	for (const direction of ['asc', 'desc'] as const) {
+		for (const offset of [0, 2, 6]) {
+			const plan: QueryPlan = { ...emptyPlan, sort: [{ field: 'label', direction }], offset, limit: 3 };
+			const actual = await store.query(model, plan), expected = await reference.query(model, plan);
+			assert.deepEqual({ list: actual.list, count: actual.count, more: actual.more }, { list: expected.list, count: expected.count, more: expected.more });
+		}
+	}
+	const extrema = { where: [{ field: 'id', op: '<' as const, value: 2 }], or: [], aggregates: [
+		{ op: 'min' as const, field: 'label', as: 'min' }, { op: 'max' as const, field: 'label', as: 'max' }
+	] };
+	assert.deepEqual(await store.aggregate!(model, extrema), await reference.aggregate(model, extrema));
 });

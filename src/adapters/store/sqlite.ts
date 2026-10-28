@@ -90,7 +90,7 @@ function fieldSql(field: string) {
 		}
 	}
 	const path = literal('$' + segments.map((segment) => `.${JSON_STRINGIFY(segment)}`).join(''));
-	return { type: `json_type(data, ${path})`, value: `json_extract(data, ${path})` };
+	return { type: `json_type(data, ${path})`, value: `json_extract(data, ${path})`, jsonValue: `data -> ${path}` };
 }
 
 function scalarCondition(field: ReturnType<typeof fieldSql>, value: unknown, params: SQLInputValue[], operator = '=') {
@@ -100,14 +100,29 @@ function scalarCondition(field: ReturnType<typeof fieldSql>, value: unknown, par
 	if (typeof value === 'number' && Number.isFinite(value)) {
 		kind = `${field.type} in ('integer', 'real')`; bound = value;
 	} else if (typeof value === 'string') {
-		kind = `${field.type} = 'text'`; bound = value;
+		kind = `${field.type} = 'text'`; bound = sqliteStringOrderKey(value);
 	} else if (typeof value === 'boolean') {
 		kind = `${field.type} = '${value ? 'true' : 'false'}'`; bound = Number(value);
 	} else {
 		throw new ActiveTsValidationError('SQLite predicates require portable scalar operands.');
 	}
 	params.push(bound);
-	return `(${kind} and ${field.value} ${operator} ?)`;
+	const comparable = typeof value === 'string' ? `active_ts_string_order_key(${field.jsonValue})` : field.value;
+	return `(${kind} and ${comparable} ${operator} ?)`;
+}
+
+// SQLite compares BLOB bytes in order; big-endian UTF-16 preserves the exact
+// JavaScript code-unit order, including supplementary characters and prefixes.
+function sqliteStringOrderKey(value: unknown): Buffer | null {
+	// SQL may evaluate an operand before its adjacent type guard.
+	if (typeof value !== 'string') return null;
+	return Buffer.from(value, 'utf16le').swap16();
+}
+
+// node:sqlite passes TEXT function arguments through a NUL-terminated API.
+// Raw JSON text preserves escaped NULs and lone surrogates until after that boundary.
+function sqliteJsonStringOrderKey(value: unknown): Buffer | null {
+	return typeof value === 'string' ? sqliteStringOrderKey(JSON_PARSE(value)) : null;
 }
 
 function sqliteSortRank(type: unknown) {
@@ -196,6 +211,7 @@ export async function createSqliteStoreAdapter(input: SqliteStoreOptions = {}): 
 		throw new ActiveTsConfigurationError('SQLite options.database must be an open node:sqlite DatabaseSync.');
 	}
 	Reflect.apply(DatabaseSync.prototype.function, database, ['active_ts_sort_rank', { deterministic: true }, sqliteSortRank]);
+	Reflect.apply(DatabaseSync.prototype.function, database, ['active_ts_string_order_key', { deterministic: true }, sqliteJsonStringOrderKey]);
 	let state = connections.get(database);
 	if (!state) {
 		let scope = `sqlite:connection:${randomUUID()}`;
@@ -326,7 +342,8 @@ export async function createSqliteStoreAdapter(input: SqliteStoreOptions = {}): 
 				const order = sortWithStableId(plan, model.idField).map((sort) => {
 					const field = fieldSql(sort.field);
 					const direction = sort.direction === 'desc' ? 'desc' : 'asc';
-					return `active_ts_sort_rank(${field.type}) ${direction}, ${field.value} ${direction}`;
+					const value = `case when ${field.type} = 'text' then active_ts_string_order_key(${field.jsonValue}) else ${field.value} end`;
+					return `active_ts_sort_rank(${field.type}) ${direction}, (${value}) ${direction}`;
 				}).join(', ');
 				for (const field of plan.select ?? []) fieldSql(field);
 				const limit = limitWithLookahead(plan.limit, 'SQLite limit');
@@ -359,7 +376,9 @@ export async function createSqliteStoreAdapter(input: SqliteStoreOptions = {}): 
 					const valid = numeric ? `${field.type} in ('integer', 'real')` : `${field.type} = 'text'`;
 					// REAL arithmetic follows the portable JS-number contract and avoids SQLite's
 					// integer overflow / node:sqlite's rejection of integers outside the safe range.
-					const value = `case when ${valid} then ${numeric ? `cast(${field.value} as real)` : field.value} end`;
+					const scalar = numeric ? `cast(${field.value} as real)` : type === 'string'
+						? `active_ts_string_order_key(${field.jsonValue})` : field.value;
+					const value = `case when ${valid} then ${scalar} end`;
 					if (spec.op === 'avg') {
 						// Bound the accumulated sum by dividing every input by a power
 						// of two at least as large as the row count. Retain subnormal
@@ -386,6 +405,9 @@ export async function createSqliteStoreAdapter(input: SqliteStoreOptions = {}): 
 					for (let i = 0; i < specs.length; i++) {
 						if (Number(row[`e${i}`] ?? 0) > 0) throw new ActiveTsValidationError(`SQLite aggregate "${specs[i].as}" requires numeric values for number aggregates or text values for string/date min/max.`);
 						let value = row[`v${i}`];
+						if (value instanceof Uint8Array && MAP_GET.call(model.fieldTypes, specs[i].field) === 'string') {
+							value = Buffer.from(value).swap16().toString('utf16le');
+						}
 						if (specs[i].op === 'avg') {
 							const count = Number(row[`n${i}`]);
 							const normalized = Number(value);

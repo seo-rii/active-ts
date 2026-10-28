@@ -775,6 +775,8 @@ or a shared file across hosts.
 
 Rows use a typed ID key and a JSON document. SQL performs filtering, ordering,
 pagination and aggregation; no implicit full-result JavaScript scan is used.
+The adapter registers internal deterministic SQLite functions on its connection
+to validate sortable scalars and preserve JavaScript UTF-16 string order.
 Declare scalar field metadata for `min`/`max`. Unique indexes, optimistic version
 checks, nested field predicates and portable projections are supported. Cursor,
 containment operators, native payloads and Datastore read policies reject.
