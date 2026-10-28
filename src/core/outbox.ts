@@ -2059,17 +2059,14 @@ export async function runSearchSyncWorker<TOutbox extends OutboxAdapter = Outbox
 				activeOptions.search,
 				activeOptions.searchSource
 			);
-			const mutation = await resolveSearchSyncMutation(
-				activeOptions.context,
-				model,
-				meta,
-				event,
-				activeOptions.searchSource,
-				activeOptions.allowUnsafeIdentityOnlyDatastoreDelete,
-				event.reconcileFromStore === true
-			);
+			let reservedIdentity: string | undefined;
 			if (usesLease && activeOptions.outbox.reserveSearchRevision) {
-				const reserved = await activeOptions.outbox.reserveSearchRevision(event, mutation.identity);
+				// Reserve before any authoritative read so an older snapshot can never
+				// receive a newer fence than a concurrently reconciled document.
+				reservedIdentity = searchSyncReservationIdentity(
+					activeOptions.context, meta, event, activeOptions.allowUnsafeIdentityOnlyDatastoreDelete
+				);
+				const reserved = await activeOptions.outbox.reserveSearchRevision(event, reservedIdentity);
 				if (reserved === undefined) {
 					if (await ensureSearchSyncLeaseCurrent(activeOptions.outbox, event, true)) {
 						throw new ActiveTsConflictError(
@@ -2083,6 +2080,18 @@ export async function runSearchSyncWorker<TOutbox extends OutboxAdapter = Outbox
 					reserved,
 					`Outbox event "${event.id}" reserved search revision`
 				);
+			}
+			const mutation = await resolveSearchSyncMutation(
+				activeOptions.context,
+				model,
+				meta,
+				event,
+				activeOptions.searchSource,
+				activeOptions.allowUnsafeIdentityOnlyDatastoreDelete,
+				event.reconcileFromStore === true
+			);
+			if (searchRevision !== undefined && mutation.identity !== reservedIdentity) {
+				throw new ActiveTsConflictError(`Outbox event "${event.id}" search identity changed after revision reservation.`);
 			}
 			repair = usesLease && searchRoutes.length
 				? await enqueueSearchSyncRepair(activeOptions.outbox, event)
@@ -2406,6 +2415,31 @@ type SearchSyncAdapterRoute = {
 type SearchSyncMutation =
 	| { operation: 'index'; identity: string | undefined; data: Record<string, any> }
 	| { operation: 'delete'; identity: string | undefined };
+
+function searchSyncReservationIdentity(
+	context: ActiveContext | undefined,
+	meta: ResolvedModelMeta,
+	event: OutboxEvent,
+	allowUnsafeIdentityOnlyDatastoreDelete: boolean | undefined
+) {
+	let data = event.data;
+	// Immutable event metadata is sufficient when present. Never load the row
+	// here: the document fence must precede that read.
+	if (!meta.datastore?.ancestor || event.modelDatastoreAncestor !== undefined) {
+		data = undefined;
+	} else if (data !== undefined) {
+		if (event.dataEncoding === 'stored') {
+			if (!context) throw new ActiveTsConfigurationError(`Outbox event "${event.id}" stores encoded data and requires a context for search indexing.`);
+			data = context.validateRead(meta, data);
+		} else if (context) {
+			data = context.validateDecodedRead(meta, data);
+		}
+		data = normalizeSearchIndexEventData(event, meta, data);
+	}
+	return outboxEventSearchDocumentIdentity(event, meta, data, datastoreNamespaceForContext(context, meta), {
+		allowUnsafeIdentityOnlyDatastoreDelete
+	});
+}
 
 async function resolveSearchSyncMutation(
 	context: ActiveContext | undefined,
