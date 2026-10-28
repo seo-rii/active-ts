@@ -71,6 +71,7 @@ import {
 	validateRelationLoadBoundary
 } from './relation-result.js';
 import {
+	applyFieldTypeTransforms,
 	normalizeAggregateFieldTypes,
 	normalizeWhereFieldTypes,
 	normalizeWhereShapeFieldTypes
@@ -2639,7 +2640,7 @@ export class SearchBuilder<TModel extends { data: any }, TIncludes extends boole
 			const list: TModel[] = [];
 			let staleHits = 0;
 			for (const item of loaded) {
-				if (item && (!revalidatePlan || filterRows([item.data], revalidatePlan, meta.idField).length)) {
+				if (item && (!revalidatePlan || filterRows([applyFieldTypeTransforms(meta, item.data, 'write')], revalidatePlan, meta.idField).length)) {
 					list.push(item);
 				} else {
 					staleHits++;
@@ -2661,7 +2662,7 @@ export class SearchBuilder<TModel extends { data: any }, TIncludes extends boole
 		const loaded = await context.loadManyFresh(this.model, ids, 'search');
 		const list: TModel[] = [];
 		for (const item of loaded) {
-			if (item && (!revalidatePlan || filterRows([item.data], revalidatePlan, meta.idField).length)) {
+			if (item && (!revalidatePlan || filterRows([applyFieldTypeTransforms(meta, item.data, 'write')], revalidatePlan, meta.idField).length)) {
 				list.push(item as TModel);
 			} else {
 				staleHits++;
