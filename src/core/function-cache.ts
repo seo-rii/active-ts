@@ -235,12 +235,12 @@ export class ActiveFunctionCache<TInput, TValue> {
 	}
 
 	async set(input: TInput, value: TValue) {
+		assertCacheableValue(value);
+		const committedValue = cloneFunctionCacheValue(value);
 		const key = await this.keyFor(input);
 		const transactionContext = this.transactionContext();
 		if (transactionContext?.isInTransaction()) {
 			assertContextTransactionWritable(transactionContext, 'set function cache entries');
-			assertCacheableValue(value);
-			const committedValue = cloneFunctionCacheValue(value);
 			const runtime = this.deferredRuntime(transactionContext);
 			await transactionContext.afterCommitInternal(async () => {
 				const epoch = this.bumpInvalidationEpoch(key);
@@ -251,7 +251,7 @@ export class ActiveFunctionCache<TInput, TValue> {
 		}
 		const epoch = this.bumpInvalidationEpoch(key);
 		MAP_DELETE.call(this.memory, key);
-		await this.setResolvedKey(key, value, epoch, this.currentRuntime(), { mode: 'authoritative' });
+		await this.setResolvedKey(key, committedValue, epoch, this.currentRuntime(), { mode: 'authoritative' });
 		return value;
 	}
 
