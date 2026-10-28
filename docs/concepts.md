@@ -83,6 +83,12 @@ defineModel<DocumentData>({ name: 'document' })
 hydrates it back to a `Date` on reads. Date query operands are normalized the
 same way so memory and JSON-backed adapters compare the same values.
 
+A field can declare both a type and a codec on the same path. The type describes
+the application value; the codec can use a different stored representation.
+Date normalization runs before write/query encoding and after read decoding.
+Routing and adapter validation retain encoded query operands without applying
+the domain type again.
+
 Portable typed dates, Date query operands and Date cursor values support UTC
 years 0000 through 9999, inclusive. Extended-year values are rejected because
 their ISO text does not preserve chronological ordering. This validation also

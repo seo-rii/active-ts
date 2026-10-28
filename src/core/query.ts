@@ -1785,7 +1785,7 @@ export class QueryBuilder<TModel extends { data: any }, TData extends Record<str
 		}
 		const fields = fieldCodecProjectionFields(meta, uniqueStrings(aggregateFields))!;
 		const select = fields.length && storeCapability(store.capabilities, 'select') ? fields : undefined;
-		const fallbackPlan: QueryPlan<TData> = {
+		const fallbackPlan: QueryPlan<TData> = copyFieldCodecQueryOperandMarker(activePlan, {
 			where: activePlan.where,
 			or: activePlan.or,
 			sort: [],
@@ -1796,7 +1796,7 @@ export class QueryBuilder<TModel extends { data: any }, TData extends Record<str
 			select: withIdField(select, meta.idField),
 			native: activePlan.native,
 			meta: activePlan.meta
-		};
+		});
 		const adapterPlan = stripStoreNativeAdapterTag(cloneQueryBranch(fallbackPlan));
 		const raw = normalizeStoreQueryResultForModel(
 			meta,
