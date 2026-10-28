@@ -121,7 +121,7 @@ export class MemorySearchAdapter implements SearchAdapter {
 	}
 
 	clear(modelName?: string) {
-		if (modelName) {
+		if (modelName !== undefined) {
 			const safeName = assertSafeSchemaIdentifier(modelName, 'memory search model name');
 			MAP_DELETE.call(this.indexes, safeName);
 			MAP_DELETE.call(this.revisions, safeName);
@@ -135,7 +135,7 @@ export class MemorySearchAdapter implements SearchAdapter {
 	snapshot(modelName: string): any[];
 	snapshot(): Record<string, any[]>;
 	snapshot(modelName?: string) {
-		if (modelName) {
+		if (modelName !== undefined) {
 			const safeName = assertSafeSchemaIdentifier(modelName, 'memory search model name');
 			const index = MAP_GET.call(this.indexes, safeName);
 			return cloneSearchIndexValues(index);
