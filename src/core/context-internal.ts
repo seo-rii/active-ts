@@ -6,6 +6,7 @@ import type { CacheAdapter, EntityId, ResolvedModelMeta, SearchAdapter, StoreAda
 export type ActiveContextInternalAccess = {
 	store(name: string): StoreAdapter;
 	cache(name: string): CacheAdapter | undefined;
+	defaultCacheName(): string;
 	searchAdapter(name: string): SearchAdapter;
 	assertWritable(operation: string): void;
 	markRollbackOnly(error: unknown): void;
@@ -36,6 +37,10 @@ export function contextInternalStore(context: ActiveContext, name: string) {
 
 export function contextInternalCache(context: ActiveContext, name: string) {
 	return activeContextInternals(context).cache(name);
+}
+
+export function contextDefaultCacheName(context: ActiveContext) {
+	return activeContextInternals(context).defaultCacheName();
 }
 
 export function contextInternalSearchAdapter(context: ActiveContext, name: string) {
