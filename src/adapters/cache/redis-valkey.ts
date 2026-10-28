@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto';
+import { assertWellFormedUnicode } from '../../core/unicode.js';
 import { optionalImport } from '../../core/optional-import.js';
 import { createAdapterCloser } from '../../core/adapter-lifecycle.js';
 import { assertCacheableValue, assertSafeCacheKey, assertSafeTtl, defineDataProperty } from '../../core/safe-keys.js';
@@ -324,7 +325,7 @@ function normalizeCacheKeys(keys: unknown, context: string): string[] {
 	const rawKeys = snapshotArrayInput<string>(keys, context);
 	const safeKeys: string[] = [];
 	for (let index = 0; index < rawKeys.length; index++) {
-		safeKeys[index] = assertSafeCacheKey(rawKeys[index], `${context}[${index}]`);
+		safeKeys[index] = assertWellFormedUnicode(assertSafeCacheKey(rawKeys[index], `${context}[${index}]`), `${context}[${index}]`);
 	}
 	return safeKeys;
 }
@@ -339,7 +340,7 @@ function normalizeCacheEntries(entries: unknown, context: string): Array<[string
 			throw new ActiveTsValidationError(`${context} must contain [key, value] entries.`);
 		}
 		const tuple = snapshotArrayInput(entry, `${context}[${index}]`);
-		const key = assertSafeCacheKey(tuple[0], `${context}[${index}] key`);
+		const key = assertWellFormedUnicode(assertSafeCacheKey(tuple[0], `${context}[${index}] key`), `${context}[${index}] key`);
 		if (SET_HAS.call(keys, key)) {
 			throw new ActiveTsValidationError(`${context} contains duplicate key "${key}".`);
 		}
@@ -647,7 +648,7 @@ function normalizePrefix(prefix: unknown) {
 	if (typeof prefix !== 'string' || prefix.includes('\0')) {
 		throw new ActiveTsValidationError('redis-valkey cache prefix must be a string without null bytes.');
 	}
-	return assertSafeCacheKey(prefix, 'redis-valkey cache prefix');
+	return assertWellFormedUnicode(assertSafeCacheKey(prefix, 'redis-valkey cache prefix'), 'redis-valkey cache prefix');
 }
 
 function redisValkeyPhysicalKey(prefix: string, key: string) {
@@ -669,5 +670,5 @@ function createRedisVersionToken() {
 }
 
 function redisValkeyKeyPart(value: string) {
-	return Buffer.from(value, 'utf8').toString('base64url');
+	return Buffer.from(assertWellFormedUnicode(value, 'redis-valkey cache key component'), 'utf8').toString('base64url');
 }
