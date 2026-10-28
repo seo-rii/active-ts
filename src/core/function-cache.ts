@@ -66,6 +66,7 @@ type MemoryEntry<TValue> = {
 	staleUntil?: number;
 	epoch: number;
 	publicationEpoch: number;
+	runtimeScope: number;
 };
 type FunctionCacheRuntime = {
 	adapter?: CacheAdapter;
@@ -107,10 +108,12 @@ const functionCacheInvalidationFailures = new WeakMap<object, Set<string>>();
 const functionCachePendingInvalidations = new Map<string, number>();
 const functionCachePendingWrites = new Map<string, Promise<void>>();
 const functionCacheTransactionScopes = new WeakMap<ActiveContext, number>();
+const functionCacheRuntimeScopes = new WeakMap<object, number>();
 const DATE_GET_TIME = Date.prototype.getTime;
 const DATE_TO_ISO_STRING = Date.prototype.toISOString;
 let functionCacheDefaultInvalidationEpoch = 0;
 let nextFunctionCacheTransactionScope = 0;
+let nextFunctionCacheRuntimeScope = 0;
 
 export class ActiveFunctionCache<TInput, TValue> {
 	readonly stats = {
@@ -159,10 +162,12 @@ export class ActiveFunctionCache<TInput, TValue> {
 
 	async get(input: TInput, options: FunctionCacheGetOptions = {}) {
 		const getOptions = normalizeFunctionCacheGetOptions(options);
+		const capturedRuntime = this.captureRuntime();
 		const key = await this.keyFor(input);
+		const runtime = capturedRuntime();
 		const epoch = this.invalidationEpoch(key);
-		const bypassCache = this.shouldBypassCacheForTransaction();
-		const flightScope = this.inFlightScope();
+		const bypassCache = runtime.transactionContext?.isInTransaction() === true;
+		const flightScope = this.inFlightScope(runtime);
 		let publicationEpoch = this.publicationEpoch(key);
 		if (getOptions.refresh && !bypassCache) {
 			if (this.options.singleFlight !== false) {
@@ -173,9 +178,9 @@ export class ActiveFunctionCache<TInput, TValue> {
 			publicationEpoch = this.bumpPublicationEpoch(key);
 		}
 		if (!bypassCache && !getOptions.refresh && this.options.consistency !== 'distributed') {
-			const local = this.memoryGet(key, { allowStale: true });
+			const local = this.memoryGet(key, runtime, { allowStale: true });
 			if (local.found && !local.stale) {
-				const value = await this.cacheHitValue(key, local.value);
+				const value = await this.cacheHitValue(key, local.value, runtime);
 				if (value !== undefined && this.invalidationEpochUnchanged(key, epoch)) {
 					this.stats.memoryHits++;
 					return value;
@@ -183,10 +188,10 @@ export class ActiveFunctionCache<TInput, TValue> {
 				MAP_DELETE.call(this.memory, key);
 			}
 			if (local.found && local.stale) {
-				const value = await this.cacheHitValue(key, local.value);
+				const value = await this.cacheHitValue(key, local.value, runtime);
 				if (value !== undefined && this.invalidationEpochUnchanged(key, epoch)) {
 					this.stats.memoryHits++;
-					void this.refreshInBackground(input, key, this.invalidationEpoch(key));
+					void this.refreshInBackground(input, key, this.invalidationEpoch(key), runtime);
 					return value;
 				}
 				MAP_DELETE.call(this.memory, key);
@@ -196,7 +201,7 @@ export class ActiveFunctionCache<TInput, TValue> {
 			const flightKey = this.inFlightKey(key, getOptions, epoch, flightScope, publicationEpoch);
 			const active = MAP_GET.call(this.inFlight, flightKey) as Promise<TValue> | undefined;
 			if (active) return cloneFunctionCacheValue(await active);
-			const pending = this.getAfterMemoryMiss(input, key, getOptions, epoch, bypassCache, publicationEpoch);
+			const pending = this.getAfterMemoryMiss(input, key, getOptions, epoch, bypassCache, publicationEpoch, runtime);
 			MAP_SET.call(this.inFlight, flightKey, pending);
 			try {
 				return await pending;
@@ -204,7 +209,7 @@ export class ActiveFunctionCache<TInput, TValue> {
 				MAP_DELETE.call(this.inFlight, flightKey);
 			}
 		}
-		return await this.getAfterMemoryMiss(input, key, getOptions, epoch, bypassCache, publicationEpoch);
+		return await this.getAfterMemoryMiss(input, key, getOptions, epoch, bypassCache, publicationEpoch, runtime);
 	}
 
 	private async getAfterMemoryMiss(
@@ -213,77 +218,84 @@ export class ActiveFunctionCache<TInput, TValue> {
 		getOptions: FunctionCacheGetOptions,
 		expectedEpoch: number,
 		bypassCache: boolean,
-		expectedPublicationEpoch: number
+		expectedPublicationEpoch: number,
+		runtime: FunctionCacheRuntime
 	) {
 		let expectedVersion: string | undefined;
 		if (!bypassCache && !getOptions.refresh) {
-			const cached = await this.cacheGet(key);
+			const cached = await this.cacheGet(key, runtime);
 			expectedVersion = cached?.version;
 			if (cached?.hit !== undefined && this.invalidationEpochUnchanged(key, expectedEpoch)) {
 				this.stats.cacheHits++;
-				if (this.publicationEpochUnchanged(key, expectedPublicationEpoch)) this.memorySet(key, cached.hit.stored);
+				if (this.publicationEpochUnchanged(key, expectedPublicationEpoch)) this.memorySet(key, cached.hit.stored, runtime);
 				return cached.hit.value;
 			}
 		} else if (!bypassCache && this.options.consistency === 'distributed') {
-			expectedVersion = await this.refreshCacheVersion(key);
+			expectedVersion = await this.refreshCacheVersion(key, runtime);
 		}
 		this.stats.misses++;
 		const publicationEpoch = this.invalidationEpochUnchanged(key, expectedEpoch)
 			? expectedPublicationEpoch
 			: this.publicationEpoch(key);
-		return await this.compute(input, key, this.invalidationEpoch(key), expectedVersion, publicationEpoch, getOptions.refresh === true);
+		return await this.compute(input, key, this.invalidationEpoch(key), expectedVersion, publicationEpoch, getOptions.refresh === true, runtime);
 	}
 
 	async peek(input: TInput) {
-		if (this.shouldBypassCacheForTransaction()) return undefined;
+		if (this.transactionContext()?.isInTransaction()) return undefined;
+		const capturedRuntime = this.captureRuntime();
 		const key = await this.keyFor(input);
+		const runtime = capturedRuntime();
 		const epoch = this.invalidationEpoch(key);
 		const publicationEpoch = this.publicationEpoch(key);
 		const local = this.options.consistency === 'distributed'
 			? { found: false as const, value: undefined }
-			: this.memoryGet(key);
+			: this.memoryGet(key, runtime);
 		if (local.found) {
-			const value = await this.cacheHitValue(key, local.value);
+			const value = await this.cacheHitValue(key, local.value, runtime);
 			if (value !== undefined && this.invalidationEpochUnchanged(key, epoch)) return value;
 			MAP_DELETE.call(this.memory, key);
 		}
-		const cached = await this.cacheGet(key);
+		const cached = await this.cacheGet(key, runtime);
 		if (cached?.hit === undefined || !this.invalidationEpochUnchanged(key, epoch)) return undefined;
-		if (this.publicationEpochUnchanged(key, publicationEpoch)) this.memorySet(key, cached.hit.stored);
+		if (this.publicationEpochUnchanged(key, publicationEpoch)) this.memorySet(key, cached.hit.stored, runtime);
 		return cached.hit.value;
 	}
 
 	async set(input: TInput, value: TValue) {
 		assertCacheableValue(value);
 		const committedValue = cloneFunctionCacheValue(value);
+		const capturedRuntime = this.captureRuntime();
 		const key = await this.keyFor(input);
-		const transactionContext = this.transactionContext();
+		const runtime = capturedRuntime();
+		const transactionContext = runtime.transactionContext;
 		if (transactionContext?.isInTransaction()) {
 			assertContextTransactionWritable(transactionContext, 'set function cache entries');
-			const runtime = this.deferredRuntime(transactionContext);
+			const deferredRuntime = this.deferredRuntime(transactionContext);
 			await transactionContext.afterCommitInternal(async () => {
 				const epoch = this.bumpInvalidationEpoch(key);
 				MAP_DELETE.call(this.memory, key);
-				await this.setResolvedKey(key, committedValue, epoch, runtime, { mode: 'authoritative' });
+				await this.setResolvedKey(key, committedValue, epoch, deferredRuntime, { mode: 'authoritative' });
 			});
 			return value;
 		}
 		const epoch = this.bumpInvalidationEpoch(key);
 		MAP_DELETE.call(this.memory, key);
-		await this.setResolvedKey(key, committedValue, epoch, this.currentRuntime(), { mode: 'authoritative' });
+		await this.setResolvedKey(key, committedValue, epoch, runtime, { mode: 'authoritative' });
 		return value;
 	}
 
 	async invalidate(input: TInput) {
+		const capturedRuntime = this.captureRuntime();
 		const key = await this.keyFor(input);
-		const transactionContext = this.transactionContext();
+		const runtime = capturedRuntime();
+		const transactionContext = runtime.transactionContext;
 		if (transactionContext?.isInTransaction()) {
 			assertContextTransactionWritable(transactionContext, 'invalidate function cache entries');
-			const runtime = this.deferredRuntime(transactionContext);
-			await transactionContext.afterCommitInternal(() => this.invalidateResolvedKey(key, runtime));
+			const deferredRuntime = this.deferredRuntime(transactionContext);
+			await transactionContext.afterCommitInternal(() => this.invalidateResolvedKey(key, deferredRuntime));
 			return;
 		}
-		await this.invalidateResolvedKey(key);
+		await this.invalidateResolvedKey(key, runtime);
 	}
 
 	private async invalidateResolvedKey(key: string, runtime = this.currentRuntime()) {
@@ -424,7 +436,7 @@ export class ActiveFunctionCache<TInput, TValue> {
 			if (intent.mode === 'backfill' && !this.publicationEpochUnchanged(key, intent.expectedPublicationEpoch)) return false;
 			// Fence reads and factories that started while this refresh was computing too.
 			if (intent.mode === 'backfill' && intent.refresh) this.bumpPublicationEpoch(key);
-			if (this.options.consistency !== 'distributed') this.memorySet(key, cacheValue);
+			if (this.options.consistency !== 'distributed') this.memorySet(key, cacheValue, runtime);
 			return true;
 		});
 		if (!published) return value;
@@ -466,8 +478,8 @@ export class ActiveFunctionCache<TInput, TValue> {
 		}
 	}
 
-	private async cacheGet(key: string): Promise<FunctionCachePersistentRead<TValue> | undefined> {
-		const adapter = this.adapter();
+	private async cacheGet(key: string, runtime: FunctionCacheRuntime): Promise<FunctionCachePersistentRead<TValue> | undefined> {
+		const { adapter, context } = runtime;
 		const distributed = this.distributedAdapter(adapter);
 		if (!adapter) return undefined;
 		if (hasPendingInvalidation(key)) return undefined;
@@ -479,9 +491,8 @@ export class ActiveFunctionCache<TInput, TValue> {
 			this.diagnosticCounters.recoveryAttempts++;
 			// A fresh fence must invalidate older fills before accepting a version
 			// for recovery. Reading the poisoned value's version alone is unsafe.
-			await this.invalidateResolvedKey(key);
+			await this.invalidateResolvedKey(key, runtime);
 		}
-		const context = this.hookContext();
 		if (context) await this.beforeCacheGet(context, key);
 		if (hasPendingInvalidation(key)) return undefined;
 		let rawValues: unknown[];
@@ -511,8 +522,8 @@ export class ActiveFunctionCache<TInput, TValue> {
 		};
 	}
 
-	private async refreshCacheVersion(key: string) {
-		const adapter = this.adapter();
+	private async refreshCacheVersion(key: string, runtime: FunctionCacheRuntime) {
+		const { adapter } = runtime;
 		const distributed = this.distributedAdapter(adapter);
 		if (!adapter) return undefined;
 		if (!distributed) return undefined;
@@ -537,8 +548,8 @@ export class ActiveFunctionCache<TInput, TValue> {
 		return snapshots[0].version;
 	}
 
-	private async cacheHitValue(key: string, value: TValue | undefined) {
-		const context = this.hookContext();
+	private async cacheHitValue(key: string, value: TValue | undefined, runtime: FunctionCacheRuntime) {
+		const { context } = runtime;
 		if (!context) return value;
 		await this.beforeCacheGet(context, key);
 		return await this.afterCacheGet(context, key, value);
@@ -563,9 +574,12 @@ export class ActiveFunctionCache<TInput, TValue> {
 		return sanitizeFunctionCacheValue(result, 'afterCacheGet result');
 	}
 
-	private async compute(input: TInput, key: string, expectedEpoch: number, expectedVersion?: string, expectedPublicationEpoch = this.publicationEpoch(key), refresh = false) {
+	private async compute(
+		input: TInput, key: string, expectedEpoch: number, expectedVersion: string | undefined,
+		expectedPublicationEpoch: number, refresh: boolean, runtime: FunctionCacheRuntime
+	) {
 		const value = await this.options.factory(input);
-		await this.setResolvedKey(key, value, expectedEpoch, this.currentRuntime(), {
+		await this.setResolvedKey(key, value, expectedEpoch, runtime, {
 			mode: 'backfill',
 			expectedVersion,
 			expectedPublicationEpoch,
@@ -574,11 +588,11 @@ export class ActiveFunctionCache<TInput, TValue> {
 		return value;
 	}
 
-	private async refreshInBackground(input: TInput, key: string, expectedEpoch: number) {
+	private async refreshInBackground(input: TInput, key: string, expectedEpoch: number, runtime: FunctionCacheRuntime) {
 		const publicationEpoch = this.publicationEpoch(key);
-		const flightKey = this.inFlightKey(key, { refresh: true }, expectedEpoch, this.inFlightScope(), publicationEpoch);
+		const flightKey = this.inFlightKey(key, { refresh: true }, expectedEpoch, this.inFlightScope(runtime), publicationEpoch);
 		if (MAP_HAS.call(this.inFlight, flightKey)) return;
-		const pending = this.compute(input, key, expectedEpoch, undefined, publicationEpoch, true);
+		const pending = this.compute(input, key, expectedEpoch, undefined, publicationEpoch, true, runtime);
 		MAP_SET.call(this.inFlight, flightKey, pending);
 		try {
 			await pending;
@@ -627,9 +641,10 @@ export class ActiveFunctionCache<TInput, TValue> {
 		return expectedEpoch === undefined || this.invalidationEpoch(key) === expectedEpoch;
 	}
 
-	private memoryGet(key: string, options: { allowStale?: boolean } = {}): { found: boolean; stale: boolean; value?: TValue } {
+	private memoryGet(key: string, runtime: FunctionCacheRuntime, options: { allowStale?: boolean } = {}): { found: boolean; stale: boolean; value?: TValue } {
 		const entry = MAP_GET.call(this.memory, key) as MemoryEntry<TValue> | undefined;
 		if (!entry) return { found: false, stale: false };
+		if (entry.runtimeScope !== this.runtimeScope(runtime)) return { found: false, stale: false };
 		if (entry.epoch !== this.invalidationEpoch(key) || entry.publicationEpoch !== this.publicationEpoch(key)) {
 			MAP_DELETE.call(this.memory, key);
 			return { found: false, stale: false };
@@ -644,7 +659,7 @@ export class ActiveFunctionCache<TInput, TValue> {
 		return { found: true, stale: false, value: cloneFunctionCacheValue(entry.value) };
 	}
 
-	private memorySet(key: string, value: TValue) {
+	private memorySet(key: string, value: TValue, runtime: FunctionCacheRuntime) {
 		if (this.options.memory === false || this.options.consistency === 'distributed') return;
 		assertCacheableValue(value);
 		const ttl = this.options.memory?.ttl ?? this.options.ttl;
@@ -653,7 +668,11 @@ export class ActiveFunctionCache<TInput, TValue> {
 			expires && this.options.staleWhileRevalidate
 				? expires + this.options.staleWhileRevalidate * 1000
 				: undefined;
-		MAP_SET.call(this.memory, key, { value: cloneFunctionCacheValue(value), expires, staleUntil, epoch: this.invalidationEpoch(key), publicationEpoch: this.publicationEpoch(key) });
+		MAP_SET.call(this.memory, key, {
+			value: cloneFunctionCacheValue(value), expires, staleUntil,
+			epoch: this.invalidationEpoch(key), publicationEpoch: this.publicationEpoch(key),
+			runtimeScope: this.runtimeScope(runtime)
+		});
 		const maxEntries = this.options.memory?.maxEntries;
 		if (maxEntries && MAP_SIZE.call(this.memory) > maxEntries) {
 			const first = MAP_KEYS.call(this.memory).next().value;
@@ -661,11 +680,23 @@ export class ActiveFunctionCache<TInput, TValue> {
 		}
 	}
 
+	private captureRuntime(): () => FunctionCacheRuntime {
+		// Resolve eagerly, but preserve key-validation errors ahead of a missing
+		// context/adapter error, as before runtime capture was introduced.
+		try {
+			const runtime = this.currentRuntime();
+			return () => runtime;
+		} catch (error) {
+			return () => { throw error; };
+		}
+	}
+
 	private currentRuntime(): FunctionCacheRuntime {
+		const transactionContext = this.transactionContext();
 		return {
-			adapter: this.adapter(),
-			context: this.hookContext(),
-			transactionContext: this.transactionContext()
+			adapter: this.adapter(transactionContext),
+			context: this.hookContext(transactionContext),
+			transactionContext
 		};
 	}
 
@@ -714,13 +745,23 @@ export class ActiveFunctionCache<TInput, TValue> {
 		return context ?? this.context();
 	}
 
-	private shouldBypassCacheForTransaction() {
-		return this.transactionContext()?.isInTransaction() === true;
+	private runtimeScope(runtime: FunctionCacheRuntime) {
+		// Direct standalone caches retain their adapter identity; unrelated default
+		// contexts do not change their storage or hooks. Context-backed caches bind
+		// local state to the root context, including deferred transaction writes.
+		const source = runtime.context?.rootContext() ?? (runtime.adapter ? cacheFailureSource(runtime.adapter) : undefined);
+		if (!source) return 0;
+		let scope = WEAKMAP_GET.call(functionCacheRuntimeScopes, source) as number | undefined;
+		if (scope === undefined) {
+			scope = ++nextFunctionCacheRuntimeScope;
+			WEAKMAP_SET.call(functionCacheRuntimeScopes, source, scope);
+		}
+		return scope;
 	}
 
-	private inFlightScope() {
-		const context = this.transactionContext();
-		if (!context?.isInTransaction()) return 'root';
+	private inFlightScope(runtime: FunctionCacheRuntime) {
+		const context = runtime.transactionContext;
+		if (!context?.isInTransaction()) return `root:${this.runtimeScope(runtime)}`;
 		return `tx:${functionCacheTransactionScope(context)}`;
 	}
 
