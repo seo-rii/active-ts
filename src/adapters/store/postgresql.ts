@@ -312,6 +312,9 @@ function jsonPathParam(field: string, params: any[]) {
 }
 
 function modelFieldType(model: ResolvedModelMeta, field: string) {
+	// Field types describe domain values. Codec predicates/sorts operate on
+	// encoded JSON, whose scalar type is inferred from operands or stored rows.
+	if (MAP_HAS.call(model.fieldCodecs, field)) return undefined;
 	return MAP_GET.call(model.fieldTypes, field) as FieldType | undefined;
 }
 

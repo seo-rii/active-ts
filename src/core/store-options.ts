@@ -1852,7 +1852,7 @@ function normalizeStoreQueryBranch(
 	if (!branch.where.length && !branch.or.length) {
 		throw new ActiveTsValidationError(`${context} requires at least one where condition.`);
 	}
-	return branch;
+	return copyFieldCodecQueryOperandMarker(plan, branch);
 }
 
 function normalizeWhereEntries(value: unknown, context: string, fieldContext?: string): QueryPlan['where'] {
@@ -1988,11 +1988,11 @@ function constrainOrBranch(branch: QueryPlan, constraints: QueryPlan['where']): 
 	for (let index = 0; index < branch.or.length; index++) {
 		or[index] = constrainOrBranch(branch.or[index], constraints);
 	}
-	return {
+	return copyFieldCodecQueryOperandMarker(branch, {
 		...branch,
 		where,
 		or
-	};
+	});
 }
 
 function mergeWhereConstraints(

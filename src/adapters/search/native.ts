@@ -135,7 +135,9 @@ export function createNativeSearchAdapter(store: StoreAdapter): SearchAdapter {
 				const orBranches: Array<{ where: typeof textContains; or: []; sort: []; include: [] }> = [];
 				if (fields.length > 1) {
 					for (let index = 0; index < textContains.length; index++) {
-						orBranches[index] = { where: [textContains[index]], or: [], sort: [], include: [] };
+						orBranches[index] = markFieldCodecQueryOperandsEncoded({
+							where: [textContains[index]], or: [], sort: [], include: []
+						});
 					}
 				}
 				const queryPlan = markFieldCodecQueryOperandsEncoded({
