@@ -9,7 +9,7 @@
       "title": "Read validator input mutation can change record identity",
       "kind": "bug",
       "verification": "reproduced",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/50"
     },
     {
@@ -18,7 +18,7 @@
       "title": "Custom constructors can change a loaded record identity",
       "kind": "bug",
       "verification": "reproduced",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/54"
     },
     {
@@ -27,7 +27,7 @@
       "title": "Resolved field codec objects remain mutable",
       "kind": "bug",
       "verification": "reproduced",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/64"
     },
     {
@@ -36,7 +36,7 @@
       "title": "Rejected validator configuration leaves partial metadata changes",
       "kind": "bug",
       "verification": "reproduced",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/68"
     },
     {
@@ -45,7 +45,7 @@
       "title": "Empty search include disagrees with the full-model return type",
       "kind": "bug",
       "verification": "reproduced",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/72"
     },
     {
@@ -54,7 +54,7 @@
       "title": "Soft-delete helper lifetime escapes transaction operation tracking",
       "kind": "bug",
       "verification": "reproduced",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/80"
     },
     {
@@ -63,7 +63,7 @@
       "title": "Function cache keys alias malformed Unicode strings",
       "kind": "bug",
       "verification": "reproduced",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/49"
     },
     {
@@ -72,7 +72,7 @@
       "title": "Redis cache keys and prefixes alias malformed Unicode strings",
       "kind": "bug",
       "verification": "reproduced",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/52"
     },
     {
@@ -81,7 +81,7 @@
       "title": "Meilisearch cursors omit query identity and page size",
       "kind": "bug",
       "verification": "reproduced",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/55"
     },
     {
@@ -90,7 +90,7 @@
       "title": "Malformed memory cache delete batches partially mutate",
       "kind": "bug",
       "verification": "reproduced",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/58"
     },
     {
@@ -99,7 +99,7 @@
       "title": "An empty memory search scope clears every index",
       "kind": "bug",
       "verification": "reproduced",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/63"
     },
     {
@@ -108,7 +108,7 @@
       "title": "Distributed function caches cannot recover through fresh computation",
       "kind": "bug",
       "verification": "reproduced",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/65"
     },
     {
@@ -117,7 +117,7 @@
       "title": "SQLite average can overflow for a finite expected result",
       "kind": "bug",
       "verification": "reproduced",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/53"
     },
     {
@@ -126,7 +126,7 @@
       "title": "SQLite sorting accepts arrays and objects",
       "kind": "bug",
       "verification": "reproduced",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/67"
     },
     {
@@ -135,7 +135,7 @@
       "title": "SQLite Unicode comparisons diverge from portable ordering",
       "kind": "bug",
       "verification": "reproduced",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/71"
     },
     {
@@ -144,7 +144,7 @@
       "title": "Malformed Unicode entity IDs can alias Firestore documents",
       "kind": "bug",
       "verification": "reproduced",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/62"
     },
     {
@@ -153,7 +153,7 @@
       "title": "Datastore automatic cache scope omits the physical endpoint",
       "kind": "bug",
       "verification": "reproduced",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/87"
     },
     {
@@ -162,7 +162,7 @@
       "title": "Integration harnesses swallow falsy rejection values",
       "kind": "bug",
       "verification": "reproduced",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/51"
     },
     {
@@ -171,7 +171,7 @@
       "title": "Nested test context wrappers restore an outer installation",
       "kind": "bug",
       "verification": "reproduced",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/56"
     },
     {
@@ -180,7 +180,7 @@
       "title": "Fixture writes leave negative cache entries intact",
       "kind": "bug",
       "verification": "reproduced",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/66"
     },
     {
@@ -189,7 +189,7 @@
       "title": "Package builds retain outputs from deleted sources",
       "kind": "bug",
       "verification": "reproduced",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/69"
     },
     {
@@ -198,7 +198,7 @@
       "title": "Search revisions reserved after reads can publish stale state last",
       "kind": "bug",
       "verification": "reproduced",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/74"
     },
     {
@@ -207,7 +207,7 @@
       "title": "Datastore search identities omit complete physical scope",
       "kind": "bug",
       "verification": "reproduced",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/94"
     },
     {
@@ -216,7 +216,7 @@
       "title": "Entity cache ownership maps retain high-cardinality built-in keys",
       "kind": "improvement",
       "verification": "reproduced",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/89"
     },
     {
@@ -225,7 +225,7 @@
       "title": "SQLite query expressions do not use generated indexes",
       "kind": "improvement",
       "verification": "reproduced",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/79"
     },
     {
@@ -234,7 +234,7 @@
       "title": "Limited memory queries still use quadratic sorting",
       "kind": "improvement",
       "verification": "reproduced",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/95"
     },
     {
@@ -243,7 +243,7 @@
       "title": "Search includes refresh owners and relations per hit",
       "kind": "improvement",
       "verification": "reproduced",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/100"
     },
     {
@@ -252,7 +252,7 @@
       "title": "Context schema and cache coordination need separate responsibilities",
       "kind": "improvement",
       "verification": "source_review",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/101"
     },
     {
@@ -261,7 +261,7 @@
       "title": "Relation loading repeats identity and hook boundary validation",
       "kind": "improvement",
       "verification": "source_review",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/104"
     },
     {
@@ -270,7 +270,7 @@
       "title": "Outbox storage, lease, revision and worker responsibilities are coupled",
       "kind": "improvement",
       "verification": "source_review",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/96"
     },
     {
@@ -279,7 +279,7 @@
       "title": "Search cursor fingerprints need one shared implementation",
       "kind": "improvement",
       "verification": "source_review",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/98"
     },
     {
@@ -288,7 +288,7 @@
       "title": "Cache batch validation and failure recovery diagnostics diverge",
       "kind": "improvement",
       "verification": "source_review",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/108"
     },
     {
@@ -297,7 +297,7 @@
       "title": "Internally created SDK resources need an ownership-aware close API",
       "kind": "improvement",
       "verification": "source_review",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/92"
     },
     {
@@ -306,7 +306,7 @@
       "title": "Testing contexts, contracts and harnesses share one implementation module",
       "kind": "improvement",
       "verification": "source_review",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/102"
     },
     {
@@ -315,7 +315,7 @@
       "title": "Datastore physical identity and runtime responsibilities are coupled",
       "kind": "improvement",
       "verification": "source_review",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/97"
     },
     {
@@ -324,7 +324,7 @@
       "title": "Soft-delete unary condition tests exercise string equality instead",
       "kind": "improvement",
       "verification": "source_review",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/106"
     },
     {
@@ -333,7 +333,7 @@
       "title": "Adapter parity contracts omit important boundary fixtures",
       "kind": "improvement",
       "verification": "source_review",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/103"
     },
     {
@@ -342,7 +342,7 @@
       "title": "Failed test reset settles before other cleanup finishes",
       "kind": "improvement",
       "verification": "reproduced",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/73"
     },
     {
@@ -351,7 +351,7 @@
       "title": "Published risk metrics do not reflect the current audit",
       "kind": "improvement",
       "verification": "source_review",
-      "status": "in_review",
+      "status": "resolved",
       "pullRequest": "https://github.com/seo-rii/active-ts/pull/107"
     }
   ]
