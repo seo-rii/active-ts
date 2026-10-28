@@ -3468,6 +3468,29 @@ test('search builder snapshots include specs and adapter route when load starts'
 	assert.deepEqual(result.list[0].data, { id: 1, title: 'searchable title' });
 });
 
+test('empty search include requests reload full models consistently with their type', async () => {
+	const store = new MemoryStoreAdapter();
+	const memory = new MemorySearchAdapter();
+	let instantiated = 0;
+	const context = createActiveTs({
+		stores: { default: store }, search: { memory }, defaultSearch: 'memory',
+		plugins: [{ name: 'count-search-instantiations', hooks: { afterInstantiate() { instantiated++; } } }]
+	});
+	const Article = SearchIncludeArticle.use(context);
+	const meta = context.meta(SearchIncludeArticle);
+	await store.seed(meta, [{ id: 1, authorId: 10, title: 'searchable', body: 'full body' }]);
+	await memory.index(meta, 1, { id: 1, authorId: 10, title: 'searchable', body: 'index copy' });
+	for (const builder of [Article.search('searchable').include(), Article.search('searchable').include({})]) {
+		instantiated = 0;
+		const item = (await builder.load()).list[0];
+		assert.equal(isPartialModel(item), false);
+		const body: string = item.data.body;
+		assert.equal(body, 'full body');
+		assert.equal(instantiated, 1);
+		await item.save();
+	}
+});
+
 test('search builder include preserves search instantiate operation', async () => {
 	class CountingStore extends MemoryStoreAdapter {
 		articleGetManyCalls = 0;
