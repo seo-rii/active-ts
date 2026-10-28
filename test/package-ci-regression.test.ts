@@ -238,7 +238,7 @@ test('CI and package scripts keep dependency audit enabled', () => {
 	assert.match(pnpmWorkspace, /^overrides:\n(?:  [^\n]+\n)*  '@opentelemetry\/core': 2\.8\.0$/m);
 	assert.match(pnpmWorkspace, /^overrides:\n(?:  [^\n]+\n)*  brace-expansion: 2\.1\.7$/m);
 	assert.match(pnpmWorkspace, /^overrides:\n(?:  [^\n]+\n)*  protobufjs: 7\.6\.5$/m);
-	assert.match(pnpmWorkspace, /^overrides:\n(?:  [^\n]+\n)*  undici: 7\.29\.1$/m);
+	assert.match(pnpmWorkspace, /^overrides:\n(?:  [^\n]+\n)*  undici: 7\.30\.1$/m);
 	assert.ok(ciAuditIndex >= 0, 'CI workflow must run dependency audit');
 	assert.ok(ciAuditIndex < ciTypecheckIndex, 'CI dependency audit must run before typecheck');
 	assert.ok(releaseAuditIndex >= 0, 'release workflow must run dependency audit');
