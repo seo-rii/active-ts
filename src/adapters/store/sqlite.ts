@@ -151,9 +151,13 @@ function whereSql(plan: Pick<QueryPlan, 'where' | 'or'>, params: SQLInputValue[]
 			}
 			case 'isNull': return `(${field.type} is null or ${field.type} = 'null')`;
 			case 'isNotNull': return `(${field.type} is not null and ${field.type} != 'null')`;
-			case 'startsWith':
-				params.push(where.value as string);
-				return `(${field.type} = 'text' and instr(${field.value}, ?) = 1)`;
+			case 'startsWith': {
+				// Compare UTF-16 BLOB prefixes without decoding strings through UTF-8.
+				const prefix = sqliteStringOrderKey(where.value)!;
+				if (!prefix.length) return `${field.type} = 'text'`;
+				params.push(prefix.length, prefix);
+				return `(${field.type} = 'text' and substr(${field.orderValue}, 1, ?) = ?)`;
+			}
 			default: throw new ActiveTsConfigurationError(`SQLite does not support query operator "${where.op}".`);
 		}
 	});
