@@ -58,6 +58,13 @@ Helpers operate on the current test context:
 
 - `seed(Model, rows)` - insert multiple rows
 - `fixture(Model, row)` - insert one row and return it
+
+Fixture writes invalidate the attempted model IDs in the entity cache, including
+cached misses and reads already being backfilled. Seeding bypasses model write
+validation and lifecycle hooks, but maintains cache invalidation. If a custom
+fixture helper writes only part of a batch before rejecting, all attempted IDs
+are invalidated before the original error is returned. Combined write and
+invalidation failures are reported together as an `AggregateError`.
 - `snapshotStore(Model?)` - inspect memory store contents
 - `resetTestContext(Model?)` - clear one model or all memory state; `await`
   this when adapters provide async cleanup helpers
@@ -478,3 +485,10 @@ smoke also run focused aggregate checks against the Google emulators so SDK
 aggregate helpers and typed `min`/`max` lookups stay covered. Elasticsearch
 smoke also passes a contract `nativeProbe` that indexes a row and searches it
 with a native-only query body against the service container.
+
+`runStoreAdapterDifferentialContract(adapter, { seed })` compares a disposable adapter with a fresh Memory store (or a supplied `reference`). It generates deterministic Unicode, mixed-scalar, null/missing, finite-average and pagination cases. The result reports executed and skipped capability-dependent cases; failures identify the seed and case. `createStoreParityFixture(seed)` exposes the same generated rows and plans for backend-specific harnesses. Use disposable integration resources: inserted rows are removed, while table/collection cleanup remains the harness's responsibility. The default model name is unique per run.
+
+```ts doc-test=fragment
+import { runStoreAdapterDifferentialContract } from 'active-ts/testing';
+await runStoreAdapterDifferentialContract(sqliteStore, { seed: 17 });
+```

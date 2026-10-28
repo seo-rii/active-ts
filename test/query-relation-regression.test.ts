@@ -795,7 +795,7 @@ test('relation hooks cannot mutate owner ids before query or search result hooks
 
 	await assert.rejects(
 		() => User.search('alice').include('profile').load(),
-		/afterRelationLoad qr_include_user\.profile target cannot change qr_include_user\.id/
+		/afterRelationLoad qr_include_user\.profile target item cannot change qr_include_user\.id/
 	);
 	assert.equal(afterSearchCalls, 0);
 });

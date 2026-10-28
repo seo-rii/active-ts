@@ -61,6 +61,27 @@ export function cursorValues(row: any, sort: CursorSort[]) {
 	return values;
 }
 
+/** Internal sort preparation: validate the plan once and snapshot each row's keys once. */
+export function prepareRowSort(sort: CursorSort[]) {
+	const safeSort = sanitizeCursorSortList(sort, 'cursor sort');
+	return {
+		keyFor(row: unknown): Comparable[] {
+			const values: Comparable[] = [];
+			for (let index = 0; index < safeSort.length; index++) {
+				values[index] = comparable(valueFor(row, safeSort[index].field));
+			}
+			return values;
+		},
+		compareKeys(left: Comparable[], right: Comparable[]) {
+			for (let index = 0; index < safeSort.length; index++) {
+				const order = compareValues(left[index], right[index]);
+				if (order !== 0) return safeSort[index].direction === 'asc' ? order : -order;
+			}
+			return 0;
+		}
+	};
+}
+
 export function compareRowsBySort(a: any, b: any, sort: CursorSort[]) {
 	for (const entry of sanitizeCursorSortList(sort, 'cursor sort')) {
 		const order = compareValues(comparable(valueFor(a, entry.field)), comparable(valueFor(b, entry.field)));

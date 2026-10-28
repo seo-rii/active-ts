@@ -10,6 +10,7 @@ import {
 	ActiveTsNotFoundError,
 	ActiveTsValidationError,
 	Model,
+	MemoryStoreAdapter,
 	createActiveTs,
 	defineModel,
 	type QueryPlan,
@@ -17,6 +18,7 @@ import {
 	type StoreAdapter
 } from '../src/index.js';
 import { createSqliteStoreAdapter } from '../src/adapters/store/sqlite.js';
+import { aggregateRows } from '../src/core/aggregate.js';
 import { runStoreAdapterContract } from '../src/testing/index.js';
 
 const emptyPlan: QueryPlan = { where: [], or: [], sort: [], include: [] };
@@ -162,6 +164,17 @@ test('SQLite supports Model codec filtering, nested projection and date hydratio
 	assert.equal((await store.get(context.meta(Encoded), 1)).token, 'encoded:secret');
 	assert.deepEqual((await Records.query().select('profile.score').first())?.data, { id: 1, profile: { score: 3 } });
 	assert.equal(await Records.sum('profile.score'), 3);
+});
+
+test('SQLite average CTEs do not shadow model tables with the same names', async (t) => {
+	for (const name of ['active_ts_rows', 'active_ts_scale', 'active_ts_scales']) {
+		const { store, model } = await fixture(t, metadata(name));
+		await store.create(model, 1, { id: 1, score: 10 });
+		await store.create(model, 2, { id: 2, score: 20 });
+		assert.deepEqual(await store.aggregate!(model, {
+			where: [], or: [], aggregates: [{ op: 'avg', field: 'score', as: 'mean' }]
+		}), { mean: 15 });
+	}
 });
 
 test('SQLite aggregates count missing input rows without including them in numeric inputs', async (t) => {
@@ -518,4 +531,178 @@ test('SQLite numeric aggregates preserve finite JavaScript numbers beyond safe i
 		{ op: 'sum', field: 'score', as: 'sum' }, { op: 'avg', field: 'score', as: 'avg' },
 		{ op: 'min', field: 'score', as: 'min' }, { op: 'max', field: 'score', as: 'max' }
 	] }), { sum: score * 2, avg: score, min: score, max: score });
+});
+
+test('SQLite average preserves finite extremes, cancellation and subnormal residues', async (t) => {
+	const { store, model } = await fixture(t);
+	const spec = [{ op: 'avg' as const, field: 'score', as: 'mean' }];
+	const cases = [
+		[1e308, 1e308], [-1e308, -1e308], [Number.MAX_VALUE, Number.MAX_VALUE],
+		[1e308, 1, -1e308], [Number.MIN_VALUE, Number.MIN_VALUE],
+		[1e308, Number.MIN_VALUE * 4, -1e308], [], [null, null]
+	];
+	let id = 0;
+	for (const [group, values] of cases.entries()) {
+		const rows = values.map((score) => ({ id: id++, group, score }));
+		for (const row of rows) await store.create(model, row.id, row);
+		assert.deepEqual(await store.aggregate!(model, {
+			where: [{ field: 'group', op: '=', value: group }], or: [], aggregates: spec
+		}), aggregateRows(rows, spec));
+	}
+});
+
+test('SQLite validates every matching sort value before applying the page limit', async (t) => {
+	const { store, model } = await fixture(t);
+	await store.create(model, 1, { id: 1, score: 1 });
+	await store.create(model, 2, { id: 2, score: 2 });
+	for (const score of [{ nested: 1 }, [1, 2]]) {
+		await store.update(model, 2, { id: 2, score });
+		for (const direction of ['asc', 'desc'] as const) {
+			await assert.rejects(() => store.query(model, {
+				...emptyPlan, sort: [{ field: 'score', direction }], limit: 1
+			}), /sort values must be scalar/);
+		}
+		// Invalid rows outside the query's input set do not poison its order.
+		assert.deepEqual((await store.query(model, {
+			...emptyPlan, where: [{ field: 'id', op: '=', value: 1 }],
+			sort: [{ field: 'score', direction: 'asc' }], limit: 1
+		})).list, [{ id: 1, score: 1 }]);
+	}
+});
+
+test('SQLite Unicode comparisons, pages and extrema follow JavaScript UTF-16 order', async (t) => {
+	const model = metadata('active_sqlite_unicode_order', { fieldTypes: new Map([['label', 'string']]) });
+	const { store } = await fixture(t, model);
+	const labels = ['\uE000', '\u{10000}', '\uD7FF', '\uD7FFx', '\u{10FFFF}', '\uFFFF', '', 'a', 'aa', 'a\0z'];
+	for (const [id, label] of labels.entries()) await store.create(model, id, { id, label });
+	const ordered = [...labels].sort();
+	for (const direction of ['asc', 'desc'] as const) {
+		const expected = direction === 'asc' ? ordered : [...ordered].reverse();
+		assert.deepEqual((await store.query(model, {
+			...emptyPlan, sort: [{ field: 'label', direction }], offset: 2, limit: 5
+		})).list.map((row) => row.label), expected.slice(2, 7));
+	}
+	for (const bound of labels) {
+		for (const op of ['=', '>', '<'] as const) {
+			const matches = labels.filter((value) => op === '=' ? value === bound : op === '>' ? value > bound : value < bound);
+			assert.deepEqual((await store.query(model, {
+				...emptyPlan, where: [{ field: 'label', op, value: bound }], sort: [{ field: 'label', direction: 'asc' }]
+			})).list.map((row) => row.label), matches.sort());
+		}
+	}
+	assert.deepEqual(await store.aggregate!(model, { where: [], or: [], aggregates: [
+		{ op: 'min', field: 'label', as: 'min' }, { op: 'max', field: 'label', as: 'max' }
+	] }), { min: ordered[0], max: ordered.at(-1) });
+});
+
+
+test('SQLite declared indexes serve generated scalar equality and range predicates', async () => {
+	const database = new DatabaseSync(':memory:');
+	const store = await createSqliteStoreAdapter({ database });
+	const model = metadata('active_sqlite_lookup', { indexes: [{ name: 'value', fields: ['value'] }] });
+	const original = DatabaseSync.prototype.prepare;
+	try {
+		await store.schema!.apply([model], { mode: 'safe' });
+		for (const row of [{ id: 1, value: 7 }, { id: 2, value: 9 }, { id: 3, value: '\u{10000}' }, { id: 4, value: '\uE000' }]) {
+			await store.create(model, row.id, row);
+		}
+		for (const [op, value, ids] of [['=', 7, [1]], ['>', 7, [2]], ['=', '\u{10000}', [3]], ['<', '\uE000', [3]]] as const) {
+			let captured = '';
+			DatabaseSync.prototype.prepare = function(sql) {
+				if (sql.startsWith('select id, data from')) captured = sql;
+				return original.call(this, sql);
+			};
+			const result = await store.query(model, { ...emptyPlan, where: [{ field: 'value', op, value }], limit: 5 });
+			DatabaseSync.prototype.prepare = original;
+			assert.deepEqual(result.list.map((row) => row.id), ids);
+			assert.ok(captured);
+			const bound = typeof value === 'string' ? Buffer.from(value, 'utf16le').swap16() : value;
+			const plan = database.prepare(`EXPLAIN QUERY PLAN ${captured}`).all(bound, 6, 0);
+			assert.ok(plan.some((row) => /SEARCH .* USING INDEX active_ts_lookup_v1_/.test(String(row.detail))), JSON.stringify(plan));
+		}
+	} finally { DatabaseSync.prototype.prepare = original; await store.close(); database.close(); }
+});
+
+test('SQLite rejects removing declared uniqueness while the retained constraint remains', async () => {
+	for (const legacyOnly of [false, true]) {
+		for (const unique of [false, undefined]) {
+			const database = new DatabaseSync(':memory:');
+			const store = await createSqliteStoreAdapter({ database });
+			const model = metadata('active_sqlite_unique_drift', {
+				indexes: [{ name: 'email', fields: ['email'], unique: true }]
+			});
+			try {
+				await store.schema!.apply([model], { mode: 'safe' });
+				if (legacyOnly) {
+					const lookup = database.prepare("select name from sqlite_schema where name like 'active_ts_lookup_v1_%'").get()!;
+					database.exec(`DROP INDEX "${lookup.name}"`);
+				}
+				await store.create(model, 1, { id: 1, email: 'same' });
+				const changed = { ...model, indexes: [{ name: 'email', fields: ['email'], ...(unique === undefined ? {} : { unique }) }] };
+				await assert.rejects(() => store.schema!.plan([changed]), /existing index .* incompatible owner or definition/);
+				await assert.rejects(() => store.schema!.apply([changed], { mode: 'safe' }), /existing index .* incompatible owner or definition/);
+				await assert.rejects(() => store.create(model, 2, { id: 2, email: 'same' }), ActiveTsConflictError);
+				await store.schema!.apply([model], { mode: 'safe' });
+				assert.deepEqual((await store.schema!.plan([model])).changes, []);
+			} finally { await store.close(); database.close(); }
+		}
+	}
+	const store = await createSqliteStoreAdapter();
+	const model = metadata('active_sqlite_nonunique', { indexes: [{ name: 'email', fields: ['email'], unique: false }] });
+	try {
+		await store.schema!.apply([model], { mode: 'safe' });
+		await store.create(model, 1, { id: 1, email: 'same' });
+		await store.create(model, 2, { id: 2, email: 'same' });
+		assert.deepEqual((await store.schema!.plan([model])).changes, []);
+	} finally { await store.close(); }
+});
+
+test('SQLite upgrades legacy unique indexes additively and preserves their constraints', async () => {
+	const database = new DatabaseSync(':memory:');
+	const store = await createSqliteStoreAdapter({ database });
+	const model = metadata('active_sqlite_legacy_index', { indexes: [{ name: 'value', fields: ['value'], unique: true }] });
+	try {
+		await store.schema!.apply([model], { mode: 'safe' });
+		const lookup = database.prepare("select name from sqlite_schema where type = 'index' and name like 'active_ts_lookup_v1_%'").get()!;
+		database.exec(`DROP INDEX "${lookup.name}"`);
+		await store.create(model, 1, { id: 1, value: null });
+		await assert.rejects(() => store.create(model, 2, { id: 2, value: null }), ActiveTsConflictError);
+		assert.deepEqual((await store.schema!.plan([model])).changes.map((change) => change.type), ['create-index']);
+		await store.schema!.apply([model], { mode: 'safe' });
+		assert.deepEqual((await store.schema!.plan([model])).changes, []);
+		await assert.rejects(() => store.create(model, 2, { id: 2, value: null }), ActiveTsConflictError);
+	} finally { await store.close(); database.close(); }
+});
+
+test('SQLite JSON string keys preserve lone surrogates without replacement-character aliases', async (t) => {
+	const model = metadata('active_sqlite_surrogate_values', {
+		indexes: [{ name: 'label', fields: ['label'] }],
+		fieldTypes: new Map([['label', 'string']])
+	});
+	const { store } = await fixture(t, model);
+	const reference = new MemoryStoreAdapter();
+	const labels = ['\ud800', '\ud801', '\ufffd', '\ufffd\ufffd\ufffd', '\u{10000}', '\udfff', 'prefix\ud800suffix', 'a\0z', ''];
+	for (const [id, label] of labels.entries()) {
+		for (const target of [store, reference]) await target.create(model, id, { id, label });
+	}
+	const ids = (result: { list: any[] }) => result.list.map((row) => row.id);
+	for (const value of labels) {
+		for (const op of ['=', '!=', '<', '<=', '>', '>='] as const) {
+			const plan: QueryPlan = { ...emptyPlan, where: [{ field: 'label', op, value }], sort: [{ field: 'label', direction: 'asc' }] };
+			assert.deepEqual(ids(await store.query(model, plan)), ids(await reference.query(model, plan)), `${op} ${JSON.stringify(value)}`);
+		}
+	}
+	const range: QueryPlan = { ...emptyPlan, where: [{ field: 'label', op: 'between', value: '\ud800', value2: '\udfff' }], sort: [{ field: 'label', direction: 'asc' }] };
+	assert.deepEqual(ids(await store.query(model, range)), ids(await reference.query(model, range)));
+	for (const direction of ['asc', 'desc'] as const) {
+		for (const offset of [0, 2, 6]) {
+			const plan: QueryPlan = { ...emptyPlan, sort: [{ field: 'label', direction }], offset, limit: 3 };
+			const actual = await store.query(model, plan), expected = await reference.query(model, plan);
+			assert.deepEqual({ list: actual.list, count: actual.count, more: actual.more }, { list: expected.list, count: expected.count, more: expected.more });
+		}
+	}
+	const extrema = { where: [{ field: 'id', op: '<' as const, value: 2 }], or: [], aggregates: [
+		{ op: 'min' as const, field: 'label', as: 'min' }, { op: 'max' as const, field: 'label', as: 'max' }
+	] };
+	assert.deepEqual(await store.aggregate!(model, extrema), await reference.aggregate(model, extrema));
 });

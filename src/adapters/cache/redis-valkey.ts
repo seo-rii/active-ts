@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { assertWellFormedUnicode } from '../../core/unicode.js';
 import { optionalImport } from '../../core/optional-import.js';
+import { createAdapterCloser } from '../../core/adapter-lifecycle.js';
 import { assertCacheableValue, assertSafeCacheKey, assertSafeTtl, defineDataProperty } from '../../core/safe-keys.js';
 import { ActiveTsValidationError } from '../../core/errors.js';
 import type { CacheAdapter, CacheCodec, CacheWriteOptions } from '../../core/types.js';
@@ -116,6 +117,11 @@ export async function createRedisValkeyCacheAdapter(options: RedisValkeyOptions 
 	options = validateRedisValkeyOptions(options);
 	const mod = options.client ? undefined : await optionalImport('redis', 'RedisValkeyCacheAdapter');
 	const rawClient = options.client ?? mod.createClient({ url: options.url });
+	const close = createAdapterCloser(options.client ? undefined : () => {
+		const closeClient = optionalClientMethod(rawClient, 'close', 'Redis client.close')
+			?? clientMethod(rawClient, 'quit', 'Redis client.quit');
+		return closeClient();
+	});
 	if (!options.client) await rawClient.connect();
 	const client = normalizeRedisValkeyClient(rawClient);
 	const codec = options.codec;
@@ -167,6 +173,7 @@ export async function createRedisValkeyCacheAdapter(options: RedisValkeyOptions 
 
 	const adapter: CacheAdapter = {
 		kind: 'redis-valkey',
+		close,
 		codecKey: key,
 		async getMany(keys) {
 			keys = normalizeCacheKeys(keys, 'redis-valkey cache keys');

@@ -157,7 +157,7 @@ test('npm package metadata and prepack publish guard are present', () => {
 		homepage?: string;
 	};
 
-	assert.equal(packageJson.scripts.prepack, 'pnpm build');
+	assert.equal(packageJson.scripts.prepack, 'node scripts/prepare-package.mjs');
 	assert.equal(packageJson.repository?.type, 'git');
 	assert.equal(packageJson.repository?.url, 'git+https://github.com/seo-rii/active-ts.git');
 	assert.equal(packageJson.bugs?.url, 'https://github.com/seo-rii/active-ts/issues');
@@ -238,7 +238,7 @@ test('CI and package scripts keep dependency audit enabled', () => {
 	assert.match(pnpmWorkspace, /^overrides:\n(?:  [^\n]+\n)*  '@opentelemetry\/core': 2\.8\.0$/m);
 	assert.match(pnpmWorkspace, /^overrides:\n(?:  [^\n]+\n)*  brace-expansion: 2\.1\.7$/m);
 	assert.match(pnpmWorkspace, /^overrides:\n(?:  [^\n]+\n)*  protobufjs: 7\.6\.5$/m);
-	assert.match(pnpmWorkspace, /^overrides:\n(?:  [^\n]+\n)*  undici: 7\.29\.1$/m);
+	assert.match(pnpmWorkspace, /^overrides:\n(?:  [^\n]+\n)*  undici: 7\.30\.1$/m);
 	assert.ok(ciAuditIndex >= 0, 'CI workflow must run dependency audit');
 	assert.ok(ciAuditIndex < ciTypecheckIndex, 'CI dependency audit must run before typecheck');
 	assert.ok(releaseAuditIndex >= 0, 'release workflow must run dependency audit');

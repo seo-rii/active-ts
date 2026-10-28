@@ -1,5 +1,15 @@
 # Adapters
 
+Adapters created by the PostgreSQL, MongoDB, and Redis/Valkey factories expose
+an optional `close()` lifecycle method. Retain the factory result and call
+`await adapter.close?.()` after application work and transactions have stopped.
+It closes only the pool/client created internally by that factory. An injected
+`pool` or `client` remains caller-owned, so adapter close is a no-op for those
+resources. Concurrent calls share one attempt, successful calls are idempotent,
+and a failed close can be retried. Transaction handles do not own their parent
+connection. Context and middleware handles do not transfer resource ownership;
+close the original factory result.
+
 Adapters isolate active-ts from backend SDKs. Applications register adapters in
 an `ActiveContext`; models select adapters by metadata or by context defaults.
 
@@ -765,6 +775,8 @@ or a shared file across hosts.
 
 Rows use a typed ID key and a JSON document. SQL performs filtering, ordering,
 pagination and aggregation; no implicit full-result JavaScript scan is used.
+The adapter registers internal deterministic SQLite functions on its connection
+to validate sortable scalars and preserve JavaScript UTF-16 string order.
 Declare scalar field metadata for `min`/`max`. Unique indexes, optimistic version
 checks, nested field predicates and portable projections are supported. Cursor,
 containment operators, native payloads and Datastore read policies reject.
@@ -1284,3 +1296,5 @@ JSON round trip without converting these IDs through JavaScript numbers. Applyin
 an int64 source, target, or ancestor requires the Datastore client's `int()` method.
 Key-wins repairs keep the branded logical ID in the entity payload; payload-wins
 repairs preserve the distinction between numeric IDs and decimal string names.
+
+SQLite schema application creates versioned expression indexes matching scalar equality/range predicates. Existing unique constraint indexes remain in place, and a separate lookup index is added without changing their null/missing semantics. Old nonunique `active_ts_` indexes from earlier releases are preserved; applications may remove them separately after reviewing their schema. Lookup indexes support filtering; a separate sort may still be needed for portable mixed-type ordering.

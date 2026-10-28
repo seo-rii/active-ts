@@ -90,31 +90,58 @@ function fieldSql(field: string) {
 		}
 	}
 	const path = literal('$' + segments.map((segment) => `.${JSON_STRINGIFY(segment)}`).join(''));
-	return { type: `json_type(data, ${path})`, value: `json_extract(data, ${path})` };
+	const type = `json_type(data, ${path})`;
+	const value = `json_extract(data, ${path})`;
+	const jsonValue = `data -> ${path}`;
+	const typeKey = `(case ${type} when 'integer' then 'number' when 'real' then 'number' else ${type} end)`;
+	const orderValue = `(case when ${type} = 'text' then active_ts_string_order_key(${jsonValue}) else ${value} end)`;
+	return { type, value, jsonValue, typeKey, orderValue, comparisonValue: `coalesce(${orderValue}, 'null')` };
 }
 
 function scalarCondition(field: ReturnType<typeof fieldSql>, value: unknown, params: SQLInputValue[], operator = '=') {
-	if (value === null && operator === '=') return `${field.type} = 'null'`;
+	if (value === null && operator === '=') return `(${field.typeKey} = 'null' and ${field.comparisonValue} = 'null')`;
 	let kind: string;
 	let bound: SQLInputValue;
 	if (typeof value === 'number' && Number.isFinite(value)) {
-		kind = `${field.type} in ('integer', 'real')`; bound = value;
+		kind = `${field.typeKey} = 'number'`; bound = value;
 	} else if (typeof value === 'string') {
-		kind = `${field.type} = 'text'`; bound = value;
+		kind = `${field.typeKey} = 'text'`; bound = sqliteStringOrderKey(value);
 	} else if (typeof value === 'boolean') {
-		kind = `${field.type} = '${value ? 'true' : 'false'}'`; bound = Number(value);
+		kind = `${field.typeKey} = '${value ? 'true' : 'false'}'`; bound = Number(value);
 	} else {
 		throw new ActiveTsValidationError('SQLite predicates require portable scalar operands.');
 	}
 	params.push(bound);
-	return `(${kind} and ${field.value} ${operator} ?)`;
+	return `(${kind} and ${field.comparisonValue} ${operator} ?)`;
+}
+
+// SQLite compares BLOB bytes in order; big-endian UTF-16 preserves the exact
+// JavaScript code-unit order, including supplementary characters and prefixes.
+function sqliteStringOrderKey(value: unknown): Buffer | null {
+	// SQL may evaluate an operand before its adjacent type guard.
+	if (typeof value !== 'string') return null;
+	return Buffer.from(value, 'utf16le').swap16();
+}
+
+// node:sqlite passes TEXT function arguments through a NUL-terminated API.
+// Raw JSON text preserves escaped NULs and lone surrogates until after that boundary.
+function sqliteJsonStringOrderKey(value: unknown): Buffer | null {
+	return typeof value === 'string' ? sqliteStringOrderKey(JSON_PARSE(value)) : null;
+}
+
+function sqliteSortRank(type: unknown) {
+	if (type === null || type === 'null') return 0;
+	if (type === 'false' || type === 'true') return 1;
+	if (type === 'integer' || type === 'real') return 2;
+	if (type === 'text') return 3;
+	throw new ActiveTsValidationError('SQLite sort values must be scalar, null, or missing.');
 }
 
 function whereSql(plan: Pick<QueryPlan, 'where' | 'or'>, params: SQLInputValue[]): string {
 	const and = plan.where.map((where) => {
 		const field = fieldSql(where.field);
 		switch (where.op) {
-			case '=': return `coalesce(${scalarCondition(field, where.value, params)}, 0)`;
+			case '=': return scalarCondition(field, where.value, params);
 			case '!=': return `(${field.type} is not null and not coalesce(${scalarCondition(field, where.value, params)}, 0))`;
 			case '>': case '>=': case '<': case '<=': return scalarCondition(field, where.value, params, where.op);
 			case 'between': return `(${scalarCondition(field, where.value, params, '>=')} and ${scalarCondition(field, where.value2, params, '<=')})`;
@@ -136,16 +163,27 @@ function whereSql(plan: Pick<QueryPlan, 'where' | 'or'>, params: SQLInputValue[]
 	return alternatives.length ? alternatives.join(' or ') : '1';
 }
 
-function indexDefinition(model: ResolvedModelMeta, index: ResolvedModelMeta['indexes'][number]) {
-	const name = `active_ts_${createHash('sha256').update(JSON_STRINGIFY([model.name, index.name])).digest('hex').slice(0, 32)}`;
-	const keys: string[] = [];
+function indexDefinitions(model: ResolvedModelMeta, index: ResolvedModelMeta['indexes'][number]) {
+	const hash = createHash('sha256').update(JSON_STRINGIFY([model.name, index.name])).digest('hex').slice(0, 32);
+	const legacyKeys: string[] = [];
+	const lookupKeys: string[] = [];
 	for (let i = 0; i < index.fields.length; i++) {
 		const field = fieldSql(index.fields[i]);
 		const direction = index.directions?.[i] === 'desc' ? ' desc' : ' asc';
-		keys.push(`(case ${field.type} when 'integer' then 'number' when 'real' then 'number' else ${field.type} end)${direction}`);
-		keys.push(`coalesce(${field.value}, 'null')${direction}`);
+		legacyKeys.push(`${field.typeKey}${direction}`, `coalesce(${field.value}, 'null')${direction}`);
+		lookupKeys.push(`${field.typeKey}${direction}`, `${field.comparisonValue}${direction}`);
 	}
-	return { name, sql: `CREATE ${index.unique ? 'UNIQUE ' : ''}INDEX ${quote(name)} ON ${table(model)} (${keys.join(', ')})` };
+	// Validate retained legacy indexes even for nonunique declarations so a
+	// model cannot silently disagree with a still-enforced unique constraint.
+	const legacyName = `active_ts_${hash}`;
+	const definitions = [{
+		name: legacyName,
+		sql: `CREATE ${index.unique ? 'UNIQUE ' : ''}INDEX ${quote(legacyName)} ON ${table(model)} (${legacyKeys.join(', ')})`,
+		required: index.unique === true
+	}];
+	const name = `active_ts_lookup_v1_${hash}`;
+	definitions.push({ name, sql: `CREATE INDEX ${quote(name)} ON ${table(model)} (${lookupKeys.join(', ')})`, required: true });
+	return definitions;
 }
 
 function sqliteError(error: unknown): unknown {
@@ -187,6 +225,8 @@ export async function createSqliteStoreAdapter(input: SqliteStoreOptions = {}): 
 		if (owned) DatabaseSync.prototype.close.call(database);
 		throw new ActiveTsConfigurationError('SQLite options.database must be an open node:sqlite DatabaseSync.');
 	}
+	Reflect.apply(DatabaseSync.prototype.function, database, ['active_ts_sort_rank', { deterministic: true }, sqliteSortRank]);
+	Reflect.apply(DatabaseSync.prototype.function, database, ['active_ts_string_order_key', { deterministic: true }, sqliteJsonStringOrderKey]);
 	let state = connections.get(database);
 	if (!state) {
 		let scope = `sqlite:connection:${randomUUID()}`;
@@ -255,14 +295,16 @@ export async function createSqliteStoreAdapter(input: SqliteStoreOptions = {}): 
 				}
 			}
 			for (const index of model.indexes) {
-				const physical = indexDefinition(model, index);
-				const found = get('select type, tbl_name, sql from sqlite_schema where name = ? collate nocase', [physical.name]);
-				if (found === undefined) {
-					changes.push({ type: 'create-index', target: model.name, name: index.name, fields: [...index.fields],
-						...(index.directions ? { directions: [...index.directions] } : {}), ...(index.unique !== undefined ? { unique: index.unique } : {}) });
-				} else if (found.type !== 'index' || found.tbl_name !== model.name || found.sql !== physical.sql) {
-					throw new ActiveTsConfigurationError(`SQLite existing index "${physical.name}" has an incompatible owner or definition.`);
+				let missing = false;
+				for (const physical of indexDefinitions(model, index)) {
+					const found = get('select type, tbl_name, sql from sqlite_schema where name = ? collate nocase', [physical.name]);
+					if (found === undefined) { if (physical.required) missing = true; }
+					else if (found.type !== 'index' || found.tbl_name !== model.name || found.sql !== physical.sql) {
+						throw new ActiveTsConfigurationError(`SQLite existing index "${physical.name}" has an incompatible owner or definition.`);
+					}
 				}
+				if (missing) changes.push({ type: 'create-index', target: model.name, name: index.name, fields: [...index.fields],
+					...(index.directions ? { directions: [...index.directions] } : {}), ...(index.unique !== undefined ? { unique: index.unique } : {}) });
 			}
 		}
 		return { adapter: 'sqlite', changes };
@@ -317,7 +359,7 @@ export async function createSqliteStoreAdapter(input: SqliteStoreOptions = {}): 
 				const order = sortWithStableId(plan, model.idField).map((sort) => {
 					const field = fieldSql(sort.field);
 					const direction = sort.direction === 'desc' ? 'desc' : 'asc';
-					return `(case ${field.type} when 'false' then 1 when 'true' then 1 when 'integer' then 2 when 'real' then 2 when 'text' then 3 else 0 end) ${direction}, ${field.value} ${direction}`;
+					return `active_ts_sort_rank(${field.type}) ${direction}, ${field.orderValue} ${direction}`;
 				}).join(', ');
 				for (const field of plan.select ?? []) fieldSql(field);
 				const limit = limitWithLookahead(plan.limit, 'SQLite limit');
@@ -337,6 +379,7 @@ export async function createSqliteStoreAdapter(input: SqliteStoreOptions = {}): 
 				const specs = assertAggregateSpecsCompatibleWithModel(model, plan.aggregates, 'SQLite aggregate');
 				assertNoAggregateFieldCodecSpecs(model, specs, 'SQLite aggregate');
 				const columns: string[] = [];
+				const hasAverage = specs.some((spec) => spec.op === 'avg');
 				for (let i = 0; i < specs.length; i++) {
 					const spec = specs[i];
 					if (spec.op === 'count') { columns.push(`count(*) as ${quote(`v${i}`)}`); continue; }
@@ -349,17 +392,49 @@ export async function createSqliteStoreAdapter(input: SqliteStoreOptions = {}): 
 					const valid = numeric ? `${field.type} in ('integer', 'real')` : `${field.type} = 'text'`;
 					// REAL arithmetic follows the portable JS-number contract and avoids SQLite's
 					// integer overflow / node:sqlite's rejection of integers outside the safe range.
-					columns.push(`${spec.op}(case when ${valid} then ${numeric ? `cast(${field.value} as real)` : field.value} end) as ${quote(`v${i}`)}`);
+					const scalar = numeric ? `cast(${field.value} as real)` : type === 'string'
+						? `active_ts_string_order_key(${field.jsonValue})` : field.value;
+					const value = `case when ${valid} then ${scalar} end`;
+					if (spec.op === 'avg') {
+						// Bound the accumulated sum by dividing every input by a power
+						// of two at least as large as the row count. Retain subnormal
+						// rounding residues in original units, as the portable reducer does.
+						columns.push(`total((${value}) / scale) as ${quote(`v${i}`)}`);
+						columns.push(`total((${value}) - ((${value}) / scale) * scale) as ${quote(`r${i}`)}`);
+						columns.push(`count(${value}) as ${quote(`n${i}`)}`);
+						columns.push(`max(scale) as ${quote(`s${i}`)}`);
+					} else columns.push(`${spec.op}(${value}) as ${quote(`v${i}`)}`);
 					columns.push(`count(case when ${field.type} is not null and ${field.type} != 'null' and not (${valid}) then 1 end) as ${quote(`e${i}`)}`);
 				}
 				const params: SQLInputValue[] = [];
-				const sql = `select ${columns.length ? columns.join(', ') : 'count(*)'} from ${table(model)} where ${whereSql(plan, params)}`;
+				const source = `select data from main.${table(model)} where ${whereSql(plan, params)}`;
+				// Keep the row scan and the average's count in one SQLite statement
+				// and snapshot. Recursive doubling needs at most 64 small scale rows.
+				const prefix = hasAverage
+					? `with recursive active_ts_rows as materialized (${source}), active_ts_scales(value) as (select 1.0 union all select value * 2 from active_ts_scales where value < (select count(*) from active_ts_rows)), active_ts_scale as (select max(value) as scale from active_ts_scales) `
+					: '';
+				const from = hasAverage ? 'active_ts_rows cross join active_ts_scale' : `(${source})`;
+				const sql = `${prefix}select ${columns.length ? columns.join(', ') : 'count(*)'} from ${from}`;
 				return execute(() => {
 					const row = get(sql, params)!;
 					const result: Record<string, unknown> = {};
 					for (let i = 0; i < specs.length; i++) {
 						if (Number(row[`e${i}`] ?? 0) > 0) throw new ActiveTsValidationError(`SQLite aggregate "${specs[i].as}" requires numeric values for number aggregates or text values for string/date min/max.`);
-						defineDataProperty(result, specs[i].as, row[`v${i}`], { enumerable: true, configurable: true, writable: true });
+						let value = row[`v${i}`];
+						if (value instanceof Uint8Array && MAP_GET.call(model.fieldTypes, specs[i].field) === 'string') {
+							value = Buffer.from(value).swap16().toString('utf16le');
+						}
+						if (specs[i].op === 'avg') {
+							const count = Number(row[`n${i}`]);
+							const normalized = Number(value);
+							const scale = Number(row[`s${i}`]);
+							const remainder = Number(row[`r${i}`]);
+							const sum = normalized * scale;
+							value = count === 0 ? null : Number.isFinite(sum)
+								? (sum + remainder) / count
+								: (normalized / count) * scale + remainder / count;
+						}
+						defineDataProperty(result, specs[i].as, value, { enumerable: true, configurable: true, writable: true });
 					}
 					return normalizeAggregateRow(result, specs, 'SQLite aggregate');
 				});
@@ -437,7 +512,9 @@ export async function createSqliteStoreAdapter(input: SqliteStoreOptions = {}): 
 									throw new ActiveTsValidationError('SQLite unique indexes require scalar field values.');
 								}
 							}
-							exec(indexDefinition(model, index).sql);
+							for (const physical of indexDefinitions(model, index)) {
+								if (physical.required && !get('select 1 from sqlite_schema where name = ? collate nocase', [physical.name])) exec(physical.sql);
+							}
 						}
 					}
 					exec('COMMIT');

@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { optionalImport } from '../../core/optional-import.js';
+import { createAdapterCloser } from '../../core/adapter-lifecycle.js';
 import {
 	ActiveTsCommittedTransactionError,
 	ActiveTsConfigurationError,
@@ -1336,11 +1337,14 @@ async function createPostgresStoreAdapterInternal(
 	options = validatePostgresOptions(options);
 	const mod = options.pool ? undefined : await optionalImport('pg', 'PostgresStoreAdapter');
 	const Pool = mod?.Pool;
-	const pool = normalizePostgresPool(options.pool ?? new Pool({ connectionString: options.connectionString }));
+	const rawPool = options.pool ?? new Pool({ connectionString: options.connectionString });
+	const pool = normalizePostgresPool(rawPool);
+	const close = createAdapterCloser(options.pool ? undefined : () => postgresMethod(rawPool, 'end', 'PostgreSQL pool.end')());
 	const supportsTransaction = !options.inTransaction && pool.connect !== undefined;
 
 	const adapter: StoreAdapter = {
 		kind: 'postgresql',
+		close,
 		cacheScope: options.cacheScope,
 		capabilities: {
 			or: true,
