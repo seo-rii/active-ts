@@ -287,11 +287,11 @@ export class ActiveFunctionCache<TInput, TValue> {
 	}
 
 	private async invalidateResolvedKey(key: string, runtime = this.currentRuntime()) {
+		const { adapter, context } = runtime;
+		this.distributedAdapter(adapter);
 		this.bumpInvalidationEpoch(key);
 		markPendingInvalidation(key);
 		MAP_DELETE.call(this.memory, key);
-		const { adapter, context } = runtime;
-		this.distributedAdapter(adapter);
 		let deleted = false;
 		try {
 			if (context) {
