@@ -27,6 +27,7 @@ test('PostgreSQL averages stay finite when the intermediate sum would overflow',
 			[Number.MAX_VALUE, Number.MAX_VALUE], [-Number.MAX_VALUE, -Number.MAX_VALUE],
 			[1e308, 1e308], [-1e308, -1e308], [Number.MAX_VALUE, -Number.MAX_VALUE],
 			[1e308, 1e308, -1e308, -1e308], [Number.MIN_VALUE, Number.MIN_VALUE],
+			[Number.MIN_VALUE, 0, 0], [-Number.MIN_VALUE, 0, 0],
 			[1, 2, 3], [null, null], []
 		] as Array<Array<number | null>>) {
 			await pool.query(`truncate ${schema}.${model.name}`);

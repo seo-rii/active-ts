@@ -691,10 +691,11 @@ function aggregateSql(model: ResolvedModelMeta, spec: AggregateSpec, params: any
 	if (spec.op === 'count') return `count(*)::double precision as ${alias}`;
 	if (spec.op === 'sum' || spec.op === 'avg') {
 		// A finite mean can have a sum outside the double-precision range.
-		// Accumulate averages as numeric and convert only the final result.
+		// Accumulate as numeric, then let shared JS-number normalization handle
+		// the text result; a PostgreSQL numeric-to-double cast rejects underflow.
 		const numericValue = numericAggregateSql(spec.field!, params, spec.op === 'avg' ? 'numeric' : 'double precision');
 		if (spec.op === 'sum') return `coalesce(sum(${numericValue}), 0)::double precision as ${alias}`;
-		return `avg(${numericValue})::double precision as ${alias}`;
+		return `avg(${numericValue})::text as ${alias}`;
 	}
 	const comparableValue = typedJsonFieldParam(model, spec.field!, params);
 	return `${spec.op}(${modelFieldType(model, spec.field!) === 'string' ? postgresStringOrderKey(comparableValue) : comparableValue}) as ${alias}`;
