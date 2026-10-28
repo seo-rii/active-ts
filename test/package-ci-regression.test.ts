@@ -157,7 +157,7 @@ test('npm package metadata and prepack publish guard are present', () => {
 		homepage?: string;
 	};
 
-	assert.equal(packageJson.scripts.prepack, 'pnpm build');
+	assert.equal(packageJson.scripts.prepack, 'node scripts/prepare-package.mjs');
 	assert.equal(packageJson.repository?.type, 'git');
 	assert.equal(packageJson.repository?.url, 'git+https://github.com/seo-rii/active-ts.git');
 	assert.equal(packageJson.bugs?.url, 'https://github.com/seo-rii/active-ts/issues');
