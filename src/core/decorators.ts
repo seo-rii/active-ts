@@ -155,7 +155,7 @@ export function ref(
 	targetModel: () => ModelConstructor,
 	options: Omit<RelationMeta, 'name' | 'kind' | 'target'>
 ) {
-	const relationOptions = normalizeDecoratorOptions(options, 'relation options', ['localKey', 'foreignKey', 'preload', 'warnOnLazy']);
+	const relationOptions = normalizeDecoratorOptions(options, 'relation options', ['localKey', 'foreignKey', 'preload', 'warnOnLazy', 'ancestor']);
 	return relation(targetModel, { kind: 'one', ...relationOptions } as Omit<RelationMeta, 'name' | 'target'>);
 }
 
@@ -163,7 +163,7 @@ export function hasMany(
 	targetModel: () => ModelConstructor,
 	options: Omit<RelationMeta, 'name' | 'kind' | 'target'>
 ) {
-	const relationOptions = normalizeDecoratorOptions(options, 'relation options', ['localKey', 'foreignKey', 'preload', 'warnOnLazy']);
+	const relationOptions = normalizeDecoratorOptions(options, 'relation options', ['localKey', 'foreignKey', 'preload', 'warnOnLazy', 'ancestor']);
 	return relation(targetModel, { kind: 'many', ...relationOptions } as Omit<RelationMeta, 'name' | 'target'>);
 }
 
@@ -229,9 +229,10 @@ function normalizeRelationPreload(preload: string[] | undefined) {
 }
 
 function normalizeRelationOptions(options: Omit<RelationMeta, 'name' | 'target'>) {
-	const record = normalizeDecoratorOptions(options, 'relation options', ['kind', 'localKey', 'foreignKey', 'preload', 'warnOnLazy']);
+	const record = normalizeDecoratorOptions(options, 'relation options', ['kind', 'localKey', 'foreignKey', 'preload', 'warnOnLazy', 'ancestor']);
 	const kind = ownOptionValue(record, 'kind');
 	const warnOnLazy = ownOptionValue(record, 'warnOnLazy');
+	const ancestor = ownOptionValue(record, 'ancestor');
 	if (kind !== 'one' && kind !== 'many') {
 		const detail = typeof kind === 'string' ? ` "${kind}"` : '';
 		throw new ActiveTsConfigurationError(`Relation kind${detail} is not allowed.`);
@@ -239,12 +240,16 @@ function normalizeRelationOptions(options: Omit<RelationMeta, 'name' | 'target'>
 	if (warnOnLazy !== undefined && typeof warnOnLazy !== 'boolean') {
 		throw new ActiveTsConfigurationError('relation warnOnLazy must be a boolean.');
 	}
+	if (ancestor !== undefined && typeof ancestor !== 'function') {
+		throw new ActiveTsConfigurationError('relation ancestor must be a function.');
+	}
 	return {
 		kind: kind as RelationMeta['kind'],
 		localKey: assertSafeFieldPath(ownOptionValue(record, 'localKey'), 'relation localKey'),
 		foreignKey: assertSafeFieldPath(ownOptionValue(record, 'foreignKey'), 'relation foreignKey'),
 		preload: normalizeRelationPreload(ownOptionValue(record, 'preload') as string[] | undefined),
-		warnOnLazy: warnOnLazy as boolean | undefined
+		warnOnLazy: warnOnLazy as boolean | undefined,
+		ancestor: ancestor as RelationMeta['ancestor']
 	};
 }
 
