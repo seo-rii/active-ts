@@ -179,9 +179,11 @@ export function setValidator<TData>(
 	mode?: ValidationMode
 ) {
 	assertModelConstructor(model);
+	const safeValidator = sanitizeValidator(validator);
+	const safeMode = mode === undefined ? undefined : sanitizeValidationMode(mode);
 	const meta = ensureModelMeta<TData>(model);
-	meta.validator = sanitizeValidator(validator);
-	if (mode !== undefined) meta.readValidation = sanitizeValidationMode(mode);
+	meta.validator = safeValidator;
+	if (safeMode !== undefined) meta.readValidation = safeMode;
 	touch(model);
 }
 
