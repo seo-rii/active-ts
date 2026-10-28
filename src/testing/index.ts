@@ -39,3 +39,10 @@ export type {
 	IntegrationHarnessApi
 } from './integration-harness.js';
 export type { LazyWarningMode } from './shared.js';
+
+export {
+	createStoreParityFixture,
+	runStoreAdapterDifferentialContract,
+	type StoreParityFixture,
+	type StoreAdapterDifferentialOptions
+} from './store-parity.js';
