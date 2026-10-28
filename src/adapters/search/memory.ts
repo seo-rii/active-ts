@@ -1,7 +1,7 @@
 import type { QueryResult, ResolvedModelMeta, SearchAdapter, SearchOptions, SearchWriteOptions } from '../../core/types.js';
 import { assertSafeEntityId, assertSafeSchemaIdentifier, cloneSafeData, defineDataProperty } from '../../core/safe-keys.js';
 import { snapshotSearchAdapterModel } from '../../core/adapter-model.js';
-import { MAP_CLEAR, MAP_DELETE, MAP_ENTRIES, MAP_GET, MAP_SET, MAP_VALUES } from '../../core/collection-intrinsics.js';
+import { MAP_CLEAR, MAP_DELETE, MAP_ENTRIES, MAP_GET, MAP_SET, MAP_VALUES, WEAKMAP_GET, WEAKMAP_SET } from '../../core/collection-intrinsics.js';
 import { normalizeWhereShapeFieldTypes } from '../../core/field-types.js';
 import { filterRows, valueFor, whereShapeToPlan } from '../../core/query-utils.js';
 import {
@@ -48,6 +48,7 @@ export class MemorySearchAdapter implements SearchAdapter {
 	};
 	private readonly indexes = new Map<string, Map<string, any>>();
 	private readonly revisions = new Map<string, Map<string, number>>();
+	private readonly documentScopes = new WeakMap<object, string | undefined>();
 	readonly stats = {
 		search: 0,
 		index: 0,
@@ -71,6 +72,10 @@ export class MemorySearchAdapter implements SearchAdapter {
 		if (!fields.length) return { list: [], more: false, count: 0 };
 		let list: any[] = [];
 		for (const item of MAP_VALUES.call(this.existingCollectionIndex(model.name)) as Iterable<any>) {
+			// Model-wide snapshots retain every scope, but query selection must be
+			// scoped before counting or limiting so foreign hits cannot consume a page.
+			if (WEAKMAP_GET.call(this.documentScopes, item) !== model.datastoreSearchScope) continue;
+			if (model.searchDocumentIdentity !== undefined && searchHitDocumentIdentity(item) !== model.searchDocumentIdentity) continue;
 			if (searchDocumentMatches(item, fields, q)) {
 				list[list.length] = item;
 			}
@@ -104,6 +109,7 @@ export class MemorySearchAdapter implements SearchAdapter {
 		});
 		this.stats.index++;
 		if (!this.acceptRevision(model.name, key, options.revision)) return;
+		WEAKMAP_SET.call(this.documentScopes, document, model.datastoreSearchScope);
 		MAP_SET.call(this.collectionIndex(model.name), key, document);
 	}
 
