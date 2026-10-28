@@ -149,3 +149,40 @@ test('error read validation snapshots validator output before model instantiatio
 		tags: ['one']
 	});
 });
+
+test('in-place read validator id changes cannot return a different persisted row', async () => {
+	class Record extends Model<ReadValidationData> {}
+	defineModel<ReadValidationData>('in_place_read_identity')
+		.validate((input) => { const data = input as ReadValidationData; data.id = 2; return data; })
+		.readValidation('error').attach(Record);
+	const store = new MemoryStoreAdapter();
+	const context = createActiveTs({ stores: { default: store } });
+	await store.seed('in_place_read_identity', [{ id: 1, name: 'one' }, { id: 2, name: 'two' }]);
+	await assert.rejects(() => Record.use(context).find(1).load(), /read validator cannot change id/);
+	assert.deepEqual(store.dump('in_place_read_identity'), [{ id: 1, name: 'one' }, { id: 2, name: 'two' }]);
+});
+
+test('warn read validation discards partial in-place changes when validation fails', () => {
+	class Record extends Model<ReadValidationData & { nested: { label: string } }> {}
+	defineModel('in_place_warn_read').validate((input) => {
+		(input as any).nested.label = 'partial';
+		throw new Error('invalid remaining field');
+	}).readValidation('warn').attach(Record);
+	const context = createActiveTs({ stores: { default: new MemoryStoreAdapter() } });
+	const original = { id: 1, name: 'one', nested: { label: 'original' } };
+	const warn = console.warn;
+	console.warn = () => {};
+	try {
+		assert.deepEqual(context.validateRead(context.meta(Record), original), original);
+	} finally { console.warn = warn; }
+});
+
+test('read validators cannot move a Datastore row to another ancestor', () => {
+	class Record extends Model<{ id: number; tenant: string }> {}
+	defineModel<{ id: number; tenant: string }>('read_ancestor_identity')
+		.datastore({ ancestorFields: ['tenant'], ancestor: ({ data }) => ({ path: [{ kind: 'Tenant', id: data!.tenant }] }) })
+		.validate((input) => { const data = input as { id: number; tenant: string }; data.tenant = 'other'; return data; })
+		.readValidation('error').attach(Record);
+	const context = createActiveTs({ stores: { default: new MemoryStoreAdapter() } });
+	assert.throws(() => context.validateRead(context.meta(Record), { id: 1, tenant: 'original' }), /cannot change the Datastore ancestor/);
+});

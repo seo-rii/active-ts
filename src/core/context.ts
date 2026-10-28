@@ -2310,9 +2310,10 @@ export class ActiveContext {
 		if (!meta.validator || meta.readValidation === 'off') return decoded;
 		let validated: any;
 		try {
-			validated = meta.validator(decoded);
+			validated = meta.validator(cloneSafeData(decoded));
 			const clean = cloneSafeDataObject(validated, `${meta.name} read data`);
 			assertReadValidatorPreservesId(meta, decoded, clean);
+			assertReadTransformPreservesAncestor(meta, decoded, clean, 'read validator');
 			return clean;
 		} catch (error) {
 			const message = `Read validation failed for ${meta.name}: ${safeErrorMessage(error)}`;
@@ -5723,6 +5724,22 @@ function assertReadValidatorPreservesId(meta: ResolvedModelMeta, before: Record<
 	assertSafeEntityId(afterId, `${meta.name}.${meta.idField}`);
 	if (entityIdKey(beforeId) !== entityIdKey(afterId)) {
 		throw new ActiveTsValidationError(`${meta.name} read validator cannot change id field "${meta.idField}".`);
+	}
+}
+
+function assertReadTransformPreservesAncestor(
+	meta: ResolvedModelMeta,
+	before: Record<string, unknown>,
+	after: Record<string, unknown>,
+	operation: string
+) {
+	if (!meta.datastore?.ancestor) return;
+	const id = valueFor(before, meta.idField) as EntityId;
+	const expected = datastorePayloadResolvedAncestor(meta, id, before, operation);
+	if (expected === undefined) return;
+	const actual = datastorePayloadResolvedAncestor(meta, id, after, operation);
+	if (actual === undefined || datastoreKeyIdentity(expected) !== datastoreKeyIdentity(actual)) {
+		throw new ActiveTsValidationError(`${meta.name} ${operation} cannot change the Datastore ancestor.`);
 	}
 }
 
