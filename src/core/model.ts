@@ -6,6 +6,7 @@ import { LazyRef } from './lazy-ref.js';
 import { isPartialModel } from './partial-model.js';
 import { findTypedViewDetails, type TypedView } from './typed-view.js';
 import { entityIdKey, valueFor } from './query-utils.js';
+import { applyFieldTypeTransforms } from './field-types.js';
 import {
 	snapshotRelationOwnerLocalKey,
 	snapshotRelationResult,
@@ -1255,7 +1256,7 @@ function assertPostWriteModelDataUnchanged(
 	expectedId: EntityId
 ) {
 	const clean = context.validateModelInstance(meta, item, operation, { expectedId, partial: false });
-	if (!isDeepStrictEqual(clean, committedData)) {
+	if (!isDeepStrictEqual(clean, applyFieldTypeTransforms(meta, committedData, 'read'))) {
 		throw new ActiveTsValidationError(
 			`${operation} cannot change committed ${meta.name} data after the store write.`
 		);
