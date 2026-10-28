@@ -274,6 +274,14 @@ await profileCache.invalidate(1);
 ```
 
 The function cache runs the same cache hooks as model cache reads and writes.
+Each operation captures its context and cache adapter before asynchronous key
+resolution. Local memo entries and in-flight computations are scoped to that
+runtime, so reusing a cache after changing the default context cannot return the
+previous context's local value. Standalone caches with a direct adapter remain
+independent of unrelated default contexts. A context switch can replace the
+single local entry for a key; its next read uses the selected backing cache.
+Factories and key/namespace resolvers still own their external dependencies;
+use bound models or explicit inputs when their computations depend on a context.
 Use `refresh: true` to bypass both cache layers and recompute:
 
 ```ts doc-test=fragment
