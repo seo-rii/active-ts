@@ -1218,7 +1218,8 @@ export class ActiveContext {
 			searchAdapter: (name) => this.internalSearchAdapter(name),
 			assertWritable: (operation) => this.assertTransactionWritable(operation),
 			markRollbackOnly: (error) => this.markTransactionRollbackOnly(error),
-			trackOperation: (run) => this.trackOperation(run)
+			trackOperation: (run) => this.trackOperation(run),
+			validateReadConstructorResult
 		};
 	}
 
@@ -2264,9 +2265,7 @@ export class ActiveContext {
 		}
 		const originalData = meta.datastore?.ancestor ? cloneSafeDataObject(data, `${meta.name} constructor input`) : undefined;
 		const item = new model(data, this, { persisted: true, [MODEL_PERSISTED_TOKEN]: true });
-		const constructedData = modelDataValue(item as object, `${meta.name} constructor result`);
-		assertResultMatchesId(constructedData, id, meta.idField, `${meta.name} constructor result`);
-		if (originalData) assertReadTransformPreservesAncestor(meta, originalData, constructedData, 'constructor');
+		validateReadConstructorResult(meta, id, originalData, item);
 		return options.partial ? markPartialModel(item as object) as TModel : item;
 	}
 
@@ -5785,6 +5784,17 @@ function assertReadValidatorPreservesId(meta: ResolvedModelMeta, before: Record<
 	if (entityIdKey(beforeId) !== entityIdKey(afterId)) {
 		throw new ActiveTsValidationError(`${meta.name} read validator cannot change id field "${meta.idField}".`);
 	}
+}
+
+function validateReadConstructorResult(
+	meta: ResolvedModelMeta,
+	id: EntityId,
+	before: Record<string, unknown> | undefined,
+	item: unknown
+) {
+	const constructedData = modelDataValue(item, `${meta.name} constructor result`);
+	assertResultMatchesId(constructedData, id, meta.idField, `${meta.name} constructor result`);
+	if (before) assertReadTransformPreservesAncestor(meta, before, constructedData, 'constructor');
 }
 
 function assertReadTransformPreservesAncestor(

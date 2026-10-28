@@ -134,7 +134,7 @@ import {
 	relationAncestorForOwner,
 	relationTargetJoinKeys
 } from './relation-ancestor.js';
-import { contextInternalStore, runTrackedContextOperation } from './context-internal.js';
+import { contextInternalStore, runTrackedContextOperation, validateContextReadConstructorResult } from './context-internal.js';
 import {
 	markDatastoreHistoricalModel,
 	MODEL_DATASTORE_WRITE_ANCESTOR,
@@ -2181,6 +2181,13 @@ async function preloadIncludes(
 						cloneSafeDataObject(snapshot.data, `${targetMeta.name} relation result data`),
 						context,
 						{ persisted: true, [MODEL_PERSISTED_TOKEN]: true }
+					);
+					validateContextReadConstructorResult(
+						context,
+						targetMeta,
+						valueFor(snapshot.data, targetMeta.idField) as EntityId,
+						targetMeta.datastore?.ancestor ? snapshot.data : undefined,
+						isolated
 					);
 					if (snapshot.partial) markPartialModel(isolated as object);
 					if (snapshot.datastoreAncestor !== undefined) {
