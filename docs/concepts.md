@@ -45,6 +45,12 @@ Metadata defines the external collection/table name, id field, validation,
 indexes, search indexes, cache policy, and relation graph.
 Store indexes can declare per-field directions with `directions`, for example
 `index('score', { fields: ['ownerId', 'score'], directions: ['asc', 'desc'] })`.
+Generated index names normalize field paths, so `profile.email` and
+`profile_email` have the same default name. A declaration with a generated name
+that conflicts with different existing fields throws before replacing metadata;
+provide distinct explicit `name` options to register both indexes. This also
+applies to search indexes within the same adapter. Explicitly named declarations
+and direct metadata registration retain their replacement behavior.
 
 Metadata can also define model-local hooks, views, and policies:
 
