@@ -1153,6 +1153,84 @@ test('PostgreSQL adapter maps own duplicate key errors to conflicts', async () =
 	assert.equal(codeGetterCalls, 0);
 });
 
+test('PostgreSQL adapter maps own duplicate key errors on update to conflicts', async () => {
+	const duplicateError = Object.assign(new Error('duplicate key value violates unique constraint'), { code: '23505' });
+	let nextError: unknown = duplicateError;
+	const calls: string[] = [];
+	const txClient = {
+		query: async (text: string) => {
+			calls.push(text.startsWith('update ') ? 'update' : text);
+			if (text.startsWith('update ')) throw nextError;
+			return { rows: [], rowCount: 1, command: text.toUpperCase() };
+		},
+		release() {
+			calls.push('release');
+		}
+	};
+	const adapter = await createPostgresStoreAdapter({
+		pool: {
+			query: async () => {
+				throw nextError;
+			},
+			connect: async () => txClient
+		}
+	});
+
+	for (const writeOptions of [undefined, { expectedVersion: 1 }]) {
+		await assert.rejects(
+			() => adapter.update(meta, 1, { id: 1, handle: 'duplicate' }, writeOptions),
+			(error: unknown) => {
+				assert.ok(error instanceof ActiveTsConflictError);
+				assert.match(error.message, /unique constraint conflict/);
+				assert.equal(error.cause, duplicateError);
+				return true;
+			}
+		);
+		calls.length = 0;
+		await assert.rejects(
+			() => adapter.transaction!(async (tx) => {
+				await tx.update(meta, 1, { id: 1, handle: 'duplicate' }, writeOptions);
+			}),
+			(error: unknown) => {
+				assert.ok(error instanceof ActiveTsConflictError);
+				assert.equal(error.cause, duplicateError);
+				return true;
+			}
+		);
+		assert.deepEqual(calls, ['begin', 'update', 'rollback', 'release']);
+	}
+
+	Object.defineProperty(Object.prototype, 'code', {
+		value: '23505',
+		configurable: true
+	});
+	try {
+		nextError = new Error('plain update failure');
+		await assert.rejects(() => adapter.update(meta, 1, { id: 1, handle: 'plain' }), /plain update failure/);
+		await assert.rejects(
+			() => adapter.update(meta, 1, { id: 1, handle: 'plain' }, { expectedVersion: 1 }),
+			/plain update failure/
+		);
+	} finally {
+		delete (Object.prototype as Record<string, unknown>).code;
+	}
+
+	let codeGetterCalls = 0;
+	nextError = Object.defineProperty(new Error('accessor update failure'), 'code', {
+		enumerable: true,
+		get() {
+			codeGetterCalls++;
+			return '23505';
+		}
+	});
+	await assert.rejects(() => adapter.update(meta, 1, { id: 1, handle: 'accessor' }), /accessor update failure/);
+	await assert.rejects(
+		() => adapter.update(meta, 1, { id: 1, handle: 'accessor' }, { expectedVersion: 1 }),
+		/accessor update failure/
+	);
+	assert.equal(codeGetterCalls, 0);
+});
+
 test('PostgreSQL versioned missing writes report not found separately from stale conflicts', async () => {
 	let exists = false;
 	const adapter = await createPostgresStoreAdapter({

@@ -1313,6 +1313,15 @@ function postgresErrorCode(error: unknown) {
 	return typeof code === 'string' ? code : undefined;
 }
 
+function postgresConflictError(message: string, cause: unknown) {
+	const conflict = new ActiveTsConflictError(message);
+	defineDataProperty(conflict, 'cause', cause, {
+		enumerable: false,
+		configurable: true
+	});
+	return conflict;
+}
+
 function mapPostgresTypedJsonCastError(error: unknown, context: string): never {
 	if (SET_HAS.call(POSTGRES_CAST_ERROR_CODES, postgresErrorCode(error) ?? '')) {
 		throw new ActiveTsValidationError(
@@ -1570,10 +1579,21 @@ async function createPostgresStoreAdapterInternal(
 			const clean = clonePortableDataObject(data, `${model.name} stored data`);
 			assertStoreDataMatchesId(model, id, clean);
 			if (writeOptions.expectedVersion !== undefined) {
-				const res = await pool.query(
-					`update ${tableName(options, model)} set data = $2, updated_at = now() where id = $1 and jsonb_typeof(data #> ARRAY['version']) = 'number' and (data #>> ARRAY['version'])::double precision = $3`,
-					[storedId, clean, writeOptions.expectedVersion]
-				);
+				let res: unknown;
+				try {
+					res = await pool.query(
+						`update ${tableName(options, model)} set data = $2, updated_at = now() where id = $1 and jsonb_typeof(data #> ARRAY['version']) = 'number' and (data #>> ARRAY['version'])::double precision = $3`,
+						[storedId, clean, writeOptions.expectedVersion]
+					);
+				} catch (error) {
+					if (postgresErrorCode(error) === '23505') {
+						throw postgresConflictError(
+							`Cannot update ${model.name}:${String(id)} because of a unique constraint conflict.`,
+							error
+						);
+					}
+					throw error;
+				}
 				if (postgresRowCount(res, 'PostgreSQL update') === 0) {
 					if (!await postgresRowExists(pool, options, model, storedId)) {
 						throw new ActiveTsNotFoundError(`Cannot update ${model.name}:${String(id)} because it does not exist.`);
@@ -1584,10 +1604,21 @@ async function createPostgresStoreAdapterInternal(
 				}
 				return;
 			}
-			const res = await pool.query(
-				`update ${tableName(options, model)} set data = $2, updated_at = now() where id = $1`,
-				[storedId, clean]
-			);
+			let res: unknown;
+			try {
+				res = await pool.query(
+					`update ${tableName(options, model)} set data = $2, updated_at = now() where id = $1`,
+					[storedId, clean]
+				);
+			} catch (error) {
+				if (postgresErrorCode(error) === '23505') {
+					throw postgresConflictError(
+						`Cannot update ${model.name}:${String(id)} because of a unique constraint conflict.`,
+						error
+					);
+				}
+				throw error;
+			}
 			if (postgresRowCount(res, 'PostgreSQL update') === 0) {
 				throw new ActiveTsNotFoundError(`Cannot update ${model.name}:${String(id)} because it does not exist.`);
 			}
