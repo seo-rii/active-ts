@@ -42,7 +42,6 @@ export function applyFieldCodecsForFields(
 		for (const [codecField, codec] of MAP_ENTRIES.call(meta.fieldCodecs)) {
 			const relation = fieldCodecPathRelation(field, codecField);
 			if (!relation || SET_HAS.call(applied, codecField)) continue;
-			if (relation === 'ancestor' && valueFor(next, field) !== undefined) continue;
 			SET_ADD.call(applied, codecField);
 			applyFieldCodec(next, meta, codecField, codec, operation);
 		}

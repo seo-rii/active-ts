@@ -8,7 +8,7 @@ import {
 import { createSqliteStoreAdapter } from '../src/adapters/store/sqlite.js';
 import { createPostgresStoreAdapter } from '../src/adapters/store/postgresql.js';
 import { createNativeSearchAdapter } from '../src/adapters/search/native.js';
-import { FIELD_CODEC_QUERY_OPERANDS_ENCODED, encodeQueryPlanFieldCodecs } from '../src/core/field-codecs.js';
+import { FIELD_CODEC_QUERY_OPERANDS_ENCODED, applyFieldCodecsForFields, encodeQueryPlanFieldCodecs } from '../src/core/field-codecs.js';
 import { normalizeQueryPlanFieldTypes } from '../src/core/field-types.js';
 
 type NumericData = { id: number; amount: number; plainNumber?: number };
@@ -175,4 +175,86 @@ test('PostgreSQL typed codecs round-trip queries, ordering, native counts and de
 		try { await pool.query(`drop schema if exists ${schema} cascade`); }
 		finally { await pool.end(); }
 	}
+});
+
+test('applyFieldCodecsForFields applies ancestor codecs on read and write even when the requested child path is defined', () => {
+	type NestedCodecRowData = {
+		id: number;
+		tenant: { id: string; region: string };
+		envelope: { id: string; label: string };
+		secret: string;
+	};
+	class NestedCodecRow extends Model<NestedCodecRowData> {}
+	let tenantReads = 0;
+	let tenantWrites = 0;
+	let envelopeWrites = 0;
+	let secretCalls = 0;
+	defineModel<NestedCodecRowData>('apply_field_codecs_ancestor_regression')
+		.id('id')
+		.fieldCodec('tenant', {
+			name: 'tenant_object_codec',
+			encode: (value) => {
+				tenantWrites++;
+				const tenant = value as { id: string; region: string };
+				return { id: `enc:${tenant.id}`, region: tenant.region };
+			},
+			decode: (value) => {
+				tenantReads++;
+				const tenant = value as { id: string; region: string };
+				return { id: tenant.id.replace(/^enc:/, ''), region: tenant.region };
+			}
+		})
+		.fieldCodec('envelope', {
+			name: 'envelope_json_codec',
+			encode: (value) => {
+				envelopeWrites++;
+				return JSON.stringify(value);
+			},
+			decode: (value) => JSON.parse(String(value))
+		})
+		.fieldCodec('secret', {
+			name: 'untouched_secret_codec',
+			encode: (value) => {
+				secretCalls++;
+				return `cipher:${String(value)}`;
+			},
+			decode: (value) => {
+				secretCalls++;
+				return String(value).replace(/^cipher:/, '');
+			}
+		})
+		.attach(NestedCodecRow);
+
+	const context = createActiveTs({ stores: { default: new MemoryStoreAdapter() } });
+	const meta = context.meta(NestedCodecRow);
+
+	const encodedObject = {
+		id: 1,
+		tenant: { id: 'enc:10', region: 'us' },
+		envelope: JSON.stringify({ id: '10', label: 'raw' }),
+		secret: 'cipher:keep'
+	};
+	const decoded = applyFieldCodecsForFields(meta, encodedObject, ['tenant.id', 'tenant.region'], 'read');
+	assert.deepEqual(decoded, {
+		id: 1,
+		tenant: { id: '10', region: 'us' },
+		envelope: JSON.stringify({ id: '10', label: 'raw' }),
+		secret: 'cipher:keep'
+	});
+	assert.equal(tenantReads, 1);
+
+	const reencodedObject = applyFieldCodecsForFields(meta, decoded, ['tenant.id', 'tenant.region'], 'write');
+	assert.deepEqual(reencodedObject, encodedObject);
+	assert.equal(tenantWrites, 1);
+
+	const decodedEnvelope = {
+		id: 1,
+		tenant: { id: 'enc:10', region: 'us' },
+		envelope: { id: '10', label: 'raw' },
+		secret: 'cipher:keep'
+	};
+	const reencodedEnvelope = applyFieldCodecsForFields(meta, decodedEnvelope, ['envelope.id'], 'write');
+	assert.deepEqual(reencodedEnvelope, encodedObject);
+	assert.equal(envelopeWrites, 1);
+	assert.equal(secretCalls, 0);
 });

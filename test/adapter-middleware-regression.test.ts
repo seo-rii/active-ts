@@ -24,6 +24,7 @@ import { ACTIVE_TS_ENTITY_KEY } from '../src/core/safe-keys.js';
 import { datastoreSearchDocumentIdentity, searchDocumentIdentity } from '../src/core/search-utils.js';
 import {
 	markStoreTrustsDatastoreEntityKeyRows,
+	normalizeStoreQueryResultForModel,
 	storeTrustsDatastoreEntityKeyRows
 } from '../src/core/store-options.js';
 
@@ -2059,4 +2060,207 @@ test('middleware adapters ignore patched Array map during normalization and exec
 	} finally {
 		Object.defineProperty(Array.prototype, 'map', map);
 	}
+});
+
+test('normalizeStoreQueryResultForModel checks WeakSet entity-key trust against pre-clone rows', () => {
+	const context = createActiveTs({ stores: { default: new MemoryStoreAdapter() } });
+	const meta = context.meta(MiddlewareDatastoreWriteRecord);
+	const scopedAncestor = datastoreKey('middleware_parent', 10);
+	const trustedRow = Object.defineProperty(
+		{ id: 7, value: 'partial trusted row' },
+		ACTIVE_TS_ENTITY_KEY,
+		{ value: datastoreKey(meta.name, 7, { parent: scopedAncestor }), enumerable: false }
+	);
+	const forgedRow = Object.defineProperty(
+		{ id: 8, parentId: 10, value: 'full forged row' },
+		ACTIVE_TS_ENTITY_KEY,
+		{ value: datastoreKey(meta.name, 8, { parent: datastoreKey('middleware_parent', 99) }), enumerable: false }
+	);
+	const trustedSet = new WeakSet<object>([trustedRow]);
+
+	const result = normalizeStoreQueryResultForModel(
+		meta,
+		{ list: [trustedRow, forgedRow], more: false },
+		'weakset trust query',
+		{
+			datastoreAncestor: scopedAncestor,
+			trustedDatastoreEntityKeys: trustedSet
+		}
+	);
+
+	assert.equal(result.list.length, 2);
+	assert.notEqual(result.list[0], trustedRow);
+	assert.deepEqual((result.list[0] as any)[ACTIVE_TS_ENTITY_KEY], datastoreKey(meta.name, 7, { parent: scopedAncestor }));
+	assert.equal(Object.getOwnPropertyDescriptor(result.list[1], ACTIVE_TS_ENTITY_KEY), undefined);
+});
+
+test('store middleware with pass-through layers preserves trusted Datastore entity keys on partial reads', async () => {
+	const scopedAncestor = datastoreKey('middleware_parent', 10);
+	const makePartialRow = (id: number, value: string) =>
+		Object.defineProperty(
+			{ id, value },
+			ACTIVE_TS_ENTITY_KEY,
+			{
+				value: datastoreKey('adapter_middleware_datastore_write_regression', id, { parent: scopedAncestor }),
+				enumerable: false
+			}
+		);
+	const rawStore: StoreAdapter = {
+		kind: 'middleware-noop-trusted-datastore',
+		capabilities: { datastoreAncestor: true, select: true },
+		get: async (_model, id) => makePartialRow(Number(id), 'partial get'),
+		getMany: async (_model, ids) => ids.map((id) => makePartialRow(Number(id), `partial getMany ${String(id)}`)),
+		query: async () => ({ list: [makePartialRow(7, 'partial query')], more: false, count: 1 }),
+		create: async () => undefined,
+		update: async () => undefined,
+		delete: async () => undefined
+	};
+	markStoreTrustsDatastoreEntityKeyRows(rawStore);
+	const wrappedOnce = createStoreMiddlewareAdapter(rawStore, [
+		async (_operation, next) => await next()
+	]);
+	const wrappedTwice = createStoreMiddlewareAdapter(wrappedOnce, [
+		async (_operation, next) => await next()
+	]);
+	const context = createActiveTs({ stores: { default: wrappedTwice } });
+	const meta = context.meta(MiddlewareDatastoreWriteRecord);
+	const Record = MiddlewareDatastoreWriteRecord.use(context) as unknown as typeof MiddlewareDatastoreWriteRecord;
+
+	const got = await wrappedTwice.get(meta, 7, { select: ['value'], meta: { datastoreAncestor: scopedAncestor } });
+	assert.deepEqual(got, { id: 7, value: 'partial get' });
+	assert.deepEqual((got as any)[ACTIVE_TS_ENTITY_KEY], datastoreKey(meta.name, 7, { parent: scopedAncestor }));
+
+	const gotMany = await wrappedTwice.getMany(meta, [7, 8], { select: ['value'], meta: { datastoreAncestor: scopedAncestor } });
+	assert.deepEqual(gotMany, [
+		{ id: 7, value: 'partial getMany 7' },
+		{ id: 8, value: 'partial getMany 8' }
+	]);
+	assert.deepEqual((gotMany[0] as any)[ACTIVE_TS_ENTITY_KEY], datastoreKey(meta.name, 7, { parent: scopedAncestor }));
+	assert.deepEqual((gotMany[1] as any)[ACTIVE_TS_ENTITY_KEY], datastoreKey(meta.name, 8, { parent: scopedAncestor }));
+
+	const queried = await wrappedTwice.query(meta, {
+		where: [],
+		or: [],
+		sort: [],
+		select: ['value'],
+		include: [],
+		meta: { datastoreAncestor: scopedAncestor }
+	});
+	assert.deepEqual(queried.list, [{ id: 7, value: 'partial query' }]);
+	assert.deepEqual((queried.list[0] as any)[ACTIVE_TS_ENTITY_KEY], datastoreKey(meta.name, 7, { parent: scopedAncestor }));
+
+	const loaded = await Record.ancestor(scopedAncestor).select('value').load();
+	assert.equal(loaded.list.length, 1);
+	assert.equal(loaded.list[0].data.value, 'partial query');
+	assert.deepEqual((loaded.list[0].data as any)[ACTIVE_TS_ENTITY_KEY], datastoreKey(meta.name, 7, { parent: scopedAncestor }));
+});
+
+test('store middleware strips forged Datastore entity keys from returned get, getMany, and query rows', async () => {
+	const contextForMeta = createActiveTs({ stores: { default: new MemoryStoreAdapter() } });
+	const meta = contextForMeta.meta(MiddlewareDatastoreWriteRecord);
+	const scopedAncestor = datastoreKey('middleware_parent', 10);
+	const forgedAncestor = datastoreKey('middleware_parent', 99);
+	const makeForgedFullRow = (id: number, value: string) =>
+		Object.defineProperty(
+			{ id, parentId: 10, value },
+			ACTIVE_TS_ENTITY_KEY,
+			{ value: datastoreKey(meta.name, id, { parent: forgedAncestor }), enumerable: false }
+		);
+	const makeForgedPartialRow = (id: number, value: string) =>
+		Object.defineProperty(
+			{ id, value },
+			ACTIVE_TS_ENTITY_KEY,
+			{ value: datastoreKey(meta.name, id, { parent: scopedAncestor }), enumerable: false }
+		);
+	const makeTrustedPartialRow = (id: number, value: string) =>
+		Object.defineProperty(
+			{ id, value },
+			ACTIVE_TS_ENTITY_KEY,
+			{ value: datastoreKey(meta.name, id, { parent: scopedAncestor }), enumerable: false }
+		);
+
+	const rawTrustedStore: StoreAdapter = {
+		kind: 'middleware-mixed-trust-datastore',
+		capabilities: { datastoreAncestor: true, select: true },
+		get: async (_model, id) => makeTrustedPartialRow(Number(id), 'trusted get'),
+		getMany: async (_model, ids) => ids.map((id) => makeTrustedPartialRow(Number(id), `trusted ${String(id)}`)),
+		query: async () => ({ list: [makeTrustedPartialRow(1, 'trusted query')], more: false, count: 1 }),
+		create: async () => undefined,
+		update: async () => undefined,
+		delete: async () => undefined
+	};
+	markStoreTrustsDatastoreEntityKeyRows(rawTrustedStore);
+
+	const shortCircuitStore = createStoreMiddlewareAdapter(rawTrustedStore, [
+		async (operation, next) => {
+			if (operation.operation === 'get') return makeForgedFullRow(10, 'forged get');
+			if (operation.operation === 'getMany') {
+				const trusted = await next();
+				return [trusted[0], makeForgedFullRow(11, 'forged getMany')];
+			}
+			if (operation.operation === 'query') {
+				const trusted = await next();
+				return { list: [...trusted.list, makeForgedFullRow(12, 'forged query')], more: false };
+			}
+			return await next();
+		}
+	]);
+
+	const got = await shortCircuitStore.get(meta, 10, { meta: { datastoreAncestor: scopedAncestor } });
+	assert.deepEqual(got, { id: 10, parentId: 10, value: 'forged get' });
+	assert.equal(Object.getOwnPropertyDescriptor(got, ACTIVE_TS_ENTITY_KEY), undefined);
+
+	const gotMany = await shortCircuitStore.getMany(meta, [1, 11], { meta: { datastoreAncestor: scopedAncestor } });
+	assert.deepEqual(gotMany, [
+		{ id: 1, value: 'trusted 1' },
+		{ id: 11, parentId: 10, value: 'forged getMany' }
+	]);
+	assert.deepEqual((gotMany[0] as any)[ACTIVE_TS_ENTITY_KEY], datastoreKey(meta.name, 1, { parent: scopedAncestor }));
+	assert.equal(Object.getOwnPropertyDescriptor(gotMany[1], ACTIVE_TS_ENTITY_KEY), undefined);
+
+	const queried = await shortCircuitStore.query(meta, {
+		where: [],
+		or: [],
+		sort: [],
+		include: [],
+		meta: { datastoreAncestor: scopedAncestor }
+	});
+	assert.deepEqual(queried.list, [
+		{ id: 1, value: 'trusted query' },
+		{ id: 12, parentId: 10, value: 'forged query' }
+	]);
+	assert.deepEqual((queried.list[0] as any)[ACTIVE_TS_ENTITY_KEY], datastoreKey(meta.name, 1, { parent: scopedAncestor }));
+	assert.equal(Object.getOwnPropertyDescriptor(queried.list[1], ACTIVE_TS_ENTITY_KEY), undefined);
+
+	// Forged key must not leak through a trusting middleware wrapper into ActiveContext/Model.
+	const context = createActiveTs({ stores: { default: shortCircuitStore } });
+	const contextRow = await context.store('default').get(meta, 10, { meta: { datastoreAncestor: scopedAncestor } });
+	assert.equal(Object.getOwnPropertyDescriptor(contextRow, ACTIVE_TS_ENTITY_KEY), undefined);
+
+	// Short-circuited partial rows carrying untrusted entity keys must still be rejected.
+	const partialForgeStore = createStoreMiddlewareAdapter(rawTrustedStore, [
+		async (operation) => {
+			if (operation.operation === 'get') return makeForgedPartialRow(20, 'forged partial get');
+			if (operation.operation === 'getMany') return [makeForgedPartialRow(20, 'forged partial getMany')];
+			return { list: [makeForgedPartialRow(20, 'forged partial query')], more: false };
+		}
+	]);
+	await assert.rejects(
+		() => partialForgeStore.get(meta, 20, { meta: { datastoreAncestor: scopedAncestor } }),
+		/partial Datastore row cannot use untrusted active-ts entity key metadata/
+	);
+	await assert.rejects(
+		() => partialForgeStore.getMany(meta, [20], { meta: { datastoreAncestor: scopedAncestor } }),
+		/partial Datastore row cannot use untrusted active-ts entity key metadata/
+	);
+	await assert.rejects(
+		() => partialForgeStore.query(meta, {
+			where: [],
+			or: [],
+			sort: [],
+			include: [],
+			meta: { datastoreAncestor: scopedAncestor }
+		}),
+		/partial Datastore row cannot use untrusted active-ts entity key metadata/
+	);
 });

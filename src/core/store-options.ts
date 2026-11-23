@@ -568,20 +568,25 @@ export function assertStoreDataHasModelId(
 	return rowId;
 }
 
-export function normalizeStoreQueryResult(
+function normalizeStoreQueryResultWithTrust(
 	value: unknown,
 	context: string,
 	options: StoreQueryResultOptions = {}
-): QueryResult {
+): { result: QueryResult; trustedEntityKeys: boolean[] } {
 	const record = assertPlainRecord(value, `${context} result`);
 	assertKnownOptionKeys(record, STORE_QUERY_RESULT_KEYS, `${context} result`);
 	const list = ownOptionValue(record, 'list');
 	if (!Array.isArray(list)) throw new ActiveTsValidationError(`${context} result.list must be an array.`);
 	const safeInput = snapshotArrayInput(list, `${context} result.list`);
 	const safeList: QueryResult['list'] = [];
+	const trustedEntityKeys: boolean[] = [];
 	for (let index = 0; index < safeInput.length; index++) {
 		const item = safeInput[index];
 		assertPlainDataObject(item, `${context} result.list[${index}]`);
+		trustedEntityKeys[index] = datastoreRowTrustsEntityKey(
+			item as Record<string, unknown>,
+			options.trustedDatastoreEntityKeys
+		);
 		safeList[index] = cloneSafeData(item);
 	}
 	const cursor = assertSafeCursor(ownOptionValue(record, 'cursor'), `${context} result cursor`);
@@ -599,7 +604,18 @@ export function normalizeStoreQueryResult(
 	if (total !== undefined && total < safeList.length) {
 		throw new ActiveTsValidationError(`${context} result.total cannot be smaller than result.list length.`);
 	}
-	return { list: safeList, cursor, more, count: safeList.length, total };
+	return {
+		result: { list: safeList, cursor, more, count: safeList.length, total },
+		trustedEntityKeys
+	};
+}
+
+export function normalizeStoreQueryResult(
+	value: unknown,
+	context: string,
+	options: StoreQueryResultOptions = {}
+): QueryResult {
+	return normalizeStoreQueryResultWithTrust(value, context, options).result;
 }
 
 export function normalizeStoreQueryResultForModel(
@@ -608,7 +624,7 @@ export function normalizeStoreQueryResultForModel(
 	context: string,
 	options: StoreQueryResultOptions = {}
 ): QueryResult {
-	const result = normalizeStoreQueryResult(value, context, options);
+	const { result, trustedEntityKeys } = normalizeStoreQueryResultWithTrust(value, context, options);
 	const ids = new Set<string>();
 	const scopedDatastoreAncestor = options.datastoreAncestor === undefined
 		? undefined
@@ -634,7 +650,7 @@ export function normalizeStoreQueryResultForModel(
 				scopedDatastoreAncestor,
 				options.datastoreNamespace,
 				result.list[index],
-				datastoreRowTrustsEntityKey(result.list[index], options.trustedDatastoreEntityKeys),
+				trustedEntityKeys[index],
 				`${context} result.list[${index}]`
 			);
 			if (trustedEntityKey.hasEntityKey && !trustedEntityKey.trusted && !canResolvePayloadAncestor) {
@@ -855,8 +871,13 @@ function datastoreDecodedPayloadRoundTrips(
 	encodedData: Record<string, unknown>,
 	decodedData: Record<string, unknown>
 ) {
+	const ancestorFields = model.datastore?.ancestorFields;
 	try {
-		const reencodedData = applyFieldCodecs(model, decodedData, 'write');
+		const reencodedData = ancestorFields === undefined
+			? applyFieldCodecs(model, decodedData, 'write')
+			: ancestorFields.length === 0
+				? decodedData
+				: applyFieldCodecsForFields(model, decodedData, ancestorFields, 'write');
 		return isDeepStrictEqual(reencodedData, encodedData);
 	} catch {
 		return false;
