@@ -2895,6 +2895,8 @@ test('PostgreSQL transactions reject caught statement failures before commit', a
 
 test('PostgreSQL transactions reject rollback command results from commit', async () => {
 	const calls: string[] = [];
+	const deferred: string[] = [];
+	const releaseArgs: unknown[] = [];
 	const client = {
 		query: async (text: string) => {
 			calls[calls.length] = text;
@@ -2904,7 +2906,8 @@ test('PostgreSQL transactions reject rollback command results from commit', asyn
 				command: text === 'commit' ? 'ROLLBACK' : text.toUpperCase()
 			};
 		},
-		release() {
+		release(error?: unknown) {
+			releaseArgs.push(error);
 			calls[calls.length] = 'release';
 		}
 	};
@@ -2914,12 +2917,204 @@ test('PostgreSQL transactions reject rollback command results from commit', asyn
 			connect: async () => client
 		}
 	});
+	const context = createActiveTs({ stores: { default: adapter } });
 
-	await assert.rejects(
-		() => adapter.transaction!(async () => 'must-not-commit'),
-		/commit returned command "ROLLBACK" instead of "COMMIT"/
-	);
-	assert.deepEqual(calls, ['begin', 'commit', 'rollback', 'release']);
+	const outcome = await context.transactionResult(async (tx) => {
+		await tx.afterCommit(() => {
+			deferred.push('commit');
+		});
+		await tx.afterRollback(() => {
+			deferred.push('rollback');
+		});
+		return 'must-not-commit';
+	});
+	assert.equal(outcome.outcome, 'not_committed');
+	assert.ok(outcome.error instanceof ActiveTsConfigurationError);
+	assert.match(outcome.error.message, /commit returned command "ROLLBACK" instead of "COMMIT"/);
+	assert.deepEqual(calls, ['begin', 'commit', 'release']);
+	assert.deepEqual(deferred, ['rollback']);
+	assert.deepEqual(releaseArgs, [undefined]);
+});
+
+test('PostgreSQL definitive commit SQLSTATE errors confirm rollback without discarding clients', async () => {
+	for (const code of ['40000', '40001', '40002', '40P01', '23503', '23514', '25P02']) {
+		const calls: string[] = [];
+		const deferred: string[] = [];
+		const releaseArgs: unknown[] = [];
+		const commitError = Object.assign(new Error(`commit rolled back (${code})`), { code });
+		const client = {
+			query: async (text: string) => {
+				calls.push(text);
+				if (text === 'commit') throw commitError;
+				return { rows: [], rowCount: 0, command: text.toUpperCase() };
+			},
+			release(error?: unknown) {
+				releaseArgs.push(error);
+				calls.push('release');
+			}
+		};
+		const adapter = await createPostgresStoreAdapter({
+			pool: {
+				query: async () => ({ rows: [], rowCount: 0 }),
+				connect: async () => client
+			}
+		});
+		const context = createActiveTs({ stores: { default: adapter } });
+
+		const outcome = await context.transactionResult(async (tx) => {
+			await tx.afterCommit(() => {
+				deferred.push('commit');
+			});
+			await tx.afterRollback(() => {
+				deferred.push('rollback');
+			});
+			return 'rolled-back';
+		});
+		assert.equal(outcome.outcome, 'not_committed', `SQLSTATE ${code} should confirm rollback`);
+		assert.equal(outcome.error, commitError, `SQLSTATE ${code} should preserve the PostgreSQL error`);
+		assert.equal((outcome.error as any).code, code);
+		assert.deepEqual(calls, ['begin', 'commit', 'release']);
+		assert.deepEqual(deferred, ['rollback']);
+		assert.deepEqual(releaseArgs, [undefined]);
+	}
+});
+
+test('PostgreSQL deferred unique constraint commit errors map 23505 to conflict and confirm rollback', async () => {
+	const calls: string[] = [];
+	const deferred: string[] = [];
+	const releaseArgs: unknown[] = [];
+	const commitError = Object.assign(new Error('deferred unique constraint violated'), { code: '23505' });
+	const client = {
+		query: async (text: string) => {
+			calls.push(text);
+			if (text === 'commit') throw commitError;
+			return { rows: [], rowCount: 0, command: text.toUpperCase() };
+		},
+		release(error?: unknown) {
+			releaseArgs.push(error);
+			calls.push('release');
+		}
+	};
+	const adapter = await createPostgresStoreAdapter({
+		pool: {
+			query: async () => ({ rows: [], rowCount: 0 }),
+			connect: async () => client
+		}
+	});
+	const context = createActiveTs({ stores: { default: adapter } });
+
+	const outcome = await context.transactionResult(async (tx) => {
+		await tx.afterCommit(() => {
+			deferred.push('commit');
+		});
+		await tx.afterRollback(() => {
+			deferred.push('rollback');
+		});
+		return 'deferred-conflict';
+	});
+	assert.equal(outcome.outcome, 'not_committed');
+	assert.ok(outcome.error instanceof ActiveTsConflictError);
+	assert.match(outcome.error.message, /unique constraint conflict/);
+	assert.equal(outcome.error.cause, commitError);
+	assert.deepEqual(calls, ['begin', 'commit', 'release']);
+	assert.deepEqual(deferred, ['rollback']);
+	assert.deepEqual(releaseArgs, [undefined]);
+});
+
+test('PostgreSQL ambiguous commit SQLSTATE and forged codes remain unknown outcomes', async () => {
+	for (const code of ['08006', '08007', '40003', '25P03', '53200', '57014', '57P01', '58030', 'XX000', 'ECONNRESET', '2350']) {
+		const calls: string[] = [];
+		const deferred: string[] = [];
+		let releasedWith: unknown;
+		const commitError = Object.assign(new Error(`ambiguous commit error (${code})`), { code });
+		const client = {
+			query: async (text: string) => {
+				calls.push(text);
+				if (text === 'commit') throw commitError;
+				return { rows: [], rowCount: 0, command: text.toUpperCase() };
+			},
+			release(error?: unknown) {
+				releasedWith = error;
+				calls.push('release');
+			}
+		};
+		const adapter = await createPostgresStoreAdapter({
+			pool: {
+				query: async () => ({ rows: [], rowCount: 0 }),
+				connect: async () => client
+			}
+		});
+		const context = createActiveTs({ stores: { default: adapter } });
+
+		const outcome = await context.transactionResult(async (tx) => {
+			await tx.afterCommit(() => {
+				deferred.push('commit');
+			});
+			await tx.afterRollback(() => {
+				deferred.push('rollback');
+			});
+			return 'ambiguous';
+		});
+		assert.equal(outcome.outcome, 'unknown', `code ${code} must remain unknown`);
+		assert.ok(outcome.error instanceof ActiveTsUnknownTransactionOutcomeError);
+		assert.equal(outcome.error.phase, 'commit');
+		assert.equal(outcome.error.cause, commitError);
+		assert.equal(releasedWith, outcome.error);
+		assert.deepEqual(calls, ['begin', 'commit', 'release']);
+		assert.deepEqual(deferred, []);
+	}
+
+	let getterCalls = 0;
+	const accessorCommitError = Object.defineProperty(new Error('accessor commit failure'), 'code', {
+		enumerable: true,
+		get() {
+			getterCalls++;
+			return '40001';
+		}
+	});
+	const inheritedCommitError = new Error('inherited code commit failure');
+	let currentError: unknown = accessorCommitError;
+	let releasedWith: unknown;
+	const adapter = await createPostgresStoreAdapter({
+		pool: {
+			query: async () => ({ rows: [], rowCount: 0 }),
+			connect: async () => ({
+				query: async (text: string) => {
+					if (text === 'commit') throw currentError;
+					return { rows: [], rowCount: 0, command: text.toUpperCase() };
+				},
+				release(error?: unknown) {
+					releasedWith = error;
+				}
+			})
+		}
+	});
+
+	await assert.rejects(() => adapter.transaction!(async () => 'accessor'), (error: unknown) => {
+		assert.ok(error instanceof ActiveTsUnknownTransactionOutcomeError);
+		assert.equal(error.phase, 'commit');
+		assert.equal(error.cause, accessorCommitError);
+		assert.equal(releasedWith, error);
+		return true;
+	});
+	assert.equal(getterCalls, 0);
+
+	Object.defineProperty(Object.prototype, 'code', {
+		value: '40001',
+		configurable: true
+	});
+	try {
+		currentError = inheritedCommitError;
+		await assert.rejects(() => adapter.transaction!(async () => 'inherited'), (error: unknown) => {
+			assert.ok(error instanceof ActiveTsUnknownTransactionOutcomeError);
+			assert.equal(error.phase, 'commit');
+			assert.equal(error.cause, inheritedCommitError);
+			assert.equal(releasedWith, error);
+			return true;
+		});
+	} finally {
+		delete (Object.prototype as Record<string, unknown>).code;
+	}
 });
 
 test('PostgreSQL transactions reject malformed commit results', async () => {

@@ -102,6 +102,13 @@ const POSTGRES_OPERATORS = capturedSet(['=', '!=', '>', '>=', '<', '<=', 'in', '
 const POSTGRES_IDENTIFIER_MAX_BYTES = 63;
 const POSTGRES_NATIVE_SQL_KEYS = ['text', 'values'] as const;
 const POSTGRES_CAST_ERROR_CODES = capturedSet(['22003', '22007', '22008', '22P02']);
+const POSTGRES_DEFINITE_COMMIT_ROLLBACK_CODES = capturedSet([
+	'25P02',
+	'40000',
+	'40001',
+	'40002',
+	'40P01'
+]);
 const PROMISE_THEN = Promise.prototype.then;
 
 function capturedSet<T>(values: readonly T[]) {
@@ -1322,6 +1329,13 @@ function postgresConflictError(message: string, cause: unknown) {
 	return conflict;
 }
 
+function isPostgresDefiniteCommitRollbackError(error: unknown) {
+	const code = postgresErrorCode(error);
+	if (code === undefined) return false;
+	if (SET_HAS.call(POSTGRES_DEFINITE_COMMIT_ROLLBACK_CODES, code)) return true;
+	return /^23[0-9A-Z]{3}$/.test(code);
+}
+
 function mapPostgresTypedJsonCastError(error: unknown, context: string): never {
 	if (SET_HAS.call(POSTGRES_CAST_ERROR_CODES, postgresErrorCode(error) ?? '')) {
 		throw new ActiveTsValidationError(
@@ -1903,7 +1917,21 @@ async function createPostgresStoreAdapterInternal(
 					throw error;
 				}
 				commitDispatched = true;
-				const commitResult = await client.query('commit');
+				let commitResult: unknown;
+				try {
+					commitResult = await client.query('commit');
+				} catch (commitError) {
+					if (isPostgresDefiniteCommitRollbackError(commitError)) {
+						rollbackConfirmed = true;
+						if (postgresErrorCode(commitError) === '23505') {
+							throw postgresConflictError(
+								`PostgreSQL transaction commit failed due to a unique constraint conflict: ${safeErrorMessage(commitError)}`,
+								commitError
+							);
+						}
+					}
+					throw commitError;
+				}
 				if (!commitResult || typeof commitResult !== 'object' || Array.isArray(commitResult)) {
 					throw new ActiveTsConfigurationError('PostgreSQL transaction commit result must be an object.');
 				}
@@ -1924,14 +1952,18 @@ async function createPostgresStoreAdapterInternal(
 			} catch (error) {
 				hasPrimaryError = true;
 				primaryError = error;
-				if (commitDispatched && !rollbackConfirmed) {
-					const uncertain = new ActiveTsUnknownTransactionOutcomeError(
-						`PostgreSQL transaction commit outcome is unknown: ${safeErrorMessage(error)}`,
-						'commit',
-						error
-					);
-					primaryError = markTransactionRollbackSkipped(uncertain);
-					discardClient = true;
+				if (commitDispatched) {
+					if (rollbackConfirmed) {
+						confirmTransactionRollback(fn);
+					} else {
+						const uncertain = new ActiveTsUnknownTransactionOutcomeError(
+							`PostgreSQL transaction commit outcome is unknown: ${safeErrorMessage(error)}`,
+							'commit',
+							error
+						);
+						primaryError = markTransactionRollbackSkipped(uncertain);
+						discardClient = true;
+					}
 				} else {
 					try {
 						await client.query('rollback');
