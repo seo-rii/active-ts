@@ -300,6 +300,9 @@ export type AesGcmCacheCodecOptions = {
 	randomBytes?: (size: number) => Buffer | Uint8Array;
 };
 const AES_GCM_OPTION_KEYS = ['key', 'version', 'aad', 'randomBytes'] as const;
+const AES_GCM_IV_BYTES = 12;
+const AES_GCM_AUTH_TAG_BYTES = 16;
+const BASE64URL_SEGMENT = /^[A-Za-z0-9_-]+$/;
 
 export function createAesGcmCacheCodec(options: AesGcmCacheCodecOptions): CacheCodec<string | Buffer> {
 	options = normalizeAesGcmOptions(options);
@@ -313,9 +316,11 @@ export function createAesGcmCacheCodec(options: AesGcmCacheCodecOptions): CacheC
 		encode(value, context) {
 			const contextKey = normalizeAesContextKey(context, 'AES-GCM cache codec encode context');
 			assertCacheableValue(value);
-			const iv = normalizeBytes(random(12), 'AES-GCM cache codec IV');
-			if (iv.length !== 12) throw new ActiveTsValidationError('AES-GCM cache codec IV must be exactly 12 bytes.');
-			const cipher = createCipheriv('aes-256-gcm', key, iv);
+			const iv = normalizeBytes(random(AES_GCM_IV_BYTES), 'AES-GCM cache codec IV');
+			if (iv.length !== AES_GCM_IV_BYTES) {
+				throw new ActiveTsValidationError('AES-GCM cache codec IV must be exactly 12 bytes.');
+			}
+			const cipher = createCipheriv('aes-256-gcm', key, iv, { authTagLength: AES_GCM_AUTH_TAG_BYTES });
 			cipher.setAAD(aadForKey(contextKey, aad));
 			const plaintext = Buffer.from(JSON_STRINGIFY(snapshotAesGcmJson(value)), 'utf8');
 			const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
@@ -336,12 +341,24 @@ export function createAesGcmCacheCodec(options: AesGcmCacheCodecOptions): CacheC
 			if (valueVersion !== version || !iv || !tag || !ciphertext) {
 				throw new ActiveTsValidationError(`Unsupported cache codec payload version "${valueVersion}".`);
 			}
+			const ivBuf = decodeCanonicalBase64Url(iv);
+			const tagBuf = decodeCanonicalBase64Url(tag);
+			const ciphertextBuf = decodeCanonicalBase64Url(ciphertext);
+			if (
+				!ivBuf ||
+				ivBuf.length !== AES_GCM_IV_BYTES ||
+				!tagBuf ||
+				tagBuf.length !== AES_GCM_AUTH_TAG_BYTES ||
+				!ciphertextBuf
+			) {
+				throw new ActiveTsValidationError('Failed to decode AES-GCM cache codec payload.');
+			}
 			try {
-				const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(iv, 'base64url'));
+				const decipher = createDecipheriv('aes-256-gcm', key, ivBuf, { authTagLength: AES_GCM_AUTH_TAG_BYTES });
 				decipher.setAAD(aadForKey(contextKey, aad));
-				decipher.setAuthTag(Buffer.from(tag, 'base64url'));
+				decipher.setAuthTag(tagBuf);
 				const plaintext = Buffer.concat([
-					decipher.update(Buffer.from(ciphertext, 'base64url')),
+					decipher.update(ciphertextBuf),
 					decipher.final()
 				]);
 				const decoded = JSON_PARSE(plaintext.toString('utf8'));
@@ -353,6 +370,13 @@ export function createAesGcmCacheCodec(options: AesGcmCacheCodecOptions): CacheC
 			}
 		}
 	};
+}
+
+function decodeCanonicalBase64Url(value: string): Buffer | undefined {
+	if (!BASE64URL_SEGMENT.test(value) || value.length % 4 === 1) return undefined;
+	const bytes = Buffer.from(value, 'base64url');
+	if (!bytes.length || bytes.toString('base64url') !== value) return undefined;
+	return bytes;
 }
 
 function snapshotAesGcmJson(value: unknown, path = '$', seen = new WeakSet<object>()): unknown {
