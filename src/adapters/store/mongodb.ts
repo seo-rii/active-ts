@@ -72,7 +72,6 @@ import type {
 	StoreAdapter,
 	StoreTransactionOptions
 } from '../../core/types.js';
-import type { TransactionOptions as MongoDriverTransactionOptions } from 'mongodb';
 import escapeStringRegexp from 'escape-string-regexp';
 
 export type MongoStoreOptions = {
@@ -93,10 +92,44 @@ const MONGO_READ_CONCERN_KEYS = ['level'] as const;
 const MONGO_WRITE_CONCERN_KEYS = ['w', 'journal', 'wtimeoutMS', 'wtimeout', 'j', 'fsync'] as const;
 const MONGO_READ_PREFERENCE_KEYS = ['mode', 'tags', 'hedge', 'maxStalenessSeconds'] as const;
 
-export type MongoTransactionNativeOptions = Pick<
-	MongoDriverTransactionOptions,
-	'readConcern' | 'writeConcern' | 'readPreference' | 'maxCommitTimeMS'
->;
+export type MongoReadConcernLevel = 'local' | 'majority' | 'linearizable' | 'available' | 'snapshot';
+
+export type MongoReadConcernOption =
+	| MongoReadConcernLevel
+	| { level: MongoReadConcernLevel }
+	| { level: MongoReadConcernLevel | string; toJSON(): Record<string, any> };
+
+export type MongoWriteConcernOption = {
+	readonly w?: number | 'majority';
+	readonly journal?: boolean;
+	readonly wtimeoutMS?: number;
+	wtimeout?: number;
+	j?: boolean;
+	fsync?: boolean | 1;
+};
+
+export type MongoReadPreferenceMode =
+	| 'primary'
+	| 'primaryPreferred'
+	| 'secondary'
+	| 'secondaryPreferred'
+	| 'nearest';
+
+export type MongoReadPreferenceOption =
+	| MongoReadPreferenceMode
+	| {
+		mode: MongoReadPreferenceMode;
+		tags?: ReadonlyArray<Record<string, string>>;
+		hedge?: { enabled?: boolean };
+		maxStalenessSeconds?: number;
+	};
+
+export type MongoTransactionNativeOptions = {
+	readConcern?: MongoReadConcernOption;
+	writeConcern?: MongoWriteConcernOption;
+	readPreference?: MongoReadPreferenceOption;
+	maxCommitTimeMS?: number;
+};
 
 export type MongoStoreTransactionOptions = Omit<StoreTransactionOptions, 'isolation' | 'native'> & {
 	isolation?: never;
@@ -332,11 +365,19 @@ function aggregateFields(specs: readonly AggregateSpec[]) {
 // Public aliases beginning with __ are rejected by aggregate plan validation.
 const MONGO_AGGREGATE_ID_ALIAS = '__activeTsResult_id';
 
+function assertSafeMongoAggregateAlias(alias: string) {
+	if (alias.startsWith('$') || alias.includes('.') || alias.includes('\0')) {
+		throw new ActiveTsValidationError(`MongoDB aggregate alias "${alias}" is not allowed.`);
+	}
+	return alias;
+}
+
 function mongoAggregateGroup(specs: readonly AggregateSpec[], invalidAliases: Map<string, AggregateSpec>) {
 	const group: Record<string, unknown> = { _id: null };
 	for (let index = 0; index < specs.length; index++) {
 		const spec = specs[index];
-		defineDataProperty(group, spec.as === '_id' ? MONGO_AGGREGATE_ID_ALIAS : spec.as, aggregateExpression(spec), {
+		const alias = assertSafeMongoAggregateAlias(spec.as);
+		defineDataProperty(group, alias === '_id' ? MONGO_AGGREGATE_ID_ALIAS : alias, aggregateExpression(spec), {
 			enumerable: true,
 			configurable: true,
 			writable: true
@@ -480,7 +521,7 @@ function numericAggregateInvalidExpression(spec: AggregateSpec) {
 			$cond: [
 				{
 					$and: [
-						{ $ne: [field, null] },
+						{ $ne: [{ $ifNull: [field, null] }, null] },
 						{ $not: [{ $isNumber: field }] }
 					]
 				},
@@ -711,6 +752,9 @@ export async function createMongoStoreAdapter(options: MongoStoreOptions): Promi
 				const specs = assertAggregateSpecsCompatibleWithModel(model, plan.aggregates, 'MongoDB aggregate');
 				assertNoAggregateFieldCodecSpecs(model, specs, 'MongoDB aggregate');
 				const native = assertMongoNativeFunction(plan);
+				if (!native) {
+					for (const spec of specs) assertSafeMongoAggregateAlias(spec.as);
+				}
 				return runMongoOperation(transactionState, async () => {
 					if (native) return normalizeStoreAggregateResult(
 						await native({ db, collection: collection(model), model, plan }),
@@ -801,11 +845,21 @@ export async function createMongoStoreAdapter(options: MongoStoreOptions): Promi
 				const document = documentFor(model, id, data);
 				return runMongoOperation(transactionState, async () => {
 					const coll = collection(model);
-					const res = await mongoMethod(coll, 'replaceOne', 'MongoDB collection.replaceOne')(
-						filter,
-						document,
-						mongoSessionOptions(transactionState, { upsert: false })
-					);
+					let res: unknown;
+					try {
+						res = await mongoMethod(coll, 'replaceOne', 'MongoDB collection.replaceOne')(
+							filter,
+							document,
+							mongoSessionOptions(transactionState, { upsert: false })
+						);
+					} catch (error) {
+						if (mongoErrorCode(error) === 11000) {
+							throw new ActiveTsConflictError(
+								`Cannot update ${model.name}:${String(id)} because it conflicts with a unique index.`
+							);
+						}
+						throw error;
+					}
 					const matchedCount = mongoMatchedCount(res, 'MongoDB replaceOne');
 					if (matchedCount === 0 && options.expectedVersion !== undefined) {
 						if (!await documentExists(model, id)) {
