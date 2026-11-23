@@ -32,13 +32,21 @@ const TYPED_ARRAY_BYTE_LENGTH = Object.getOwnPropertyDescriptor(
 const VERSION_TOMBSTONE_TTL_SECONDS = 24 * 60 * 60;
 const VERSIONED_GET_SCRIPT = `
 local value = redis.call('GET', KEYS[1])
+local valueTtl = -2
+if value then
+  valueTtl = redis.call('PTTL', KEYS[1])
+  if valueTtl <= -2 then
+    value = false
+  end
+end
 local version = redis.call('GET', KEYS[2])
 if not version then
   version = ARGV[1]
   if value then
-    local valueTtl = redis.call('PTTL', KEYS[1])
-    if valueTtl >= 0 then
+    if valueTtl > 0 then
       redis.call('SET', KEYS[2], version, 'PX', valueTtl)
+    elseif valueTtl == 0 then
+      redis.call('SET', KEYS[2], version, 'PX', 1)
     else
       redis.call('SET', KEYS[2], version)
     end
@@ -46,9 +54,10 @@ if not version then
     redis.call('SET', KEYS[2], version, 'EX', ARGV[2])
   end
 elseif value then
-  local valueTtl = redis.call('PTTL', KEYS[1])
-  if valueTtl >= 0 then
+  if valueTtl > 0 then
     redis.call('PEXPIRE', KEYS[2], valueTtl)
+  elseif valueTtl == 0 then
+    redis.call('PEXPIRE', KEYS[2], 1)
   else
     redis.call('PERSIST', KEYS[2])
   end
@@ -59,19 +68,19 @@ return { value, version }
 `;
 const VERSIONED_SET_SCRIPT = `
 local version = redis.call('GET', KEYS[2])
+local replacement = ARGV[4]
+if replacement == ARGV[1] then replacement = replacement .. ':rotated' end
 if not version then
-  local replacement = ARGV[4]
-  if replacement == ARGV[1] then replacement = replacement .. ':rotated' end
   redis.call('SET', KEYS[2], replacement, 'EX', ARGV[5])
   return 0
 end
 if version ~= ARGV[1] then return 0 end
 if ARGV[3] == '' then
   redis.call('SET', KEYS[1], ARGV[2])
-  redis.call('SET', KEYS[2], version)
+  redis.call('SET', KEYS[2], replacement)
 else
   redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
-  redis.call('SET', KEYS[2], version, 'EX', ARGV[3])
+  redis.call('SET', KEYS[2], replacement, 'EX', ARGV[3])
 end
 return 1
 `;
