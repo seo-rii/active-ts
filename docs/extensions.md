@@ -637,6 +637,14 @@ write. Adapters that cannot provide an atomic compare-and-set must declare
 `optimisticLock: false`, and active-ts fails fast instead of presenting a
 best-effort lock.
 
+Datastore supports it when the injected client exposes `transaction()`. A
+version-checked `update()` or `delete()` outside a transaction runs in its own
+read-write transaction: it reads the entity, compares `version`, and commits the
+write. A concurrent change after that read aborts the commit, which is reported
+as `ActiveTsConflictError`. Inside a transaction the comparison uses the
+transaction's own read, or the row it already wrote. Each such save costs a
+BeginTransaction, Lookup and Commit instead of one Commit.
+
 ## Function Cache Singleflight
 
 Function caches coalesce concurrent misses for the same key by default. Set

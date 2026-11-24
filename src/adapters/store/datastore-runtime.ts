@@ -407,6 +407,29 @@ type DatastoreTransactionFactory = (options?: { readOnly?: boolean }) => unknown
 type DatastoreTransactionMutation =
 	| { operation: 'create' | 'update'; model: ResolvedModelMeta; id: EntityId; data: any; options: StoreWriteOptions }
 	| { operation: 'delete'; model: ResolvedModelMeta; id: EntityId; options: StoreWriteOptions; existed: boolean };
+
+function datastoreVersionMatches(row: unknown, expectedVersion: number) {
+	return (
+		!!row &&
+		typeof row === 'object' &&
+		Object.prototype.hasOwnProperty.call(row, 'version') &&
+		(row as { version?: unknown }).version === expectedVersion
+	);
+}
+
+function datastoreOptimisticLockConflict(model: ResolvedModelMeta, id: EntityId, expectedVersion: number) {
+	return new ActiveTsConflictError(
+		`Optimistic lock failed for ${model.name}:${String(id)}. Expected version ${expectedVersion}.`
+	);
+}
+
+// The buffered transaction has already compared the version against its own
+// read. Replaying the mutation into the SDK transaction must not repeat it.
+function withoutExpectedVersion(options: StoreWriteOptions): StoreWriteOptions {
+	if (options.expectedVersion === undefined) return options;
+	const { expectedVersion: _checked, ...rest } = options;
+	return rest;
+}
 const DATASTORE_OPTION_KEYS = [
 	'client',
 	'datastoreOptions',
@@ -1661,6 +1684,22 @@ function createDatastoreAdapter(
 	};
 
 	const adapterNamespace = options.namespace;
+	// A version-checked write outside a transaction runs in its own read-write
+	// transaction. The version read and the write commit together; a concurrent
+	// change aborts the commit, which the transaction reports as a conflict.
+	const runOptimisticDatastoreWrite = async (
+		operation: 'write' | 'delete',
+		write: (tx: StoreAdapter) => Promise<unknown>
+	): Promise<void> => {
+		if (scopedTransaction || !adapter.transaction) {
+			throw new ActiveTsConfigurationError(
+				`Datastore store ${operation} options does not support expectedVersion without client.transaction().`
+			);
+		}
+		await adapter.transaction(async (tx) => {
+			await write(tx);
+		});
+	};
 	const adapter: StoreAdapter = {
 		kind: 'datastore',
 		cacheScope: options.cacheScope,
@@ -1686,7 +1725,8 @@ function createDatastoreAdapter(
 			transactionConflictDetection: transactionFactory !== undefined,
 			savepoint: false,
 			uniqueIndex: false,
-			optimisticLock: false,
+			// Version-checked writes run in a read-write transaction, so they need one.
+			optimisticLock: transactionFactory !== undefined && !scopedTransaction,
 			nullOperators: true,
 			missingFieldNulls: true,
 			native: true,
@@ -1910,7 +1950,7 @@ function createDatastoreAdapter(
 							path[path.length] = { kind: kindName(model), id };
 							return datastoreKeyIdentity({ path, namespace: ancestor?.namespace ?? options.namespace });
 						};
-						const transactionEntityExists = async (
+						const transactionEntityRow = async (
 							model: ResolvedModelMeta,
 							id: EntityId,
 							data: any,
@@ -1944,8 +1984,15 @@ function createDatastoreAdapter(
 								adapterNamespace,
 								data !== undefined,
 								keyEncoding
-							) !== null;
+							);
 						};
+						const transactionEntityExists = async (
+							model: ResolvedModelMeta,
+							id: EntityId,
+							data: any,
+							ancestorOverride: DatastoreAncestorOverride,
+							context: string
+						) => (await transactionEntityRow(model, id, data, ancestorOverride, context)) !== null;
 						const transactionBufferedRow = (
 							mutation: DatastoreTransactionMutation | undefined,
 							context: string
@@ -2158,7 +2205,7 @@ function createDatastoreAdapter(
 								: txStore.datastoreDatabaseId,
 							datastoreKeyEncoding: txStore.datastoreKeyEncoding ?? adapter.datastoreKeyEncoding,
 							datastoreCacheScopeStability: txStore.datastoreCacheScopeStability ?? adapter.datastoreCacheScopeStability,
-							capabilities: { ...txStore.capabilities, transaction: false },
+							capabilities: { ...txStore.capabilities, transaction: false, optimisticLock: true },
 							get: async (model, id, readOptions) => {
 								model = snapshotAdapterModel(model, 'Datastore model metadata');
 								const safeReadOptions = normalizeDatastoreReadOptions(readOptions, 'Datastore store read options');
@@ -2546,9 +2593,7 @@ function createDatastoreAdapter(
 							update: async (model, id, data, writeOptions = {}) => {
 								model = snapshotAdapterModel(model, 'Datastore model metadata');
 								const safeOptions = normalizeStoreWriteOptions(writeOptions, 'Datastore store write options');
-								if (safeOptions.expectedVersion !== undefined) {
-									throw new ActiveTsConfigurationError('Datastore store write options does not support expectedVersion.');
-								}
+								const expectedVersion = safeOptions.expectedVersion;
 								const clean = clonePortableDataObject(data, `${model.name} stored data`);
 								assertStoreDataMatchesId(model, id, clean);
 								const ancestor = datastoreAncestorFromWriteOptions(safeOptions);
@@ -2568,16 +2613,23 @@ function createDatastoreAdapter(
 										throw new ActiveTsNotFoundError(`Cannot update ${model.name}:${String(id)} because it does not exist.`);
 									}
 									if (!current) {
-										const existing = await transactionEntityExists(
+										const existing = await transactionEntityRow(
 											model,
 											id,
 											clean,
 											ancestor,
 											`Datastore transaction update ${model.name}:${String(id)}`
 										);
-										if (!existing) {
+										if (existing === null) {
 											throw new ActiveTsNotFoundError(`Cannot update ${model.name}:${String(id)} because it does not exist.`);
 										}
+										// The transaction read is part of the commit's conflict set, so a
+										// concurrent write after this check aborts the commit.
+										if (expectedVersion !== undefined && !datastoreVersionMatches(existing, expectedVersion)) {
+											throw datastoreOptimisticLockConflict(model, id, expectedVersion);
+										}
+									} else if (expectedVersion !== undefined && !datastoreVersionMatches(current.data, expectedVersion)) {
+										throw datastoreOptimisticLockConflict(model, id, expectedVersion);
 									}
 									const bufferedData = cloneSafeDataObjectWithoutActiveEntityKey(clean, `${model.name} stored data`);
 									MAP_SET.call(bufferedMutations, key, {
@@ -2585,42 +2637,55 @@ function createDatastoreAdapter(
 										model,
 										id,
 										data: bufferedData,
-										options: safeOptions
+										options: withoutExpectedVersion(safeOptions)
 									});
 								});
 							},
 							delete: async (model, id, writeOptions = {}) => {
 								model = snapshotAdapterModel(model, 'Datastore model metadata');
 								const safeOptions = normalizeStoreWriteOptions(writeOptions, 'Datastore store delete options');
-								if (safeOptions.expectedVersion !== undefined) {
-									throw new ActiveTsConfigurationError('Datastore store delete options does not support expectedVersion.');
-								}
+								const expectedVersion = safeOptions.expectedVersion;
 								const ancestor = datastoreAncestorFromWriteOptions(safeOptions);
 								assertDatastoreDirectIdReadAllowed(model, ancestor);
 								const key = transactionMutationKey(model, id, undefined, ancestor);
+								const missing = () =>
+									new ActiveTsNotFoundError(`Cannot delete ${model.name}:${String(id)} because it does not exist.`);
 								return serializeBufferedMutation(key, async () => {
 									const current = MAP_GET.call(bufferedMutations, key) as DatastoreTransactionMutation | undefined;
+									if (current?.operation === 'delete') {
+										if (expectedVersion !== undefined) throw missing();
+										return;
+									}
+									if (current && expectedVersion !== undefined && !datastoreVersionMatches(current.data, expectedVersion)) {
+										throw datastoreOptimisticLockConflict(model, id, expectedVersion);
+									}
 									if (current?.operation === 'create') {
 										MAP_DELETE.call(bufferedMutations, key);
 										return;
 									}
-									if (current?.operation === 'delete') return;
 									let existed = true;
 									if (!current) {
-										existed = await transactionEntityExists(
+										const existing = await transactionEntityRow(
 											model,
 											id,
 											undefined,
 											ancestor,
 											`Datastore transaction delete ${model.name}:${String(id)}`
 										);
+										existed = existing !== null;
+										if (expectedVersion !== undefined) {
+											if (!existed) throw missing();
+											if (!datastoreVersionMatches(existing, expectedVersion)) {
+												throw datastoreOptimisticLockConflict(model, id, expectedVersion);
+											}
+										}
 									}
 									if (!current && !existed) return;
 									MAP_SET.call(bufferedMutations, key, {
 										operation: 'delete',
 										model,
 										id,
-										options: safeOptions,
+										options: withoutExpectedVersion(safeOptions),
 										existed
 									});
 								});
@@ -3561,7 +3626,7 @@ function createDatastoreAdapter(
 			model = snapshotAdapterModel(model, 'Datastore model metadata');
 			const safeOptions = normalizeStoreWriteOptions(options, 'Datastore store write options');
 			if (safeOptions.expectedVersion !== undefined) {
-				throw new ActiveTsConfigurationError('Datastore store write options does not support expectedVersion.');
+				return runOptimisticDatastoreWrite('write', (tx) => tx.update(model, id, data, safeOptions));
 			}
 			assertSafeEntityId(id, `${model.name} store id`);
 			const clean = clonePortableDataObject(data, `${model.name} stored data`);
@@ -3593,7 +3658,7 @@ function createDatastoreAdapter(
 			model = snapshotAdapterModel(model, 'Datastore model metadata');
 			const safeOptions = normalizeStoreWriteOptions(options, 'Datastore store delete options');
 			if (safeOptions.expectedVersion !== undefined) {
-				throw new ActiveTsConfigurationError('Datastore store delete options does not support expectedVersion.');
+				return runOptimisticDatastoreWrite('delete', (tx) => tx.delete(model, id, safeOptions));
 			}
 			const ancestor = datastoreAncestorFromWriteOptions(safeOptions);
 			assertDatastoreDirectIdReadAllowed(model, ancestor);

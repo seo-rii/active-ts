@@ -676,6 +676,9 @@ bounded exponential backoff with jitter. The transaction callback can run up to
 external side effects unless the application deduplicates or defers them.
 Definitive commit rejections are returned as ordinary failures, while transport
 errors with an unknowable commit outcome fail closed as unknown outcomes.
+The same transaction support provides `capabilities.optimisticLock`, so models
+with a numeric `version` field can `save()` and `delete()`; see
+[optimistic locking](extensions.md#optimistic-locking).
 Datastore mode databases using
 `OPTIMISTIC_WITH_ENTITY_GROUPS` can set
 `requireAncestorTransactionQueries: true` on `createDatastoreStoreAdapter()` to
