@@ -48,7 +48,7 @@ and the distinction between support and rejection coverage.
 | Aggregate helpers | Yes | Yes | Yes | Conditional | Yes | Yes; scalar metadata for min/max |
 | Transactions | Yes | Requires pool `connect()` | Requires client `startSession()` | Requires SDK `transaction()` | Yes | Yes |
 | Transaction point-read conflict detection | Yes | **No** | With transactions | With transactions | Yes | No |
-| Optimistic `expectedVersion` writes | Yes | Yes | Yes | No | No | Yes |
+| Optimistic `expectedVersion` writes | Yes | Yes | Yes | Requires SDK `transaction()` | No | Yes |
 | Unique schema indexes | No | Yes | Yes | No | No | Yes |
 | Trusted native query payloads | No | Yes | Yes | Yes | Yes | No |
 

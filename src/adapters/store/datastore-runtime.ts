@@ -427,6 +427,9 @@ type DatastoreTransactionMutation =
 	| { operation: 'create' | 'update'; model: ResolvedModelMeta; id: EntityId; data: any; options: StoreWriteOptions }
 	| { operation: 'delete'; model: ResolvedModelMeta; id: EntityId; options: StoreWriteOptions; existed: boolean };
 
+/** Attempts for a version-checked write outside a transaction; ABORTED commits retry. */
+const OPTIMISTIC_WRITE_ATTEMPTS = 3;
+
 function datastoreVersionMatches(row: unknown, expectedVersion: number) {
 	return (
 		!!row &&
@@ -1761,9 +1764,12 @@ function createDatastoreAdapter(
 				`Datastore store ${operation} options does not support expectedVersion without client.transaction().`
 			);
 		}
+		// The callback only reads, compares and buffers one write, so retrying a
+		// definitive ABORTED (contention without a version change) is safe; a retry
+		// that reads a changed version still reports a conflict.
 		await adapter.transaction(async (tx) => {
 			await write(tx);
-		});
+		}, { native: { maxAttempts: OPTIMISTIC_WRITE_ATTEMPTS } });
 	};
 	const adapter: StoreAdapter = {
 		kind: 'datastore',
