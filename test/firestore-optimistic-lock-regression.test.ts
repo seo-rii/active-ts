@@ -46,8 +46,6 @@ function fakeFirestore() {
 	const calls: string[] = [];
 	let revision = 0;
 	let beforeCommit: (() => void) | undefined;
-	// Apply the next commit, then lose its reply with a code the SDK retries.
-	let loseNextCommitReply: (() => void) | undefined;
 	const put = (path: string, data: Record<string, unknown> | undefined) => {
 		if (data === undefined) rows.delete(path);
 		else rows.set(path, clone(data));
@@ -119,14 +117,6 @@ function fakeFirestore() {
 				}
 				for (const apply of writes) apply();
 				calls.push('tx.commit');
-				if (loseNextCommitReply !== undefined) {
-					const beforeRetry = loseNextCommitReply;
-					loseNextCommitReply = undefined;
-					calls.push('tx.reply-lost');
-					beforeRetry();
-					// The SDK retries ambiguous commit failures such as UNAVAILABLE.
-					continue;
-				}
 				return result;
 			}
 			throw Object.assign(new Error('transaction aborted too many times'), { code: 10 });
@@ -140,10 +130,6 @@ function fakeFirestore() {
 		write: (id: number, data: Record<string, unknown>) => put(path(id), data),
 		concurrentlyBeforeCommit(change: () => void) {
 			beforeCommit = change;
-		},
-		/** Apply the next commit, lose its reply, then run `beforeRetry` before the SDK retries. */
-		loseNextCommitReply(beforeRetry: () => void = () => {}) {
-			loseNextCommitReply = beforeRetry;
 		}
 	};
 }
@@ -295,27 +281,17 @@ test('Firestore models with a version field save and delete atomically', async (
 	assert.equal(fake.row(7), undefined);
 });
 
-test('Firestore reports success when a retried attempt finds its own lost commit', async () => {
+test('Firestore keeps version checks exclusive for writers that write identical data', async () => {
 	const fake = fakeFirestore();
 	const store = await createFirestoreStoreAdapter({ client: fake.client });
-	await store.create(meta, 1, { id: 1, title: 'first', version: 1 });
-	fake.calls.length = 0;
-	fake.loseNextCommitReply();
-	await store.update(meta, 1, { id: 1, title: 'second', version: 2 }, { expectedVersion: 1 });
-	assert.deepEqual(fake.row(1), { id: 1, title: 'second', version: 2 });
-	assert.deepEqual(fake.calls, ['tx.get', 'tx.commit', 'tx.reply-lost', 'tx.get', 'tx.commit']);
-
-	// A retry that finds another writer's value after the lost reply is still a conflict.
-	fake.loseNextCommitReply(() => fake.write(1, { id: 1, title: 'other writer', version: 3 }));
+	await store.create(meta, 1, { id: 1, title: 'queued', version: 1 });
+	// Two workers both move the row from version 1 to the same next state. The
+	// first commits while the second's transaction is open; the SDK retries the
+	// second, which must still lose even though the stored data equals its own.
+	fake.concurrentlyBeforeCommit(() => fake.write(1, { id: 1, title: 'running', version: 2 }));
 	await assert.rejects(
-		() => store.update(meta, 1, { id: 1, title: 'third', version: 3 }, { expectedVersion: 2 }),
+		() => store.update(meta, 1, { id: 1, title: 'running', version: 2 }, { expectedVersion: 1 }),
 		ActiveTsConflictError
 	);
-	assert.deepEqual(fake.row(1), { id: 1, title: 'other writer', version: 3 });
-
-	// A retried delete cannot tell its own lost commit from a concurrent delete;
-	// it reports NotFound like a concurrent delete, and the row is gone either way.
-	fake.loseNextCommitReply();
-	await assert.rejects(() => store.delete(meta, 1, { expectedVersion: 3 }), ActiveTsNotFoundError);
-	assert.equal(fake.row(1), undefined);
+	assert.deepEqual(fake.row(1), { id: 1, title: 'running', version: 2 });
 });
