@@ -674,8 +674,11 @@ conflicts; `retryInitialDelayMs`, `retryMaxDelayMs`, and `retryJitter` control
 bounded exponential backoff with jitter. The transaction callback can run up to
 `maxAttempts` times, so it must be idempotent and must not perform irreversible
 external side effects unless the application deduplicates or defers them.
-Definitive commit rejections are returned as ordinary failures, while transport
-errors with an unknowable commit outcome fail closed as unknown outcomes.
+Definitive commit rejections are returned as ordinary failures. Other commit
+failures, such as a lost response, `DEADLINE_EXCEEDED` or `UNAVAILABLE`, may
+have been applied: they raise `ActiveTsUnknownTransactionOutcomeError` with
+`phase === "commit"` and the SDK error in `cause`, and suppress both commit and
+rollback hooks. Firestore reports its unknown commit outcomes the same way.
 Datastore mode databases using
 `OPTIMISTIC_WITH_ENTITY_GROUPS` can set
 `requireAncestorTransactionQueries: true` on `createDatastoreStoreAdapter()` to

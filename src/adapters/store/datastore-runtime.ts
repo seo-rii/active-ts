@@ -6,6 +6,7 @@ import {
 	ActiveTsConfigurationError,
 	ActiveTsConflictError,
 	ActiveTsNotFoundError,
+	ActiveTsUnknownTransactionOutcomeError,
 	ActiveTsValidationError,
 	safeErrorMessage
 } from '../../core/errors.js';
@@ -2684,7 +2685,12 @@ function createDatastoreAdapter(
 								confirmTransactionRollback(fn);
 								throw error;
 							}
-							throw markTransactionRollbackSkipped(error);
+							// The Commit RPC may have been applied (for example, a lost response).
+							throw markTransactionRollbackSkipped(new ActiveTsUnknownTransactionOutcomeError(
+								`Datastore transaction commit outcome is unknown: ${safeErrorMessage(error)}`,
+								'commit',
+								error
+							));
 						}
 						try {
 							await transaction.rollback(nativeRollbackGaxOptions);
