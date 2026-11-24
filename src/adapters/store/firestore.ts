@@ -1573,16 +1573,13 @@ async function deleteFirestoreDocumentAtVersion(
 			'Firestore adapter client.runTransaction is required for delete() with expectedVersion.'
 		);
 	}
-	let attempts = 0;
 	await client.runTransaction(async (transaction: unknown) => {
-		attempts += 1;
 		const safeTransaction = normalizeFirestoreObject(transaction, 'Firestore transaction');
 		const current = await readFirestoreDocumentForWrite(safeTransaction, id, ref, true);
-		if (!current) {
-			// A retry after a lost commit reply finds the document this delete removed.
-			if (attempts > 1) return;
-			throw firestoreDeleteNotFound(model, id);
-		}
+		// A retry cannot tell a concurrent delete from this delete's own commit
+		// whose reply was lost, so a missing document stays NotFound, as it is for
+		// concurrent deletes on other stores. Either way the document is gone.
+		if (!current) throw firestoreDeleteNotFound(model, id);
 		if (!firestoreVersionMatches(current, expectedVersion)) {
 			throw firestoreOptimisticLockConflict(model, id, expectedVersion);
 		}

@@ -313,9 +313,9 @@ test('Firestore reports success when a retried attempt finds its own lost commit
 	);
 	assert.deepEqual(fake.row(1), { id: 1, title: 'other writer', version: 3 });
 
+	// A retried delete cannot tell its own lost commit from a concurrent delete;
+	// it reports NotFound like a concurrent delete, and the row is gone either way.
 	fake.loseNextCommitReply();
-	await store.delete(meta, 1, { expectedVersion: 3 });
-	assert.equal(fake.row(1), undefined, 'a retried delete that finds the row gone succeeded');
-	// A first attempt that finds no row is still NotFound.
 	await assert.rejects(() => store.delete(meta, 1, { expectedVersion: 3 }), ActiveTsNotFoundError);
+	assert.equal(fake.row(1), undefined);
 });
