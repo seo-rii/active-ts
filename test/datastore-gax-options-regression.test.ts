@@ -68,6 +68,7 @@ function recordingDatastore() {
 			runQuery: record('tx.runQuery'),
 			insert: record('tx.insert'),
 			update: record('tx.update'),
+			upsert: record('tx.upsert'),
 			delete: record('tx.delete'),
 			commit: record('tx.commit'),
 			rollback: record('tx.rollback')
@@ -192,3 +193,75 @@ test('Datastore namespace factories and contexts evaluate the provider per call'
 	await context.store('default').get(meta, 2);
 	assert.deepEqual(calls.map(gaxOf), [{ request: 'first-request' }, { request: 'second-request' }]);
 });
+
+test('Datastore treats a provider failure at commit as a failed transaction, not an unknown commit', async () => {
+	const { client, calls } = recordingDatastore();
+	const failure = new Error('request aborted before commit');
+	const store = await createDatastoreStoreAdapter({
+		client,
+		gaxOptions: ({ operation }) => {
+			if (operation === 'commit') throw failure;
+			return undefined;
+		}
+	});
+	await assert.rejects(
+		() => store.transaction!(async (tx) => { await tx.update(meta, 1, { id: 1, title: 'next' }); }),
+		(error: unknown) => error === failure
+	);
+	assert.ok(!calls.some((call) => call.method === 'tx.commit'), 'Commit never started');
+	assert.ok(calls.some((call) => call.method === 'tx.rollback'), 'the transaction is rolled back');
+});
+
+test('Datastore atomic bulk mutations pass provider options to begin, commit and rollback', async () => {
+	const { client, calls } = recordingDatastore();
+	const provided: DatastoreRpcOperation[] = [];
+	const scopes = new Map<DatastoreRpcOperation, CallScope>();
+	const store = await createDatastoreStoreAdapter({
+		client,
+		gaxOptions: ({ operation }) => {
+			provided.push(operation);
+			const scope = new CallScope(operation);
+			scopes.set(operation, scope);
+			return scope;
+		}
+	});
+	await store.bulk!.upsertMany(meta, [{ id: 2, data: { id: 2, title: 'c' } }], { atomic: true });
+	assert.deepEqual(provided, ['beginTransaction', 'commit']);
+	assert.equal(gaxOf(calls.find((call) => call.method === 'tx.run')), scopes.get('beginTransaction'));
+	assert.equal(calls.find((call) => call.method === 'tx.commit')?.args[0], scopes.get('commit'));
+
+	const failing = recordingDatastore();
+	const failingTransaction = failing.client.transaction;
+	failing.client.transaction = () => ({ ...failingTransaction(), upsert: async () => { throw new Error('mutation failed'); } });
+	const rollbackScopes: unknown[] = [];
+	const failingStore = await createDatastoreStoreAdapter({
+		client: failing.client,
+		gaxOptions: ({ operation }) => {
+			const scope = new CallScope(operation);
+			if (operation === 'rollback') rollbackScopes.push(scope);
+			return scope;
+		}
+	});
+	await assert.rejects(() => failingStore.bulk!.deleteMany(meta, [2], { atomic: true }).then(() =>
+		failingStore.bulk!.upsertMany(meta, [{ id: 3, data: { id: 3, title: 'd' } }], { atomic: true })), /mutation failed/);
+	assert.equal(failing.calls.find((call) => call.method === 'tx.rollback')?.args[0], rollbackScopes[0]);
+});
+
+test('Datastore reads an upsert-capable client save() only when a write needs it', async () => {
+	const { client } = recordingDatastore();
+	const lazy = { ...client } as Record<string, unknown>;
+	delete lazy.save;
+	let saveReads = 0;
+	Object.defineProperty(lazy, 'save', { enumerable: true, get() { saveReads++; throw new Error('save is not available'); } });
+	const store = await createDatastoreStoreAdapter({ client: lazy as typeof client });
+	assert.equal(saveReads, 0, 'construction does not read save()');
+	await store.create(meta, 1, { id: 1, title: 'a' });
+	await store.bulk!.upsertMany(meta, [{ id: 2, data: { id: 2, title: 'b' } }]);
+	assert.equal(saveReads, 0, 'writes without a provider use insert() and upsert()');
+});
+
+// The SDK's CallOptions is an interface without an index signature.
+interface CallOptionsLike { timeout?: number; retry?: { retryCodes?: number[] } }
+const typedProvider: Parameters<typeof createDatastoreStoreAdapter>[0] extends infer Options
+	? Options extends { gaxOptions?: infer Provider } ? Provider : never : never = (): CallOptionsLike => ({ timeout: 1 });
+void typedProvider;

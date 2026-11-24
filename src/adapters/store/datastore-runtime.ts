@@ -142,7 +142,7 @@ export type DatastoreRpcOperation =
  */
 export type DatastoreGaxOptionsProvider = (
 	call: Readonly<{ operation: DatastoreRpcOperation }>
-) => Record<string, unknown> | undefined;
+) => object | undefined;
 
 export type DatastoreStoreOptions = {
 	client?: any;
@@ -1746,9 +1746,6 @@ function createDatastoreAdapter(
 		gaxOptions: Record<string, unknown>,
 		context: string
 	) => {
-		if (!client.save) {
-			throw new ActiveTsConfigurationError(`${context} with gaxOptions requires client.save().`);
-		}
 		const withMethod = (item: Record<string, unknown>) => (method === undefined ? item : { ...item, method });
 		await client.save(Array.isArray(entity) ? entity.map(withMethod) : withMethod(entity), gaxOptions);
 	};
@@ -2804,8 +2801,11 @@ function createDatastoreAdapter(
 								}
 							}
 						}
+						// Ask the provider before marking the commit started: a provider
+						// failure (an aborted request, an invalid result) is not a commit.
+						const commitOptions = mergeDatastoreGaxOptions(callGaxOptions('commit'), nativeCommitGaxOptions);
 						committing = true;
-						await transaction.commit(mergeDatastoreGaxOptions(callGaxOptions('commit'), nativeCommitGaxOptions));
+						await transaction.commit(commitOptions);
 						return result;
 					} catch (error) {
 						if (!started) throw error;
@@ -3815,11 +3815,13 @@ function createDatastoreAdapter(
 				let started = false;
 				let committing = false;
 				try {
-					await transaction.run();
+					const beginOptions = callGaxOptions('beginTransaction');
+					await (beginOptions === undefined ? transaction.run() : transaction.run({ gaxOptions: beginOptions }));
 					started = true;
 					await mutate(transaction.client, items);
+					const commitOptions = callGaxOptions('commit');
 					committing = true;
-					await transaction.commit();
+					await (commitOptions === undefined ? transaction.commit() : transaction.commit(commitOptions));
 				} catch (error) {
 					if (!started) throw error;
 					if (committing) {
@@ -3828,7 +3830,8 @@ function createDatastoreAdapter(
 						throw markTransactionRollbackSkipped(error);
 					}
 					try {
-						await transaction.rollback();
+						const rollbackOptions = callGaxOptions('rollback');
+						await (rollbackOptions === undefined ? transaction.rollback() : transaction.rollback(rollbackOptions));
 					} catch (rollbackError) {
 						throw markTransactionRollbackSkipped(
 							new AggregateError(
@@ -4748,10 +4751,24 @@ function normalizeDatastoreClient(client: unknown) {
 	);
 	const insert = datastoreOptionalMethod(client, 'insert', 'Datastore adapter client.insert');
 	const update = datastoreMethod(client, 'update', 'Datastore adapter client.update');
-	const save = datastoreOptionalMethod(client, 'save', 'Datastore adapter client.save');
-	const upsert = datastoreOptionalMethod(client, 'upsert', 'Datastore adapter client.upsert') ?? save;
+	// As before the gaxOptions provider, an upsert-capable client exposes save()
+	// only when a write needs it; it is read on first use, not at construction.
+	let saveMethod: ((...args: any[]) => any) | undefined;
+	let saveRead = false;
+	const readSave = () => {
+		if (!saveRead) {
+			saveMethod = datastoreOptionalMethod(client, 'save', 'Datastore adapter client.save');
+			saveRead = true;
+		}
+		return saveMethod;
+	};
+	const upsert = datastoreOptionalMethod(client, 'upsert', 'Datastore adapter client.upsert') ?? readSave();
 	return Object.freeze({
-		save,
+		save: (...args: any[]) => {
+			const method = readSave();
+			if (!method) throw new ActiveTsConfigurationError('Datastore adapter client.save() is required for writes with gaxOptions.');
+			return method(...args);
+		},
 		key,
 		int,
 		get,
@@ -4906,7 +4923,7 @@ function createDatastoreTransactionNativeReadClient(client: NormalizedDatastoreC
 		insert: client.insert ? rejectWrite : undefined,
 		update: rejectWrite,
 		upsert: client.upsert ? rejectWrite : undefined,
-		save: client.save ? rejectWrite : undefined
+		save: rejectWrite
 	});
 	return guarded;
 }
