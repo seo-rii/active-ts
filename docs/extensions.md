@@ -645,6 +645,19 @@ as `ActiveTsConflictError`. Inside a transaction the comparison uses the
 transaction's own read, or the row it already wrote. Each such save costs a
 BeginTransaction, Lookup and Commit instead of one Commit.
 
+Firestore runs a version-checked `update()` or `delete()` outside a transaction
+through `client.runTransaction()`: it reads the document, compares `version`, and
+writes. When a concurrent write reaches the document before that commit,
+Firestore aborts and retries the callback, so the retry sees the newer version
+and reports `ActiveTsConflictError`. `update()` already read the document this way
+to detect a missing row; a version-checked `delete()` adds that read, while an
+unversioned `delete()` stays a single write. Inside a transaction the comparison
+uses the transaction's own read or the row it already wrote. Because Firestore
+transactions read before they write, a version-checked write to a document the
+transaction has not read yet fails with a configuration error once the
+transaction has written something; read the row in the transaction before its
+first write.
+
 ## Function Cache Singleflight
 
 Function caches coalesce concurrent misses for the same key by default. Set
