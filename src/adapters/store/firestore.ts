@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from 'node:util';
 import { optionalImport } from '../../core/optional-import.js';
 import {
 	ActiveTsConfigurationError,
@@ -1512,30 +1513,19 @@ function firestoreUpdateNotFound(model: ResolvedModelMeta, id: EntityId) {
 }
 
 /**
- * Reads the document inside a Firestore transaction and fails when it is
- * missing or, with an expected version, when the stored version differs.
- * Firestore aborts the commit (and the SDK retries the callback) when the read
- * document changes before commit, so the check and the write are atomic.
+ * Reads the document inside a Firestore transaction. Firestore aborts the
+ * commit (and the SDK retries the callback) when the read document changes
+ * before commit, so a check on this read and the write that follows are atomic.
  */
-async function readFirestoreDocumentForWrite(
-	transaction: object,
-	model: ResolvedModelMeta,
-	id: EntityId,
-	ref: object,
-	expectedVersion: number | undefined,
-	missing: () => Error
-) {
+async function readFirestoreDocumentForWrite(transaction: object, id: EntityId, ref: object, withData: boolean) {
 	const snap = normalizeFirestoreObject(
 		await firestoreMethod(transaction, 'get', 'Firestore transaction.get')(ref),
 		'Firestore transaction document snapshot'
 	);
-	if (!firestoreSnapshotExists(snap, 'Firestore transaction document snapshot')) throw missing();
-	if (expectedVersion === undefined) return;
+	if (!firestoreSnapshotExists(snap, 'Firestore transaction document snapshot')) return null;
+	if (!withData) return {};
 	assertFirestoreDocumentMatchesExpectedId(snap, id, 'Firestore transaction document snapshot');
-	const current = firestoreDocumentData(snap, 'Firestore transaction document snapshot');
-	if (!firestoreVersionMatches(current, expectedVersion)) {
-		throw firestoreOptimisticLockConflict(model, id, expectedVersion);
-	}
+	return firestoreDocumentData(snap, 'Firestore transaction document snapshot');
 }
 
 async function replaceFirestoreDocument(
@@ -1549,12 +1539,19 @@ async function replaceFirestoreDocument(
 	if (!client.runTransaction) {
 		throw new ActiveTsConfigurationError('Firestore adapter client.runTransaction is required for update().');
 	}
+	let attempts = 0;
 	try {
 		await client.runTransaction(async (transaction: unknown) => {
+			attempts += 1;
 			const safeTransaction = normalizeFirestoreObject(transaction, 'Firestore transaction');
-			await readFirestoreDocumentForWrite(safeTransaction, model, id, ref, expectedVersion, () =>
-				firestoreUpdateNotFound(model, id)
-			);
+			const current = await readFirestoreDocumentForWrite(safeTransaction, id, ref, expectedVersion !== undefined);
+			if (!current) throw firestoreUpdateNotFound(model, id);
+			if (expectedVersion !== undefined && !firestoreVersionMatches(current, expectedVersion)) {
+				// The SDK retries a commit whose reply was lost (UNAVAILABLE, DEADLINE_EXCEEDED, ...).
+				// A retry that finds exactly the data this update wrote found its own commit.
+				if (attempts > 1 && isDeepStrictEqual(current, data)) return;
+				throw firestoreOptimisticLockConflict(model, id, expectedVersion);
+			}
 			await firestoreMethod(safeTransaction, 'set', 'Firestore transaction.set')(ref, data);
 		});
 	} catch (error) {
@@ -1576,11 +1573,19 @@ async function deleteFirestoreDocumentAtVersion(
 			'Firestore adapter client.runTransaction is required for delete() with expectedVersion.'
 		);
 	}
+	let attempts = 0;
 	await client.runTransaction(async (transaction: unknown) => {
+		attempts += 1;
 		const safeTransaction = normalizeFirestoreObject(transaction, 'Firestore transaction');
-		await readFirestoreDocumentForWrite(safeTransaction, model, id, ref, expectedVersion, () =>
-			firestoreDeleteNotFound(model, id)
-		);
+		const current = await readFirestoreDocumentForWrite(safeTransaction, id, ref, true);
+		if (!current) {
+			// A retry after a lost commit reply finds the document this delete removed.
+			if (attempts > 1) return;
+			throw firestoreDeleteNotFound(model, id);
+		}
+		if (!firestoreVersionMatches(current, expectedVersion)) {
+			throw firestoreOptimisticLockConflict(model, id, expectedVersion);
+		}
 		await firestoreMethod(safeTransaction, 'delete', 'Firestore transaction.delete')(ref);
 	});
 }
