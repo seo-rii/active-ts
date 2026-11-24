@@ -220,6 +220,41 @@ If an injected client does not expose a reliable SDK key symbol, active-ts keeps
 the full-row fallback. Transaction overlay queries also keep full rows so they
 can merge buffered writes correctly.
 
+Datastore adapters accept a `gaxOptions` provider for request deadlines and
+cancellation. It runs immediately before each Datastore RPC the adapter starts,
+in the caller's async context, and receives the `operation`: `lookup`,
+`runQuery`, `runAggregationQuery`, `beginTransaction`, `commit` or `rollback`.
+Return SDK `gaxOptions` for that call, or `undefined` to send the call
+unchanged. The returned object is passed as-is, so it may hold a transport's
+cancellation handle:
+
+```ts doc-test=typecheck
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { createDatastoreStoreAdapter } from 'active-ts/adapters/store/datastore-injected';
+
+declare const client: object;
+declare const keySymbol: symbol;
+
+// The request handler stores its absolute deadline here for the request's duration.
+const requestDeadline = new AsyncLocalStorage<number>();
+
+const store = await createDatastoreStoreAdapter({
+	client,
+	keySymbol,
+	gaxOptions: () => {
+		const deadline = requestDeadline.getStore();
+		return deadline === undefined ? undefined : { timeout: Math.max(1, deadline - Date.now()) };
+	}
+});
+```
+
+Writes outside a transaction that receive options use the SDK's `save()` with
+`method: 'insert'` or `'update'`, because `insert()` and `update()` take no call
+options; bulk writes use `save()` and `delete()`. Transaction-scoped writes only
+buffer mutations, so their options reach the Commit. Explicit transaction
+`native` options win over the provider for the same key. ID inventory and
+repair helpers do not call the provider.
+
 Datastore key encoding is selected once per adapter. The default
 `keyEncoding: 'active-ts'` preserves active-ts's canonical physical names:
 numeric `17` is stored as the Datastore name `number:17`, while string `"17"`
