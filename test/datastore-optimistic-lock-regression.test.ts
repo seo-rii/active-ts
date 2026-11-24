@@ -45,6 +45,7 @@ function fakeDatastore({ transactions = true } = {}) {
 	const rows = new Map<string, Record<string, unknown>>();
 	const calls: string[] = [];
 	let beforeCommit: (() => void) | undefined;
+	let abortNextCommit = false;
 	const write = (operation: string, entity: { key: unknown; data: Record<string, unknown> }) => {
 		const key = keyId(entity.key);
 		if (operation === 'insert' && rows.has(key)) throw Object.assign(new Error('already exists'), { code: 6 });
@@ -110,6 +111,11 @@ function fakeDatastore({ transactions = true } = {}) {
 					const hook = beforeCommit;
 					beforeCommit = undefined;
 					hook?.();
+					if (abortNextCommit) {
+						// Contention without any change to the entities this transaction read.
+						abortNextCommit = false;
+						throw Object.assign(new Error('transaction aborted by contention'), { code: 10 });
+					}
 					for (const [key, snapshot] of reads) {
 						if (JSON.stringify(rows.get(key) ?? null) !== snapshot) {
 							throw Object.assign(new Error('transaction aborted by a concurrent write'), { code: 10 });
@@ -130,6 +136,9 @@ function fakeDatastore({ transactions = true } = {}) {
 		row: (id: number) => rows.get(JSON.stringify([meta.name, `number:${id}`])),
 		concurrentlyBeforeCommit(change: () => void) {
 			beforeCommit = change;
+		},
+		abortNextCommit() {
+			abortNextCommit = true;
 		}
 	};
 }
@@ -248,4 +257,27 @@ test('Datastore models with a version field save and delete atomically', async (
 	const current = (await Note.find(7).load())!;
 	await current.delete();
 	assert.equal(fake.row(7), undefined);
+});
+
+test('Datastore retries a version-checked write aborted by contention alone', async () => {
+	const fake = fakeDatastore();
+	const store = await createDatastoreStoreAdapter({ client: fake.client });
+	await store.create(meta, 1, { id: 1, title: 'first', version: 1 });
+	fake.calls.length = 0;
+	fake.abortNextCommit();
+	await store.update(meta, 1, { id: 1, title: 'second', version: 2 }, { expectedVersion: 1 });
+	assert.deepEqual(fake.row(1), { id: 1, title: 'second', version: 2 });
+	// An aborted commit already ended its transaction, so the retry begins a new one.
+	assert.deepEqual(fake.calls, ['tx.run', 'tx.get', 'tx.commit', 'tx.run', 'tx.get', 'tx.commit']);
+
+	// A retry that finds the version changed is still a conflict.
+	fake.abortNextCommit();
+	fake.concurrentlyBeforeCommit(() => {
+		fake.rows.set(JSON.stringify([meta.name, 'number:1']), { id: 1, title: 'other writer', version: 3 });
+	});
+	await assert.rejects(
+		() => store.update(meta, 1, { id: 1, title: 'mine', version: 3 }, { expectedVersion: 2 }),
+		ActiveTsConflictError
+	);
+	assert.deepEqual(fake.row(1), { id: 1, title: 'other writer', version: 3 });
 });
