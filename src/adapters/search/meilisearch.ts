@@ -1,3 +1,4 @@
+import { searchPageFromCursor, searchCursorForPage, searchCursorFingerprint } from '../../core/search-cursor.js';
 import type { EntityId, QueryResult, ResolvedModelMeta, SchemaPlan, SearchAdapter, SearchOptions } from '../../core/types.js';
 import { optionalImport } from '../../core/optional-import.js';
 import { ActiveTsConfigurationError, ActiveTsValidationError } from '../../core/errors.js';
@@ -146,11 +147,6 @@ function unsigned(value: unknown, context: string) {
 	return value;
 }
 
-function pageFromCursor(cursor: string | undefined) {
-	if (cursor === undefined) return 1;
-	if (!/^[1-9][0-9]*$/.test(cursor)) throw new ActiveTsValidationError('Meilisearch cursor must be a positive decimal page number.');
-	return unsigned(Number(cursor), 'Meilisearch cursor');
-}
 
 function nativeOptions(value: unknown) {
 	if (value === undefined) return {};
@@ -233,15 +229,16 @@ export async function createMeilisearchSearchAdapter(input: MeilisearchOptions =
 			const safeQuery = assertSafeSearchQuery(query, 'Meilisearch search query');
 			const { fields, retrieve } = projection(model);
 			const native = nativeOptions(searchOptions.native);
-			const page = pageFromCursor(searchOptions.cursor);
 			const hitsPerPage = searchOptions.limit ?? 20;
 			const name = indexName(model);
-			const request = cloneJsonTransportPayload({ ...native, page, hitsPerPage,
-				...(fields.length ? { attributesToSearchOn: fields } : {}), attributesToRetrieve: retrieve }, 'Meilisearch search request');
+			const request = cloneJsonTransportPayload({ ...native, hitsPerPage,
+				...(fields.length ? { attributesToSearchOn: fields } : {}), attributesToRetrieve: retrieve }, 'Meilisearch search request') as Record<string, unknown>;
+			const fingerprint = searchCursorFingerprint(cloneJsonTransportPayload({ indexName: name, query: safeQuery, idField: model.idField, request }));
+			const page = searchPageFromCursor(searchOptions.cursor, fingerprint, 'meilisearch') ?? 1;
 			if (!fields.length && searchOptions.native === undefined) return { list: [], more: false, count: 0 };
 			const index = indexMethods(name);
 			// Search-only API keys cannot read index metadata; validate each returned identity below.
-			const response = await index.search(safeQuery, request);
+			const response = await index.search(safeQuery, cloneJsonTransportPayload({ ...request, page }));
 			responseObject(response, 'Meilisearch search response');
 			const responsePage = unsigned(own(response, 'page', 'Meilisearch search response'), 'Meilisearch response page');
 			const responseLimit = unsigned(own(response, 'hitsPerPage', 'Meilisearch search response'), 'Meilisearch response hitsPerPage');
@@ -262,7 +259,7 @@ export async function createMeilisearchSearchAdapter(input: MeilisearchOptions =
 			const more = hitsPerPage > 0 && page < totalPages;
 			if (more && !list.length) throw new ActiveTsValidationError('Meilisearch returned an empty page before its final page.');
 			// estimatedTotalHits is approximate; even page-mode totals are bounded by maxTotalHits.
-			return { list, count: list.length, more, ...(more ? { cursor: String(page + 1) } : {}) };
+			return { list, count: list.length, more, ...(more ? { cursor: searchCursorForPage(page + 1, fingerprint, 'meilisearch') } : {}) };
 		},
 		async index(model, id: EntityId, data: unknown, writeOptions = {}) {
 			model = snapshotSearchAdapterModel(model, 'Meilisearch model metadata', 'meilisearch');

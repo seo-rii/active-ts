@@ -4,6 +4,7 @@ import {
 	ActiveTsCommittedTransactionError,
 	ActiveTsCommittedWriteError,
 	ActiveTsConflictError,
+	ActiveTsNotFoundError,
 	ActiveTsValidationError,
 	clearDefaultContext,
 	Model,
@@ -513,6 +514,23 @@ for (const operation of ['save', 'delete'] as const) {
 		assert.equal(fixture.state.cleanupCalls, cleanupBefore + 1);
 		assert.deepEqual((await fixture.Observer.find(1).load())?.data, { id: 1, value: 'fresh', version: 2 });
 		assert.deepEqual(stale.data, { id: 1, value: 'attempt', version: 1 });
+	});
+}
+
+for (const operation of ['save', 'delete'] as const) {
+	test(`store ${operation} not-found evicts a cached entity another writer deleted`, async () => {
+		const fixture = createConflictCacheFixture();
+		await fixture.Fresh.create({ id: 1, value: 'old', version: 1 });
+		const stale = await fixture.Cached.find(1).load();
+		assert.ok(stale);
+		assert.ok(await fixture.Observer.find(1).load(), 'the shared cache holds the row');
+		// Another process deletes the row without touching this cache.
+		await fixture.Fresh.delete(1);
+		stale.data.value = 'attempt';
+		const cleanupBefore = fixture.state.cleanupCalls;
+		await assert.rejects(() => stale[operation](), ActiveTsNotFoundError);
+		assert.equal(fixture.state.cleanupCalls, cleanupBefore + 1);
+		assert.equal(await fixture.Observer.find(1).load(), null, 'the cache no longer serves the deleted row');
 	});
 }
 

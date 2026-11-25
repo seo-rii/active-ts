@@ -474,3 +474,12 @@ function extensionContextTypes(context: ActiveContext) {
 }
 
 void extensionContextTypes;
+function resolvedFieldCodecsAreReadonly(meta: import('../src/index.js').ResolvedModelMeta) {
+	// @ts-expect-error resolved codec maps are immutable
+	meta.fieldCodecs.set('name', { name: 'codec', encode: (value: unknown) => value, decode: (value: unknown) => value });
+	const codec = meta.fieldCodecs.get('name');
+	if (codec) {
+		// @ts-expect-error resolved codec callbacks are immutable
+		codec.encode = () => 'changed';
+	}
+}
