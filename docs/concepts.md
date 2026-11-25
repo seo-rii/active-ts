@@ -45,6 +45,12 @@ Metadata defines the external collection/table name, id field, validation,
 indexes, search indexes, cache policy, and relation graph.
 Store indexes can declare per-field directions with `directions`, for example
 `index('score', { fields: ['ownerId', 'score'], directions: ['asc', 'desc'] })`.
+Generated index names normalize field paths, so `profile.email` and
+`profile_email` have the same default name. A declaration with a generated name
+that conflicts with different existing fields throws before replacing metadata;
+provide distinct explicit `name` options to register both indexes. This also
+applies to search indexes within the same adapter. Explicitly named declarations
+and direct metadata registration retain their replacement behavior.
 
 Metadata can also define model-local hooks, views, and policies:
 
@@ -76,6 +82,12 @@ defineModel<DocumentData>({ name: 'document' })
 `fieldType('...', 'date')` stores the field as a canonical ISO string and
 hydrates it back to a `Date` on reads. Date query operands are normalized the
 same way so memory and JSON-backed adapters compare the same values.
+
+A field can declare both a type and a codec on the same path. The type describes
+the application value; the codec can use a different stored representation.
+Date normalization runs before write/query encoding and after read decoding.
+Routing and adapter validation retain encoded query operands without applying
+the domain type again.
 
 Portable typed dates, Date query operands and Date cursor values support UTC
 years 0000 through 9999, inclusive. Extended-year values are rejected because
@@ -220,6 +232,11 @@ await Account.query().include({ posts: { comments: 'author' } }).load();
 Relation `preload` fields are translated into `select()` projections for both
 lazy and batched relation loads. active-ts also includes the target id and
 foreign key so relation matching remains stable.
+
+Relation queries apply the target model's query hooks consistently, including
+soft-delete filters. A one/id relation may use a batched direct-read shortcut
+only when no target-model or context query hooks are configured. Adding a
+`preload` projection therefore changes fields, not relation membership.
 
 Relation arrays must contain the complete matching result. If a store returns
 `more: true` for a relation query, lazy loading and `include()` throw instead of
@@ -431,7 +448,15 @@ and indexes. Destructive changes are intentionally out of scope.
 `schemaMigration(models, name)` captures the same plans as a migration snapshot
 without applying them.
 
-Relation queries apply the target model's query hooks consistently, including
-soft-delete filters. A one/id relation may use a batched direct-read shortcut
-only when no target-model or context query hooks are configured. Adding a
-`preload` projection therefore changes fields, not relation membership.
+## Cache key ownership
+
+Built-in entity cache keys are deterministic and retain no per-entity ownership
+history. A custom `cacheKey` resolver retains ownership pairs for the context's
+lifetime, including cache misses, so collisions and changing keys can be rejected.
+Cache TTL expiration and `clear()` do not discard this safety history.
+
+Long-lived contexts using custom resolvers can set `cacheKeyOwnerLimit` to a
+positive safe integer. Once reached, new owners fail with a configuration error;
+existing owners remain usable. Omit the option for the existing unlimited behavior,
+or use request-scoped contexts to bound the lifetime. Transaction ownership is
+staged and discarded on rollback; committed ownership shares the root's limit.

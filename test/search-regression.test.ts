@@ -3468,6 +3468,99 @@ test('search builder snapshots include specs and adapter route when load starts'
 	assert.deepEqual(result.list[0].data, { id: 1, title: 'searchable title' });
 });
 
+test('empty search include requests reload full models consistently with their type', async () => {
+	const store = new MemoryStoreAdapter();
+	const memory = new MemorySearchAdapter();
+	let instantiated = 0;
+	const context = createActiveTs({
+		stores: { default: store }, search: { memory }, defaultSearch: 'memory',
+		plugins: [{ name: 'count-search-instantiations', hooks: { afterInstantiate() { instantiated++; } } }]
+	});
+	const Article = SearchIncludeArticle.use(context);
+	const meta = context.meta(SearchIncludeArticle);
+	await store.seed(meta, [{ id: 1, authorId: 10, title: 'searchable', body: 'full body' }]);
+	await memory.index(meta, 1, { id: 1, authorId: 10, title: 'searchable', body: 'index copy' });
+	for (const builder of [Article.search('searchable').include(), Article.search('searchable').include({})]) {
+		instantiated = 0;
+		const item = (await builder.load()).list[0];
+		assert.equal(isPartialModel(item), false);
+		const body: string = item.data.body;
+		assert.equal(body, 'full body');
+		assert.equal(instantiated, 1);
+		await item.save();
+	}
+});
+
+async function createNamespacedSearchIncludeOwner(
+	hook?: 'beforeRelationLoad' | 'afterRelationLoad',
+	mutate?: (data: { parentId: number; parentNamespace?: string }) => void
+) {
+	type OwnerData = { id: number; parentId: number; parentNamespace?: string; title: string };
+	class Parent extends Model<{ id: number; name: string }> {}
+	class Owner extends Model<OwnerData> {}
+	defineModel<{ id: number; name: string }>('namespaced_search_include_parent')
+		.id('id').validate(value => value as { id: number; name: string }).attach(Parent);
+	defineModel<OwnerData>({ name: 'namespaced_search_include_owner', search: 'memory' })
+		.id('id').validate(value => value as OwnerData)
+		.datastore({
+			ancestor: ({ data }) => data ? datastoreKey('parent', data.parentId, { namespace: data.parentNamespace }) : undefined,
+			ancestorFields: ['parentId']
+		})
+		.search('memory', ['title', 'parentId'])
+		.ref('parent', () => Parent, { localKey: 'parentId', foreignKey: 'id' }).attach(Owner);
+	const store = Object.assign(new MemoryStoreAdapter(), { datastoreNamespace: 'tenant_a' });
+	Object.assign(store.capabilities, { datastoreAncestor: true });
+	const search = new MemorySearchAdapter();
+	const stored: OwnerData = { id: 1, parentId: 10, title: 'stored needle' };
+	const query = store.query.bind(store);
+	const ancestor = datastoreKey('parent', 10, { namespace: 'tenant_a' });
+	store.query = async (meta, plan, options) => {
+		if (meta.name !== 'namespaced_search_include_owner') return query(meta, plan, options);
+		assert.deepEqual(plan.meta?.datastoreAncestor, ancestor);
+		return { list: [{ ...stored }], more: false, count: 1 };
+	};
+	const context = createActiveTs({
+		stores: { default: store }, search: { memory: search }, defaultSearch: 'memory',
+		plugins: hook ? [{ name: 'namespaced-search-include-hook', hooks: {
+			[hook]: (payload: any) => {
+				if (payload.model?.name === 'namespaced_search_include_owner') mutate!((payload.target as Owner).data);
+			}
+		} }] : []
+	});
+	await store.seed(context.meta(Parent), [{ id: 10, name: 'parent' }]);
+	await search.index(withDatastoreSearchNamespace(context.meta(Owner), 'tenant_a'), 1, { ...stored, title: 'indexed needle' });
+	return { Owner: Owner.use(context), ancestor, stored };
+}
+
+test('grouped query and search includes preserve implicit adapter ancestor namespaces', async () => {
+	for (const source of ['query', 'search'] as const) {
+		const { Owner, ancestor, stored } = await createNamespacedSearchIncludeOwner();
+		const result = source === 'query'
+			? await Owner.query().ancestor(ancestor).include('parent').load()
+			: await Owner.search('needle').include('parent').load();
+		assert.equal(result.count, 1);
+		assert.deepEqual(result.list[0].data, stored);
+		const parent = await result.list[0].ref<Model<{ id: number; name: string }>>('parent').load();
+		assert.ok(parent && !Array.isArray(parent));
+		assert.equal(parent.data.name, 'parent');
+	}
+});
+
+for (const hook of ['beforeRelationLoad', 'afterRelationLoad'] as const) {
+	for (const mutation of ['parent', 'namespace'] as const) {
+		test(`grouped search ${hook} rejects owner ${mutation} changes with an adapter namespace`, async () => {
+			const { Owner } = await createNamespacedSearchIncludeOwner(hook, data => {
+				if (mutation === 'parent') data.parentId = 11;
+				else data.parentNamespace = 'tenant_b';
+			});
+			await assert.rejects(
+				Owner.search('needle').include('parent').load(),
+				mutation === 'parent' ? /outside the scoped Datastore ancestor/ : /namespace must match adapter namespace/
+			);
+		});
+	}
+}
+
 test('search builder include preserves search instantiate operation', async () => {
 	class CountingStore extends MemoryStoreAdapter {
 		articleGetManyCalls = 0;
@@ -5586,4 +5679,57 @@ test('remote search adapters reject undefined transport values before SDK calls'
 		/Elasticsearch search request\.body\.sort cannot contain undefined/
 	);
 	assert.equal(elasticPayloads.length, 1);
+});
+
+
+test('search includes batch fresh owners and shared relations within max batch size', async () => {
+	const store = new MemoryStoreAdapter();
+	const memory = new MemorySearchAdapter();
+	const batches: Array<{ model: string; ids: Array<string | number> }> = [];
+	const getMany = store.getMany.bind(store);
+	store.getMany = async (model, ids) => {
+		batches.push({ model: model.name, ids: [...ids] });
+		return getMany(model, ids);
+	};
+	const context = createActiveTs({ stores: { default: store }, search: { memory }, defaultSearch: 'memory', batch: { maxSize: 2 } });
+	const Article = SearchIncludeArticle.use(context) as typeof SearchIncludeArticle;
+	const meta = context.meta(SearchIncludeArticle);
+	await store.seed(context.meta(SearchIncludeAuthor), [{ id: 10, name: 'Ada' }]);
+	const rows = [1, 2, 3].map((id) => ({ id, authorId: 10, title: 'batched search', body: `full ${id}` }));
+	await store.seed(meta, rows);
+	for (const row of rows) await memory.index(meta, row.id, row);
+	const result = await Article.search('batched').include('author').load();
+	assert.deepEqual(result.list.map((row) => row.data.body), ['full 1', 'full 2', 'full 3']);
+	assert.deepEqual(batches.filter((batch) => batch.model === meta.name).map((batch) => batch.ids), [[1, 2], [3]]);
+	// Existing loaders may repeat a shared ID across chunks; deduplicating it further is compatible.
+	assert.ok(batches.filter((batch) => batch.model === context.meta(SearchIncludeAuthor).name).length <= 2);
+	const related = await Promise.all(result.list.map((row) => row.ref<SearchIncludeAuthor>('author').load()));
+	assert.deepEqual(related.map((author) => (author as SearchIncludeAuthor).data.name), ['Ada', 'Ada', 'Ada']);
+	assert.equal(new Set(related).size, 3);
+	assert.ok(batches.length <= 4);
+});
+
+
+test('search hasMany includes issue one relation query for all result owners', async () => {
+	class Parent extends Model<{ id: number; title: string }> {}
+	class Child extends Model<{ id: number; parentId: number }> {}
+	defineModel<{ id: number; parentId: number }>('search_batch_child').id('id').attach(Child);
+	defineModel<{ id: number; title: string }>({ name: 'search_batch_parent', search: 'memory' }).id('id')
+		.search('memory', ['title']).hasMany('children', () => Child, { localKey: 'id', foreignKey: 'parentId' }).attach(Parent);
+	const store = new MemoryStoreAdapter();
+	const memory = new MemorySearchAdapter();
+	const context = createActiveTs({ stores: { default: store }, search: { memory }, defaultSearch: 'memory' });
+	const Bound = Parent.use(context) as typeof Parent;
+	const rows = [1, 2, 3].map((id) => ({ id, title: 'many owners' }));
+	await store.seed(context.meta(Parent), rows);
+	await store.seed(context.meta(Child), rows.map(({ id }) => ({ id: id + 10, parentId: id })));
+	for (const row of rows) await memory.index(context.meta(Parent), row.id, row);
+	const result = await Bound.search('many').include('children').load();
+	assert.equal(store.stats.getMany, 1);
+	assert.equal(store.stats.query, 1);
+	for (const row of result.list) {
+		const children = await row.ref<Child>('children').load() as Child[];
+		assert.deepEqual(children.map((child) => child.data.parentId), [row.data.id]);
+	}
+	assert.equal(store.stats.query, 1);
 });

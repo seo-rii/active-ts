@@ -1,3 +1,4 @@
+import { datastoreSearchScopeForStore } from '../src/core/datastore-search-scope.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
@@ -1455,6 +1456,9 @@ test('search sync reloads data-less datastore events with SDK entity key metadat
 	);
 	const store: StoreAdapter = {
 		kind: 'datastore',
+		datastoreProjectId: 'sdk-test',
+		datastoreDatabaseId: null,
+		datastoreKeyEncoding: 'active-ts',
 		capabilities: { datastoreAncestor: true },
 		get: async () => {
 			throw new Error('direct get must not be used for ancestor search sync');
@@ -1476,11 +1480,12 @@ test('search sync reloads data-less datastore events with SDK entity key metadat
 		search: { memory: search },
 		defaultSearch: 'memory'
 	});
-	const meta = context.meta(AncestorOutboxSearchDoc);
+	const meta = { ...context.meta(AncestorOutboxSearchDoc), datastoreSearchScope: datastoreSearchScopeForStore(store) };
 	await outbox.append({
 		id: 'ancestor-sdk-key-update',
 		model: 'ancestor_outbox_search_regression_doc',
 		modelId: 3,
+		modelDatastoreScope: meta.datastoreSearchScope,
 		modelIdentity: datastoreSearchDocumentIdentity(meta, 3, parent),
 		modelDatastoreAncestor: parent,
 		operation: 'update',

@@ -1,15 +1,17 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { ActiveTsConfigurationError } from './errors.js';
 import type { ActiveContext } from './context.js';
-import type { CacheAdapter, SearchAdapter, StoreAdapter, ResolvedModelMeta } from './types.js';
+import type { CacheAdapter, EntityId, ResolvedModelMeta, SearchAdapter, StoreAdapter } from './types.js';
 
 export type ActiveContextInternalAccess = {
 	store(name: string): StoreAdapter;
 	cache(name: string): CacheAdapter | undefined;
+	defaultCacheName(): string;
 	searchAdapter(name: string): SearchAdapter;
 	assertWritable(operation: string): void;
 	markRollbackOnly(error: unknown): void;
 	trackOperation<T>(run: () => Promise<T>): Promise<T>;
+	validateReadConstructorResult(meta: ResolvedModelMeta, id: EntityId, before: Record<string, unknown> | undefined, item: unknown): void;
 	hasQueryHooks(model: ResolvedModelMeta): boolean;
 };
 
@@ -38,8 +40,22 @@ export function contextInternalCache(context: ActiveContext, name: string) {
 	return activeContextInternals(context).cache(name);
 }
 
+export function contextDefaultCacheName(context: ActiveContext) {
+	return activeContextInternals(context).defaultCacheName();
+}
+
 export function contextInternalSearchAdapter(context: ActiveContext, name: string) {
 	return activeContextInternals(context).searchAdapter(name);
+}
+
+export function validateContextReadConstructorResult(
+	context: ActiveContext,
+	meta: ResolvedModelMeta,
+	id: EntityId,
+	before: Record<string, unknown> | undefined,
+	item: unknown
+) {
+	activeContextInternals(context).validateReadConstructorResult(meta, id, before, item);
 }
 
 export function assertContextTransactionWritable(context: ActiveContext, operation: string) {
