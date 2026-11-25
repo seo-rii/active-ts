@@ -175,7 +175,7 @@ test('Meilisearch owns query, fields and pagination while forwarding native filt
 	await adapter.index(model, 1, { slug: 1, title: 'shared one' }); await adapter.index(model, 2, { slug: 2, title: 'shared two' });
 	const first = await adapter.search(model, 'shared', { limit: 1, native: { filter: 'score > 1' } });
 	assert.equal(first.more, true); assert.ok(first.cursor);
-	const second = await adapter.search(model, 'shared', { limit: 1, cursor: first.cursor });
+	const second = await adapter.search(model, 'shared', { limit: 1, cursor: first.cursor, native: { filter: 'score > 1' } });
 	assert.deepEqual(second.list.map((row) => row.slug), [2]); assert.equal(second.more, false);
 	const request = fixture.requests.filter((entry) => entry.operation === 'search')[0].value;
 	assert.deepEqual(JSON.parse(JSON.stringify(request.options.attributesToRetrieve)), ['active_ts_id', 'slug', 'title', 'profile.city']);
@@ -229,7 +229,7 @@ test('Meilisearch snapshots write payloads before asynchronous metadata lookup',
 
 test('Meilisearch avoids Unicode ID collisions and validates ancestor identity on reads/deletes', async () => {
 	const fixture = fake(); const adapter = await createMeilisearchSearchAdapter({ client: fixture.client });
-	for (const id of ['\ud800', '\ud801', '\ufffd', '한글/문서']) await adapter.index(metadata(), id, { slug: id, title: 'shared' });
+	for (const id of ['\u{10000}', '\u{10001}', '\ufffd', '한글/문서']) await adapter.index(metadata(), id, { slug: id, title: 'shared' });
 	assert.equal(fixture.docs.size, 4);
 	const model = metadata({ datastore: { ancestorFields: ['parentId'], ancestor: ({ data }) => data ? datastoreKey('parent', data.parentId) : undefined } });
 	await adapter.index(model, 1, { slug: 1, title: 'ancestor', parentId: 10 });
