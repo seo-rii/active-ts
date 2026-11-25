@@ -36,8 +36,9 @@ test('Firestore factory shares close attempts and allows retry after termination
 	try {
 		// Construction and the stubbed terminate method perform no network calls.
 		const store = await createFirestoreStoreAdapter({ firestoreOptions: { projectId: 'active-ts-lifecycle-test' } });
-		const first = store.close!();
-		const second = store.close!();
+		// StoreAdapter.close is typed MaybePromise<void> on main; the owned closer is async.
+		const first = Promise.resolve(store.close!());
+		const second = Promise.resolve(store.close!());
 		release();
 		await assert.rejects(first, error => error === failure);
 		await assert.rejects(second, error => error === failure);
