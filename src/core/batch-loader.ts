@@ -43,10 +43,16 @@ export class BatchLoader<T> {
 
 	private async flush() {
 		this.scheduled = false;
-		const batch = pendingBatches(this.pending, this.distinctResults);
+		const batch = pendingBatches(this.pending);
 		MAP_CLEAR.call(this.pending);
 		if (!batch.length) return;
-		for (const chunk of chunkItems(batch, this.maxSize)) {
+		for (const uniqueChunk of chunkItems(batch, this.maxSize)) {
+			const chunk: Array<PendingBatch<T>> = [];
+			for (const item of uniqueChunk) {
+				if (this.distinctResults) {
+					for (const waiter of item.waiters) chunk[chunk.length] = { id: item.id, waiters: [waiter] };
+				} else chunk[chunk.length] = item;
+			}
 			try {
 				const values = await this.loadMany(chunkIds(chunk));
 				for (let index = 0; index < chunk.length; index++) {
@@ -68,17 +74,9 @@ export class BatchLoader<T> {
 	}
 }
 
-function pendingBatches<T>(pending: Map<string, PendingBatch<T>>, distinctResults: boolean) {
+function pendingBatches<T>(pending: Map<string, PendingBatch<T>>) {
 	const batch: Array<PendingBatch<T>> = [];
-	for (const item of MAP_VALUES.call(pending) as Iterable<PendingBatch<T>>) {
-		if (distinctResults) {
-			for (let index = 0; index < item.waiters.length; index++) {
-				batch[batch.length] = { id: item.id, waiters: [item.waiters[index]] };
-			}
-		} else {
-			batch[batch.length] = item;
-		}
-	}
+	for (const item of MAP_VALUES.call(pending) as Iterable<PendingBatch<T>>) batch[batch.length] = item;
 	return batch;
 }
 

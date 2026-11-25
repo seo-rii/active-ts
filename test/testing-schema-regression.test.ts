@@ -1426,9 +1426,9 @@ test('test helper options ignore inherited fields', async () => {
 		const ctx = createTestContext({});
 		assert.notEqual(ctx.store, inheritedStore);
 		await withTestContext(ctx, async () => {
-			console.warn('captured warning');
+			console.warn('active-ts lazy relation "captured warning"');
 		});
-		assert.deepEqual(ctx.warnings, ['captured warning']);
+		assert.deepEqual(ctx.warnings, ['active-ts lazy relation "captured warning"']);
 	} finally {
 		delete (Object.prototype as Record<string, unknown>).store;
 		delete (Object.prototype as Record<string, unknown>).lazyLoadWarnings;
@@ -1526,13 +1526,13 @@ test('lazy warning capture records each warning once and validates callbacks', a
 		/captureLazyLoadWarnings fn must be a function/
 	);
 	const captured = await captureLazyLoadWarnings(() => {
-		console.warn('first warning');
-		console.warn('second', 'warning');
+		console.warn('active-ts lazy relation "first warning"');
+		console.warn('active-ts lazy relation "second"', 'warning');
 		return 42;
 	});
 
 	assert.equal(captured.result, 42);
-	assert.deepEqual(captured.warnings, ['first warning', 'second warning']);
+	assert.deepEqual(captured.warnings, ['active-ts lazy relation "first warning"', 'active-ts lazy relation "second" warning']);
 });
 
 test('lazy warning capture formats unsafe warning objects without invoking coercion', async () => {
@@ -1555,7 +1555,7 @@ test('lazy warning capture formats unsafe warning objects without invoking coerc
 	});
 
 	const captured = await captureLazyLoadWarnings(() => {
-		console.warn('captured unsafe warning', warningArg);
+		console.warn('active-ts lazy relation "captured unsafe warning"', warningArg);
 		return 42;
 	});
 
@@ -1568,7 +1568,7 @@ test('lazy warning capture formats unsafe warning objects without invoking coerc
 	const ctx = createTestContext({ lazyLoadWarnings: 'capture' });
 	ctx.install();
 	try {
-		console.warn('context unsafe warning', warningArg);
+		console.warn('active-ts lazy relation "context unsafe warning"', warningArg);
 	} finally {
 		ctx.restore();
 	}
@@ -1579,7 +1579,7 @@ test('lazy warning capture formats unsafe warning objects without invoking coerc
 	const throwingCtx = createTestContext({ lazyLoadWarnings: 'throw' });
 	throwingCtx.install();
 	try {
-		assert.throws(() => console.warn('throw unsafe warning', warningArg), /throw unsafe warning/);
+		assert.throws(() => console.warn('active-ts lazy relation "throw unsafe warning"', warningArg), /throw unsafe warning/);
 	} finally {
 		throwingCtx.restore();
 	}

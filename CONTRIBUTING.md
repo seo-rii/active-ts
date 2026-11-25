@@ -14,6 +14,12 @@ pnpm test
 The test suite is intentionally local by default. It uses memory adapters and
 fake SDK clients unless a test explicitly opts into an external service.
 
+CI runs the local suite and packed-package checks on Node.js 22 and 24. After
+building an unchanged checkout, `pnpm test:built` and `pnpm pack:smoke:built`
+reuse its output. Use `pnpm test` and `pnpm pack:smoke` when the source may have
+changed; those commands build first. Packing still runs the package's prepack
+build so a published artifact includes the current source.
+
 ## Project Layout
 
 ```text
