@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { MongoError, ReadConcern, ReadPreference, WriteConcern } from 'mongodb';
 import type { ResolvedModelMeta } from '../src/index.js';
 import {
@@ -7,11 +8,12 @@ import {
 	ActiveTsConflictError,
 	ActiveTsNotFoundError,
 	ActiveTsUnknownTransactionOutcomeError,
+	ActiveTsValidationError,
 	Model,
 	createActiveTs,
 	defineModel
 } from '../src/index.js';
-import { createMongoStoreAdapter } from '../src/adapters/store/mongodb.js';
+import { createMongoStoreAdapter, type MongoTransactionNativeOptions } from '../src/adapters/store/mongodb.js';
 
 type MongoRegressionData = {
 	id: number;
@@ -1449,7 +1451,7 @@ test('MongoDB numeric aggregate pipelines reject corrupted numeric row values', 
 				$cond: [
 					{
 						$and: [
-							{ $ne: ['$score', null] },
+							{ $ne: [{ $ifNull: ['$score', null] }, null] },
 							{ $not: [{ $isNumber: '$score' }] }
 						]
 					},
@@ -2044,3 +2046,301 @@ for (const op of ['count', 'sum', 'avg'] as const) {
 		] }), { _id: 3, _activeTsResult_id: 3, count: 3 });
 	});
 }
+
+test('MongoDB numeric aggregate invalid-value check ignores missing optional fields and rejects corrupted non-numeric values', async () => {
+	const BSON_MISSING = Symbol('bson-missing');
+	const resolveFieldPath = (doc: Record<string, unknown>, path: string): unknown => {
+		let current: unknown = doc;
+		for (const part of path.split('.')) {
+			if (!current || typeof current !== 'object' || Array.isArray(current)) return BSON_MISSING;
+			if (!Object.prototype.hasOwnProperty.call(current, part)) return BSON_MISSING;
+			current = (current as Record<string, unknown>)[part];
+		}
+		return current;
+	};
+	const evalExpr = (expr: unknown, doc: Record<string, unknown>): unknown => {
+		if (typeof expr === 'string' && expr.startsWith('$')) {
+			return resolveFieldPath(doc, expr.slice(1));
+		}
+		if (!expr || typeof expr !== 'object' || Array.isArray(expr)) return expr;
+		const entries = Object.entries(expr as Record<string, unknown>);
+		assert.equal(entries.length, 1);
+		const [op, arg] = entries[0];
+		if (op === '$ifNull') {
+			const [input, fallback] = arg as [unknown, unknown];
+			const evaluated = evalExpr(input, doc);
+			return evaluated === BSON_MISSING || evaluated === null || evaluated === undefined
+				? evalExpr(fallback, doc)
+				: evaluated;
+		}
+		if (op === '$ne') {
+			const [left, right] = (arg as [unknown, unknown]).map((item) => evalExpr(item, doc));
+			// In MongoDB aggregation expressions, BSON missing !== null.
+			return left !== right;
+		}
+		if (op === '$isNumber') {
+			const value = evalExpr(arg, doc);
+			return typeof value === 'number';
+		}
+		if (op === '$not') {
+			const [inner] = arg as [unknown];
+			const value = evalExpr(inner, doc);
+			return !(value && value !== BSON_MISSING);
+		}
+		if (op === '$and') {
+			return (arg as unknown[]).every((item) => {
+				const value = evalExpr(item, doc);
+				return Boolean(value && value !== BSON_MISSING);
+			});
+		}
+		if (op === '$cond') {
+			const [cond, whenTrue, whenFalse] = arg as [unknown, unknown, unknown];
+			const condValue = evalExpr(cond, doc);
+			return condValue && condValue !== BSON_MISSING ? evalExpr(whenTrue, doc) : evalExpr(whenFalse, doc);
+		}
+		throw new Error(`Unsupported test aggregation operator: ${op}`);
+	};
+	const runGroup = (docs: Array<Record<string, unknown>>, group: Record<string, any>) => {
+		if (!docs.length) return [];
+		const row: Record<string, unknown> = { _id: null };
+		for (const [alias, accumulator] of Object.entries(group)) {
+			if (alias === '_id') continue;
+			if ('$sum' in accumulator) {
+				let total = 0;
+				for (const doc of docs) {
+					const val = evalExpr(accumulator.$sum, doc);
+					if (typeof val === 'number') total += val;
+				}
+				row[alias] = total;
+			} else if ('$avg' in accumulator) {
+				let total = 0;
+				let count = 0;
+				for (const doc of docs) {
+					const val = evalExpr(accumulator.$avg, doc);
+					if (typeof val === 'number') {
+						total += val;
+						count++;
+					}
+				}
+				row[alias] = count === 0 ? null : total / count;
+			} else {
+				throw new Error(`Unsupported test accumulator for ${alias}`);
+			}
+		}
+		return [row];
+	};
+
+	let docs: Array<Record<string, unknown>> = [
+		{ _id: 'number:1', id: 1, handle: 'omitted-score' },
+		{ _id: 'number:2', id: 2, handle: 'null-score', score: null, stats: null },
+		{ _id: 'number:3', id: 3, handle: 'empty-nested', score: 10, stats: {} },
+		{ _id: 'number:4', id: 4, handle: 'null-nested', score: 20, stats: { score: null } },
+		{ _id: 'number:5', id: 5, handle: 'valid-nested', stats: { score: 5 } }
+	];
+	const adapter = await mongoAdapter({
+		aggregate: (pipeline: any[]) => ({
+			toArray: async () => runGroup(docs, pipeline[1].$group)
+		})
+	});
+
+	assert.deepEqual(
+		await adapter.aggregate!(meta, {
+			where: [],
+			or: [],
+			aggregates: [
+				{ op: 'count', as: 'count' },
+				{ op: 'sum', field: 'score', as: 'total' },
+				{ op: 'avg', field: 'score', as: 'average' },
+				{ op: 'sum', field: 'stats.score', as: 'nestedTotal' },
+				{ op: 'avg', field: 'stats.score', as: 'nestedAverage' }
+			]
+		}),
+		{ count: 5, total: 30, average: 15, nestedTotal: 5, nestedAverage: 5 }
+	);
+
+	for (const badValue of ['5', true, false, {}, [], [1]]) {
+		docs = [
+			{ _id: 'number:1', id: 1, handle: 'omitted' },
+			{ _id: 'number:2', id: 2, handle: 'corrupted', score: badValue }
+		];
+		await assert.rejects(
+			() =>
+				adapter.aggregate!(meta, {
+					where: [],
+					or: [],
+					aggregates: [{ op: 'sum', field: 'score', as: 'total' }]
+				}),
+			(error) =>
+				error instanceof ActiveTsValidationError &&
+				/Aggregate "total" expected numeric values in field "score"/.test(error.message)
+		);
+		await assert.rejects(
+			() =>
+				adapter.aggregate!(meta, {
+					where: [],
+					or: [],
+					aggregates: [{ op: 'avg', field: 'score', as: 'average' }]
+				}),
+			(error) =>
+				error instanceof ActiveTsValidationError &&
+				/Aggregate "average" expected numeric values in field "score"/.test(error.message)
+		);
+	}
+});
+
+test('MongoDB update translates duplicate key 11000 errors to ActiveTsConflictError in root and transaction paths', async () => {
+	let replaceError: unknown;
+	let commitCalls = 0;
+	let abortCalls = 0;
+	let endCalls = 0;
+	const session = {
+		startTransaction: async () => undefined,
+		commitTransaction: async () => {
+			commitCalls++;
+		},
+		abortTransaction: async () => {
+			abortCalls++;
+		},
+		endSession: async () => {
+			endCalls++;
+		}
+	};
+	const adapter = await createMongoStoreAdapter({
+		dbName: 'test',
+		client: {
+			db: () => ({
+				collection: () => ({
+					replaceOne: async () => {
+						if (replaceError !== undefined) throw replaceError;
+						return { matchedCount: 1 };
+					},
+					findOne: async () => null
+				})
+			}),
+			startSession: () => session
+		}
+	});
+
+	replaceError = Object.assign(new Error('E11000 duplicate key error collection'), { code: 11000 });
+	await assert.rejects(
+		() => adapter.update(meta, 1, { id: 1, handle: 'duplicate' }),
+		ActiveTsConflictError
+	);
+	await assert.rejects(
+		() => adapter.update(meta, 1, { id: 1, handle: 'duplicate', version: 2 }, { expectedVersion: 1 }),
+		ActiveTsConflictError
+	);
+	await assert.rejects(
+		() => adapter.transaction!(async (tx) => tx.update(meta, 1, { id: 1, handle: 'duplicate' })),
+		ActiveTsConflictError
+	);
+	assert.equal(commitCalls, 0);
+	assert.equal(abortCalls, 1);
+	assert.equal(endCalls, 1);
+
+	const plainReplaceError = new Error('plain replace failure');
+	replaceError = plainReplaceError;
+	Object.defineProperty(Object.prototype, 'code', { value: 11000, configurable: true });
+	try {
+		await assert.rejects(
+			() => adapter.update(meta, 1, { id: 1, handle: 'plain' }),
+			(error) => error === plainReplaceError
+		);
+	} finally {
+		delete (Object.prototype as Record<string, unknown>).code;
+	}
+});
+
+test('MongoDB aggregate rejects dollar-prefixed aliases while allowing non-leading dollar aliases', async () => {
+	let collectionCalls = 0;
+	let aggregateCalls = 0;
+	let findCalls = 0;
+	const adapter = await createMongoStoreAdapter({
+		dbName: 'test',
+		allowAggregateScanFallback: true,
+		client: {
+			db: () => ({
+				collection: () => {
+					collectionCalls++;
+					return {
+						aggregate: () => {
+							aggregateCalls++;
+							return { toArray: async () => [{ _id: null, 'total$1': 3 }] };
+						},
+						find: () => {
+							findCalls++;
+							return { toArray: async () => [] };
+						}
+					};
+				}
+			})
+		}
+	});
+
+	for (const spec of [
+		{ op: 'count', as: '$total' },
+		{ op: 'count', as: '$' },
+		{ op: 'sum', field: 'score', as: '$sumScore' },
+		{ op: 'avg', field: 'score', as: '$avgScore' },
+		{ op: 'max', field: 'score', as: '$maxScore' }
+	] as const) {
+		await assert.rejects(
+			() => adapter.aggregate!(meta, { where: [], or: [], aggregates: [spec] }),
+			(error) =>
+				error instanceof ActiveTsValidationError &&
+				error.message === `MongoDB aggregate alias "${spec.as}" is not allowed.`
+		);
+	}
+	assert.equal(collectionCalls, 0);
+	assert.equal(aggregateCalls, 0);
+	assert.equal(findCalls, 0);
+
+	assert.deepEqual(
+		await adapter.aggregate!(meta, {
+			where: [],
+			or: [],
+			aggregates: [{ op: 'count', as: 'total$1' }]
+		}),
+		{ 'total$1': 3 }
+	);
+	assert.equal(aggregateCalls, 1);
+});
+
+test('MongoDB declaration output avoids optional mongodb peer imports and validates structural transaction options', () => {
+	const dts = readFileSync(new URL('../src/adapters/store/mongodb.d.ts', import.meta.url), 'utf8');
+	assert.doesNotMatch(dts, /from\s+['"]mongodb(?:\/|['"])/);
+	assert.doesNotMatch(dts, /import\s*\(\s*['"]mongodb(?:\/|['"])/);
+	assert.doesNotMatch(dts, /reference\s+types=['"]mongodb['"]/);
+
+	const validInstanceOptions: MongoTransactionNativeOptions = {
+		readConcern: new ReadConcern('snapshot'),
+		writeConcern: new WriteConcern('majority', 250, true),
+		readPreference: new ReadPreference('secondary', [{ region: 'east' }], { maxStalenessSeconds: 120 }),
+		maxCommitTimeMS: 100
+	};
+	const validPlainOptions: MongoTransactionNativeOptions = {
+		readConcern: { level: 'majority' },
+		writeConcern: { w: 1, journal: true, wtimeoutMS: 500 },
+		readPreference: { mode: 'nearest', tags: [{ dc: 'east' }], hedge: { enabled: true }, maxStalenessSeconds: 90 },
+		maxCommitTimeMS: 200
+	};
+	const validShorthandOptions: MongoTransactionNativeOptions = {
+		readConcern: 'local',
+		readPreference: 'primaryPreferred'
+	};
+	// @ts-expect-error invalid readConcern level must be rejected.
+	const invalidReadConcern: MongoTransactionNativeOptions = { readConcern: { level: 'invalid' } };
+	// @ts-expect-error invalid readPreference mode must be rejected.
+	const invalidReadPreference: MongoTransactionNativeOptions = { readPreference: 'invalid' };
+	// @ts-expect-error invalid writeConcern w value must be rejected.
+	const invalidWriteConcern: MongoTransactionNativeOptions = { writeConcern: { w: 'invalid' } };
+	// @ts-expect-error unknown native transaction option must be rejected.
+	const invalidUnknownOption: MongoTransactionNativeOptions = { retryWrites: true };
+	void validInstanceOptions;
+	void validPlainOptions;
+	void validShorthandOptions;
+	void invalidReadConcern;
+	void invalidReadPreference;
+	void invalidWriteConcern;
+	void invalidUnknownOption;
+});

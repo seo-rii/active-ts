@@ -227,14 +227,6 @@ for (const specifier of specifiers) {
 `
 	);
 	await exec('node', ['no-peer-runtime-smoke.mjs'], { cwd: installDir });
-	const mongodbPackageJson = JSON.parse(
-		await readFile(path.join(root, 'node_modules', 'mongodb', 'package.json'), 'utf8')
-	);
-	await exec(
-		'npm',
-		['install', '--ignore-scripts', '--save-dev', `mongodb@${mongodbPackageJson.version}`],
-		{ cwd: installDir }
-	);
 	await writeFile(
 		path.join(installDir, 'require-smoke.cjs'),
 		"require('active-ts');\n"
@@ -1385,6 +1377,7 @@ export async function verifyPackedArtifact(tarball, files, extractionDirectory) 
 	await assertPackedMarkdownLinksResolve(artifactRoot, packedPaths, ['README.md', ...[...packedPaths].filter((file) => file.startsWith('docs/') && file.endsWith('.md'))]);
 	await assertPackedFilesAvoidSecrets(artifactRoot, files);
 	await assertPackedSourceMapsResolve(artifactRoot, packedPaths);
+	await assertPackedDeclarationsAvoidOptionalPeers(artifactRoot, packedPaths, Object.keys(packageJson.peerDependencies ?? {}));
 	return { packageJson, packedPaths, root: artifactRoot };
 }
 
@@ -1450,6 +1443,28 @@ async function assertPackedSourceMapsResolve(rootDir, packedPaths) {
 		}
 	}
 	assert.deepEqual(issues, []);
+}
+
+async function assertPackedDeclarationsAvoidOptionalPeers(rootDir, packedPaths, optionalPeers) {
+	if (!optionalPeers.length) return;
+	const peerPatterns = optionalPeers.map((peer) => {
+		const escaped = peer.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+		return {
+			peer,
+			pattern: new RegExp(
+				`(?:\\b(?:from|import)\\s*\\(?\\s*['"]${escaped}(?:\\/[^'"]*)?['"]|///\\s*<reference\\s+types=['"]${escaped}['"])`
+			)
+		};
+	});
+	const leaks = [];
+	for (const file of packedPaths) {
+		if (!file.startsWith('build/src/') || !file.endsWith('.d.ts')) continue;
+		const content = await readFile(path.join(rootDir, file), 'utf8');
+		for (const { peer, pattern } of peerPatterns) {
+			if (pattern.test(content)) leaks.push(`${file} -> ${peer}`);
+		}
+	}
+	assert.deepEqual(leaks, []);
 }
 
 function isPackedTextFile(filePath) {

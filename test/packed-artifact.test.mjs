@@ -106,3 +106,15 @@ test('a broken Markdown link present only in a packed guide fails static checks'
 }, ({ members }) => {
 	members.set('docs/quickstart.md', '# Artifact-only guide\n\n[Missing guide](missing-fixture.md)\n');
 }));
+
+test('an optional peer import present in a packed declaration fails static checks', () => withPackedFixture(async ({ tarball, files, extractionDirectory }) => {
+	await assert.rejects(
+		verifyPackedArtifact(tarball, files, extractionDirectory),
+		/build\/src\/adapters\/store\/mongodb\.d\.ts -> mongodb/
+	);
+}, ({ members }) => {
+	members.set(
+		'build/src/adapters/store/mongodb.d.ts',
+		"import type { TransactionOptions } from 'mongodb';\nexport type Leaked = TransactionOptions;\n"
+	);
+}));
