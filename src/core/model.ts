@@ -1,16 +1,16 @@
 import { isDeepStrictEqual } from 'node:util';
 import { snapshotArrayInput } from './array-input.js';
 import { ActiveContext, getDefaultContext } from './context.js';
-import { ActiveTsCommittedWriteError, ActiveTsConfigurationError, ActiveTsConflictError, ActiveTsValidationError, safeErrorMessage } from './errors.js';
+import { ActiveTsCommittedWriteError, ActiveTsConfigurationError, ActiveTsConflictError, ActiveTsNotFoundError, ActiveTsValidationError, safeErrorMessage } from './errors.js';
 import { LazyRef } from './lazy-ref.js';
 import { isPartialModel } from './partial-model.js';
 import { findTypedViewDetails, type TypedView } from './typed-view.js';
 import { entityIdKey, valueFor } from './query-utils.js';
+import { applyFieldTypeTransforms } from './field-types.js';
 import {
 	snapshotRelationOwnerLocalKey,
 	snapshotRelationResult,
-	validateRelationOwnerLocalKeySnapshot,
-	validateRelationResultSnapshot
+	runAfterRelationLoad
 } from './relation-result.js';
 import { FindBuilder, normalizeIncludeSpecs, QueryBuilder, SearchBuilder } from './query.js';
 import type { AggregateComparableValue, AggregateFieldConstraint } from './query.js';
@@ -365,31 +365,19 @@ export abstract class Model<TData extends Record<string, any> = Record<string, a
 								await (result as any).include(...nested);
 							}
 						}
-						const after = await context.runHooks('afterRelationLoad', {
-							model: meta,
-							target: this,
-							result,
-							operation: 'relation',
-							meta: { relation }
-						});
-						result = after.result as any;
-						context.validateModelInstance(meta, this as any, `afterRelationLoad ${meta.name}.${relation} target`, {
-							expectedId,
-							expectedDatastoreAncestor,
-							partial: false
-						});
-						validateRelationOwnerLocalKeySnapshot(
-							context,
-							ownerLocalKeySnapshot,
-							this,
-							`afterRelationLoad ${meta.name}.${relation} target`
-						);
-						validateRelationResultSnapshot(
-							context,
-							resultSnapshot,
-							result,
-							`afterRelationLoad ${meta.name}.${relation}`
-						);
+						result = await runAfterRelationLoad(context, {
+							ownerMeta: meta,
+							owner: this,
+							relation: relationMeta,
+							ownerLocalKey: ownerLocalKeySnapshot,
+							validateOwner: (label) => {
+								context.validateModelInstance(meta, this as any, label, {
+									expectedId,
+									expectedDatastoreAncestor,
+									partial: false
+								});
+							}
+						}, resultSnapshot, result) as any;
 						ref.prime(result, { full: nested.length > 0 });
 					} catch (error) {
 						ref.clear();
@@ -1265,7 +1253,7 @@ function assertPostWriteModelDataUnchanged(
 	expectedId: EntityId
 ) {
 	const clean = context.validateModelInstance(meta, item, operation, { expectedId, partial: false });
-	if (!isDeepStrictEqual(clean, committedData)) {
+	if (!isDeepStrictEqual(clean, applyFieldTypeTransforms(meta, committedData, 'read'))) {
 		throw new ActiveTsValidationError(
 			`${operation} cannot change committed ${meta.name} data after the store write.`
 		);
@@ -1439,7 +1427,9 @@ async function writeWithConflictInvalidation(
 	try {
 		await write();
 	} catch (error) {
-		if (error instanceof ActiveTsConflictError) {
+		// A conflict or a missing row means the cached entity no longer matches the
+		// store; another writer changed or deleted it without this cache.
+		if (error instanceof ActiveTsConflictError || error instanceof ActiveTsNotFoundError) {
 			try {
 				await context.invalidateModelExternal(model, id);
 			} catch (invalidationError) {
