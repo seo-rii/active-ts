@@ -81,3 +81,27 @@ test('unconfigured collections retain Promise.all rejection timing', { timeout: 
   try { await assert.rejects(result, error => error === undefined); }
   finally { release(); }
 });
+
+test('batch concurrency does not split coalesced relation id loads', async () => {
+  for (const concurrency of [2, undefined]) {
+    const store = new MemoryStoreAdapter();
+    const original = MemoryStoreAdapter.prototype.getMany;
+    const childBatches: number[] = [];
+    let observe = false;
+    Object.defineProperty(store, 'getMany', { enumerable: true, configurable: true, writable: true, value(this: unknown, meta: any, ids: any[], options?: any) {
+      if (observe && meta.name === 'bounded_hooks_record') childBatches.push(ids.length);
+      return original.call(store, meta, ids, options);
+    } });
+    const context = createActiveTs({ stores: { default: store }, batch: { concurrency } });
+    const Bound = Record.use(context);
+    const BoundOwner = Owner.use(context);
+    for (let id = 1; id <= 6; id++) {
+      await Bound.create({ id, name: 'needle' });
+      await BoundOwner.create({ id, childId: id });
+    }
+    observe = true;
+    const owners = (await BoundOwner.query().include('child').load()).list;
+    assert.equal(owners.length, 6);
+    assert.deepEqual(childBatches, [6]);
+  }
+});

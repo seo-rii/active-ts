@@ -2017,9 +2017,15 @@ async function preloadIncludes(
 							mapSet(resultByOwner, owner.item, await query.find(owner.localValue as EntityId).load());
 						});
 					} else {
-						const loaded = await contextMapConcurrent(context, activeOwners, owner =>
-							context.loadById(target, owner.localValue as EntityId)
-						);
+						// Issue every id before awaiting so BatchLoader coalesces them into
+						// maxSize-chunked getMany calls; batch.concurrency must not split
+						// those batches. Loaded models' afterInstantiate hooks are bounded
+						// inside loadManyNow().
+						const loadTasks: Array<Promise<any>> = [];
+						for (let index = 0; index < activeOwners.length; index++) {
+							loadTasks[index] = context.loadById(target, activeOwners[index].localValue as EntityId);
+						}
+						const loaded = await Promise.all(loadTasks);
 						resultByOwner = new Map<any, any | any[] | null>();
 						for (let index = 0; index < activeOwners.length; index++) {
 							mapSet(resultByOwner, activeOwners[index].item, loaded[index] ?? null);
