@@ -314,7 +314,10 @@ test('Datastore missing commit acknowledgement or failed rollback report unknown
 	const uncertainCommit = await datastoreContext(failure);
 	const committed = await uncertainCommit.context.transactionResult(async () => 'value');
 	assert.equal(committed.outcome, 'unknown');
-	assert.equal(errorOf(committed), failure);
+	const commitError = errorOf(committed);
+	assert.ok(commitError instanceof ActiveTsUnknownTransactionOutcomeError);
+	assert.equal(commitError.phase, 'commit');
+	assert.equal(commitError.cause, failure);
 	assert.deepEqual(uncertainCommit.calls, ['run', 'commit']);
 	const uncertainRollback = await datastoreContext(undefined, failure);
 	const aborted = await uncertainRollback.context.transactionResult(async () => { throw new Error('callback'); });

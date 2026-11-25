@@ -214,7 +214,7 @@ jobs:
           NODE
       - run: pnpm test:integration:backends
       - name: Test release manifest verification
-        run: node --test scripts/release-artifact.test.mjs test/packed-artifact.test.mjs
+        run: node --test scripts/prepare-package.test.mjs scripts/release-artifact.test.mjs test/packed-artifact.test.mjs
       - name: Prepare identifiable release artifact
         id: artifact
         run: |
