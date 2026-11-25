@@ -34,6 +34,8 @@ import {
 	createDatastoreStoreAdapter,
 	inventoryDatastoreIds
 } from '../../build/src/adapters/store/datastore.js';
+import { datastoreSearchScopeForStore } from '../../build/src/core/datastore-search-scope.js';
+import { withDatastoreSearchNamespace } from '../../build/src/core/search-utils.js';
 import { createFirestoreStoreAdapter } from '../../build/src/adapters/store/firestore.js';
 import { createMongoStoreAdapter } from '../../build/src/adapters/store/mongodb.js';
 import { createPostgresStoreAdapter } from '../../build/src/adapters/store/postgresql.js';
@@ -62,6 +64,19 @@ const allowedRealGoogleBackendProjects = new Set(
 		.map((item) => item.trim())
 		.filter(Boolean)
 );
+
+// The Datastore SDK sends readTime with whole-second precision: it floors epoch
+// milliseconds to seconds. A read time taken in the same second as a write can
+// therefore select a snapshot from before that write. Wait until the next whole
+// second has started and use that boundary, which is at or after every earlier
+// write and is never in the future.
+async function nextDatastoreReadTime() {
+	const boundary = (Math.floor(Date.now() / 1000) + 1) * 1000;
+	while (Date.now() <= boundary) {
+		await new Promise((resolve) => setTimeout(resolve, boundary - Date.now() + 5));
+	}
+	return boundary;
+}
 
 function assertGoogleBackendSmokeSafety(target, emulatorEnvName) {
 	if (process.env[emulatorEnvName]) return;
@@ -609,13 +624,13 @@ if (targets.has('datastore')) {
 			if (!Array.isArray(specs) || specs.length <= 1) return directAggregate(model, plan);
 			const metaDescriptor = Object.getOwnPropertyDescriptor(plan, 'meta');
 			if (metaDescriptor && !('value' in metaDescriptor)) return directAggregate(model, plan);
-			return directAggregate(model, {
+			return nextDatastoreReadTime().then((readTime) => directAggregate(model, {
 				...plan,
 				meta: {
 					...(metaDescriptor?.value ?? {}),
-					...datastoreReadOptions({ readTime: Date.now() }).meta
+					...datastoreReadOptions({ readTime }).meta
 				}
-			});
+			}));
 		};
 	}
 	await runStoreAdapterContract(diagnosticAdapter, {
@@ -1107,8 +1122,7 @@ if (targets.has('datastore')) {
 			(await NestedRecord.ancestor(nestedParent).readConsistency('strong').find(1).load())?.data.id,
 			1
 		);
-		const historicalReadTime = Date.now();
-		await new Promise((resolve) => setTimeout(resolve, 10));
+		const historicalReadTime = await nextDatastoreReadTime();
 		await NestedRecord.ancestor(nestedParent).find(3).update({
 			metadata: { category: 'group-c', createdAt: 40 }
 		});
@@ -1116,7 +1130,7 @@ if (targets.has('datastore')) {
 			(await NestedRecord.ancestor(nestedParent).find(3).load())?.data.metadata.createdAt,
 			40
 		);
-		const emulatorReadTime = Date.now();
+		const emulatorReadTime = await nextDatastoreReadTime();
 		const pointInTime = process.env.DATASTORE_EMULATOR_HOST ? emulatorReadTime : historicalReadTime;
 		assert.equal(
 			(await NestedRecord.ancestor(nestedParent).readAt(pointInTime).find(3).load())?.data.metadata.createdAt,
@@ -1180,6 +1194,8 @@ if (targets.has('datastore') && targets.has('elasticsearch')) {
 		});
 		const Record = IntegrationDatastoreOutboxSearchRecord.use(context);
 		const meta = context.meta(IntegrationDatastoreOutboxSearchRecord);
+		const store = context.store(meta.store);
+		const searchMeta = withDatastoreSearchNamespace(meta, store.datastoreNamespace, datastoreSearchScopeForStore(store));
 		const leftAncestor = datastoreKey(parentKind, 10, { namespace });
 		const rightAncestor = datastoreKey(parentKind, 20, { namespace });
 		await Record.create({ id: 1, parentId: 10, title: 'backend left needle' });
@@ -1190,6 +1206,7 @@ if (targets.has('datastore') && targets.has('elasticsearch')) {
 				id: event.id,
 				operation: event.operation,
 				modelIdentity: event.modelIdentity,
+				modelDatastoreScope: event.modelDatastoreScope,
 				modelDatastoreAncestor: event.modelDatastoreAncestor,
 				hasData: event.data !== undefined
 			})),
@@ -1197,14 +1214,16 @@ if (targets.has('datastore') && targets.has('elasticsearch')) {
 				{
 					id: 'datastore-outbox-search-1',
 					operation: 'create',
-					modelIdentity: datastoreSearchDocumentIdentity(meta, 1, leftAncestor),
+					modelIdentity: datastoreSearchDocumentIdentity(searchMeta, 1, leftAncestor),
+					modelDatastoreScope: searchMeta.datastoreSearchScope,
 					modelDatastoreAncestor: leftAncestor,
 					hasData: false
 				},
 				{
 					id: 'datastore-outbox-search-2',
 					operation: 'create',
-					modelIdentity: datastoreSearchDocumentIdentity(meta, 1, rightAncestor),
+					modelIdentity: datastoreSearchDocumentIdentity(searchMeta, 1, rightAncestor),
+					modelDatastoreScope: searchMeta.datastoreSearchScope,
 					modelDatastoreAncestor: rightAncestor,
 					hasData: false
 				}
@@ -1223,9 +1242,14 @@ if (targets.has('datastore') && targets.has('elasticsearch')) {
 		assert.ok(Number.isSafeInteger(createdRevisionTotal) && createdRevisionTotal > 0);
 		const indexName = `${indexPrefix}${meta.name}`.toLowerCase();
 		await elasticsearchClient.indices.refresh({ index: indexName });
-		const indexed = await search.search(meta, 'needle', { limit: 10 });
+		const indexed = await context.searchAdapter('elasticsearch').search(meta, 'needle', { limit: 10 });
 		assert.deepEqual(
 			indexed.list.map((item) => `${item.id}:${item.parentId}`).sort(),
+			['1:10', '1:20']
+		);
+		const publicIndexed = await Record.search('needle').limit(10).load();
+		assert.deepEqual(
+			publicIndexed.list.map((item) => `${item.data.id}:${item.data.parentId}`).sort(),
 			['1:10', '1:20']
 		);
 
@@ -1236,6 +1260,7 @@ if (targets.has('datastore') && targets.has('elasticsearch')) {
 				id: event.id,
 				operation: event.operation,
 				modelIdentity: event.modelIdentity,
+				modelDatastoreScope: event.modelDatastoreScope,
 				modelDatastoreAncestor: event.modelDatastoreAncestor,
 				hasData: event.data !== undefined
 			})),
@@ -1243,7 +1268,8 @@ if (targets.has('datastore') && targets.has('elasticsearch')) {
 				{
 					id: 'datastore-outbox-search-3',
 					operation: 'delete',
-					modelIdentity: datastoreSearchDocumentIdentity(meta, 1, leftAncestor),
+					modelIdentity: datastoreSearchDocumentIdentity(searchMeta, 1, leftAncestor),
+					modelDatastoreScope: searchMeta.datastoreSearchScope,
 					modelDatastoreAncestor: leftAncestor,
 					hasData: false
 				}
@@ -1263,9 +1289,14 @@ if (targets.has('datastore') && targets.has('elasticsearch')) {
 			createdRevisionTotal + 1
 		);
 		await elasticsearchClient.indices.refresh({ index: indexName });
-		const afterDelete = await search.search(meta, 'needle', { limit: 10 });
+		const afterDelete = await context.searchAdapter('elasticsearch').search(meta, 'needle', { limit: 10 });
 		assert.deepEqual(
 			afterDelete.list.map((item) => `${item.id}:${item.parentId}`).sort(),
+			['1:20']
+		);
+		const publicAfterDelete = await Record.search('needle').limit(10).load();
+		assert.deepEqual(
+			publicAfterDelete.list.map((item) => `${item.data.id}:${item.data.parentId}`).sort(),
 			['1:20']
 		);
 	} finally {

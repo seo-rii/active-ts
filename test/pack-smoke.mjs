@@ -161,6 +161,7 @@ const PUBLIC_SUBPATH_SMOKE_EXPORTS = {
 		'createCacheAdapterContractSuite',
 		'createIntegrationHarness',
 		'createSearchAdapterContractSuite',
+		'createStoreParityFixture',
 		'createTestContext',
 		'expectNoLazyLoadWarnings',
 		'fixture',
@@ -169,6 +170,7 @@ const PUBLIC_SUBPATH_SMOKE_EXPORTS = {
 		'runCacheAdapterContract',
 		'runSearchAdapterContract',
 		'runStoreAdapterContract',
+		'runStoreAdapterDifferentialContract',
 		'seed',
 		'snapshotStore',
 		'withTestContext'
@@ -344,6 +346,7 @@ import {
 	createCacheAdapterContractSuite,
 	createIntegrationHarness,
 	createSearchAdapterContractSuite,
+	createStoreParityFixture,
 	createTestContext,
 	expectNoLazyLoadWarnings,
 	fixture,
@@ -352,6 +355,7 @@ import {
 	runCacheAdapterContract,
 	runSearchAdapterContract,
 	runStoreAdapterContract,
+	runStoreAdapterDifferentialContract,
 	seed,
 	snapshotStore,
 	type AdapterContractSuite,
@@ -362,7 +366,9 @@ import {
 	type SearchAdapterContractSuite,
 	type SearchAdapterContractOptions,
 	type StoreAdapterContractOptions,
+	type StoreAdapterDifferentialOptions,
 	type StoreContractModel,
+	type StoreParityFixture,
 	type TestContextOptions,
 	withTestContext
 } from 'active-ts/testing';
@@ -497,6 +503,13 @@ const testContext = createTestContext();
 const activeTestContext: ActiveTestContext = testContext;
 const testContextName: string = testContext.context.meta(PackedUser).name;
 const contract: typeof runStoreAdapterContract = runStoreAdapterContract;
+const differentialContract: typeof runStoreAdapterDifferentialContract = runStoreAdapterDifferentialContract;
+const storeParityFixture: StoreParityFixture = createStoreParityFixture(0x5eed);
+const storeParityOptions: StoreAdapterDifferentialOptions = {
+	seed: storeParityFixture.seed,
+	modelName: 'packed_store_parity',
+	reference: new MemoryStoreAdapter()
+};
 const cacheContract: typeof runCacheAdapterContract = runCacheAdapterContract;
 const searchContract: typeof runSearchAdapterContract = runSearchAdapterContract;
 const adapterSuite: typeof createAdapterContractSuite = createAdapterContractSuite;

@@ -27,6 +27,12 @@ export class CacheInvalidationFailures {
 			(state.generation > 0 && MAP_GET.call(state.recovered, key) !== state.generation));
 	}
 
+	/** Number of individually tracked failed keys for diagnostics. */
+	failedKeyCount(source: object) {
+		const state = WEAKMAP_GET.call(this.sources, source) as FailureState | undefined;
+		return state ? SET_SIZE.call(state.failures) as number : 0;
+	}
+
 	mark(source: object, key: string) {
 		let state = WEAKMAP_GET.call(this.sources, source) as FailureState | undefined;
 		if (!state) {
