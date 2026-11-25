@@ -1,7 +1,7 @@
 import { isDeepStrictEqual } from 'node:util';
 import { snapshotArrayInput } from './array-input.js';
 import { ActiveContext, getDefaultContext } from './context.js';
-import { ActiveTsCommittedWriteError, ActiveTsConfigurationError, ActiveTsConflictError, ActiveTsValidationError, safeErrorMessage } from './errors.js';
+import { ActiveTsCommittedWriteError, ActiveTsConfigurationError, ActiveTsConflictError, ActiveTsNotFoundError, ActiveTsValidationError, safeErrorMessage } from './errors.js';
 import { LazyRef } from './lazy-ref.js';
 import { isPartialModel } from './partial-model.js';
 import { findTypedViewDetails, type TypedView } from './typed-view.js';
@@ -1430,7 +1430,9 @@ async function writeWithConflictInvalidation(
 	try {
 		await write();
 	} catch (error) {
-		if (error instanceof ActiveTsConflictError) {
+		// A conflict or a missing row means the cached entity no longer matches the
+		// store; another writer changed or deleted it without this cache.
+		if (error instanceof ActiveTsConflictError || error instanceof ActiveTsNotFoundError) {
 			try {
 				await context.invalidateModelExternal(model, id);
 			} catch (invalidationError) {

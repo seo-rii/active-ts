@@ -222,3 +222,56 @@ jobs:
           }
           NODE
       - run: pnpm test:integration:backends
+  datastore-mode-emulator:
+    # The legacy Datastore emulator above accepts read times inside the second
+    # of a write. The Firestore emulator in Datastore mode applies them as the
+    # SDK sends them (whole seconds), so run the Datastore smoke against it too.
+    # Emulator 1.19.9 (gcloud 505) rejects committing an empty read-only
+    # transaction; 1.21.0 (gcloud 570) does not.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      DATASTORE_EMULATOR_HOST: 127.0.0.1:8083
+      GOOGLE_CLOUD_PROJECT: active-ts-emulator
+      GCLOUD_PROJECT: active-ts-emulator
+      ACTIVE_TS_INTEGRATION_TARGETS: datastore
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - name: Install and audit the exact package manager before executing it
+        run: node scripts/setup-pnpm.mjs
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+        with:
+          version: 570.0.0
+          install_components: cloud-firestore-emulator
+      - run: pnpm install --frozen-lockfile
+      - name: Start the Firestore emulator in Datastore mode
+        run: |
+          gcloud config set project "$GOOGLE_CLOUD_PROJECT"
+          gcloud emulators firestore start --database-mode=datastore-mode --project="$GOOGLE_CLOUD_PROJECT" --host-port="$DATASTORE_EMULATOR_HOST" > "$RUNNER_TEMP/datastore-mode-emulator.log" 2>&1 &
+          node --input-type=module <<'NODE'
+          import { Datastore } from '@google-cloud/datastore';
+
+          const datastore = new Datastore({ projectId: process.env.GOOGLE_CLOUD_PROJECT });
+          const key = datastore.key({ namespace: 'active_ts_readiness', path: ['readiness', 'probe'] });
+          let lastError;
+          for (let attempt = 1; attempt <= 60; attempt++) {
+            try {
+              await datastore.save({ key, data: { ok: true } });
+              const [entity] = await datastore.get(key);
+              if (!entity?.ok) throw new Error('Datastore probe read failed');
+              await datastore.delete(key);
+              process.exit(0);
+            } catch (error) {
+              lastError = error;
+              await new Promise((resolve) => setTimeout(resolve, 1000));
+            }
+          }
+          throw new Error(`Datastore-mode emulator did not become ready: ${lastError?.message ?? lastError}`);
+          NODE
+      - run: pnpm test:integration:backends
+      - name: Show the emulator log
+        if: failure()
+        run: cat "$RUNNER_TEMP/datastore-mode-emulator.log"
