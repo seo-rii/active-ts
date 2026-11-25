@@ -179,6 +179,8 @@ export type SearchCapabilities = Partial<{
 
 export type StoreAdapter = {
 	kind: string;
+	/** Close resources created by this adapter; injected clients remain caller-owned. */
+	close?: () => MaybePromise<void>;
 	capabilities?: StoreCapabilities;
 	cacheScope?: string;
 	datastoreNamespace?: string;
@@ -187,6 +189,8 @@ export type StoreAdapter = {
 	/** `null` denotes the default Datastore database; `undefined` means the database is unknown. */
 	datastoreDatabaseId?: string | null;
 	datastoreKeyEncoding?: 'active-ts' | 'native';
+	/** Whether cacheScope identifies a stable Datastore backend or only one client instance. */
+	datastoreCacheScopeStability?: 'stable' | 'client';
 	get: (model: ResolvedModelMeta, id: EntityId, options?: StoreReadOptions) => Promise<any | null>;
 	getMany: (
 		model: ResolvedModelMeta,
@@ -208,6 +212,8 @@ export type StoreAdapter = {
 
 export type CacheAdapter = {
 	kind: string;
+	/** Close resources created by this adapter; injected clients remain caller-owned. */
+	close?: () => MaybePromise<void>;
 	getMany: (keys: string[]) => Promise<Array<any | undefined>>;
 	setMany: (entries: Array<[string, any]>, options?: CacheWriteOptions) => Promise<void>;
 	deleteMany: (keys: string[]) => Promise<void>;
@@ -539,6 +545,8 @@ export type ResolvedModelMeta<TData = any> = {
 	};
 	search?: string;
 	searchDocumentIdentity?: string;
+	/** Canonical physical Datastore scope attached by context search routing. */
+	datastoreSearchScope?: string;
 	idField: string;
 	validator?: Validator<TData>;
 	readValidation: ValidationMode;
@@ -549,7 +557,7 @@ export type ResolvedModelMeta<TData = any> = {
 	views: Map<string, ViewResolver<TData>>;
 	policies: Map<string, PolicyResolver<TData>>;
 	scopes: Map<string, ScopeResolver<TData>>;
-	fieldCodecs: Map<string, FieldCodec>;
+	fieldCodecs: ReadonlyMap<string, Readonly<FieldCodec>>;
 	fieldTypes: Map<string, FieldType>;
 	datastore?: DatastoreModelMeta<TData>;
 };
@@ -576,4 +584,6 @@ export type ActiveTsConfig = {
 	plugins?: ActiveTsPlugin[];
 	queryPlanner?: QueryPlanner;
 	cacheKey?: CacheKeyResolver;
+	/** Maximum retained custom cache key owners; omitted means no limit. Built-in keys retain no owners. */
+	cacheKeyOwnerLimit?: number;
 };

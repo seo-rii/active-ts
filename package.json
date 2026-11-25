@@ -110,7 +110,7 @@
 		"docs/workers.md"
 	],
 	"scripts": {
-		"prepack": "pnpm build",
+		"prepack": "node scripts/prepare-package.mjs",
 		"build": "tsc -p tsconfig.json",
 		"typecheck": "tsc -p tsconfig.json --noEmit",
 		"audit": "pnpm audit --audit-level moderate",
