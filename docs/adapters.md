@@ -48,7 +48,7 @@ and the distinction between support and rejection coverage.
 | Aggregate helpers | Yes | Yes | Yes | Conditional | Yes | Yes; scalar metadata for min/max |
 | Transactions | Yes | Requires pool `connect()` | Requires client `startSession()` | Requires SDK `transaction()` | Yes | Yes |
 | Transaction point-read conflict detection | Yes | **No** | With transactions | With transactions | Yes | No |
-| Optimistic `expectedVersion` writes | Yes | Yes | Yes | No | No | Yes |
+| Optimistic `expectedVersion` writes | Yes | Yes | Yes | Requires SDK `transaction()` | No | Yes |
 | Unique schema indexes | No | Yes | Yes | No | No | Yes |
 | Trusted native query payloads | No | Yes | Yes | Yes | Yes | No |
 
@@ -489,6 +489,13 @@ const snapshot = await context.store('datastore').get(meta, 42, options);
 to the second SDK argument for `get()`, `runQuery()`, and
 `runAggregationQuery()`, including every query-scan fallback page and min/max
 probe. Reuse the same `readAt()` value when following a continuation cursor.
+The Datastore SDK sends that `readTime` with whole-second precision: it floors
+the epoch milliseconds to seconds (checked in SDK 10.1.0 and 11.1.0). A read
+time inside the current second therefore selects the snapshot at the start of
+that second, so `readAt(Date.now())` can omit a write committed a few
+milliseconds earlier. To observe a write, use a whole-second read time taken
+after that second has ended, or use `readConsistency('strong')` for a current
+read.
 Low-level `getMany()` calls with more than 1,000 unique IDs are split into SDK
 lookup chunks only inside a Datastore transaction or with an explicit
 `datastoreReadOptions({ readTime })`; otherwise they fail before backend access
@@ -679,6 +686,9 @@ failures, such as a lost response, `DEADLINE_EXCEEDED` or `UNAVAILABLE`, may
 have been applied: they raise `ActiveTsUnknownTransactionOutcomeError` with
 `phase === "commit"` and the SDK error in `cause`, and suppress both commit and
 rollback hooks. Firestore reports its unknown commit outcomes the same way.
+The same transaction support provides `capabilities.optimisticLock`, so models
+with a numeric `version` field can `save()` and `delete()`; see
+[optimistic locking](extensions.md#optimistic-locking).
 Datastore mode databases using
 `OPTIMISTIC_WITH_ENTITY_GROUPS` can set
 `requireAncestorTransactionQueries: true` on `createDatastoreStoreAdapter()` to

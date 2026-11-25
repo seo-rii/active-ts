@@ -236,7 +236,11 @@ test('CI and package scripts keep dependency audit enabled', () => {
 	assert.match(pnpmWorkspace, /^allowBuilds:\n(?:  [^\n]+\n)*  protobufjs: true$/m);
 	assert.match(pnpmWorkspace, /^overrides:\n(?:  [^\n]+\n)*  '@grpc\/grpc-js': 1\.14\.5$/m);
 	assert.match(pnpmWorkspace, /^overrides:\n(?:  [^\n]+\n)*  '@opentelemetry\/core': 2\.8\.0$/m);
-	assert.match(pnpmWorkspace, /^overrides:\n(?:  [^\n]+\n)*  brace-expansion: 2\.1\.7$/m);
+	// google-gax pulls rimraf > glob > minimatch > brace-expansion; glob and
+	// minimatch have no patched release on the lines rimraf 5 requests.
+	assert.match(pnpmWorkspace, /^overrides:\n(?:  [^\n]+\n)*  brace-expansion: 5\.0\.13$/m);
+	assert.match(pnpmWorkspace, /^overrides:\n(?:  [^\n]+\n)*  glob: 14\.0\.6$/m);
+	assert.match(pnpmWorkspace, /^overrides:\n(?:  [^\n]+\n)*  minimatch: 11\.0\.9$/m);
 	assert.match(pnpmWorkspace, /^overrides:\n(?:  [^\n]+\n)*  protobufjs: 7\.6\.5$/m);
 	assert.match(pnpmWorkspace, /^overrides:\n(?:  [^\n]+\n)*  undici: 7\.30\.1$/m);
 	assert.ok(ciAuditIndex >= 0, 'CI workflow must run dependency audit');
