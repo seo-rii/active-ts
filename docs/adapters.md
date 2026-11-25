@@ -1,6 +1,6 @@
 # Adapters
 
-Adapters created by the PostgreSQL, MongoDB, and Redis/Valkey factories expose
+Adapters created by the PostgreSQL, MongoDB, Firestore, and Redis/Valkey factories expose
 an optional `close()` lifecycle method. Retain the factory result and call
 `await adapter.close?.()` after application work and transactions have stopped.
 It closes only the pool/client created internally by that factory. An injected
