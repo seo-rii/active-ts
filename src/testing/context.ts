@@ -148,6 +148,9 @@ export class ActiveTestContext {
 		const safeRows = snapshotSeedRows<TModel['data']>(rows);
 		const meta = this.context.meta(model);
 		const ids = mapArray(safeRows, (row) => seedRowId(row, meta));
+		// Prepare the complete batch before mutating the adapter. Fixtures accept
+		// model data, while every storage path (including seedModel) accepts encoded rows.
+		const encodedRows = mapArray(safeRows, (row) => this.context.encodeWrite(meta, row));
 		const store = this.store as StoreAdapter & {
 			seed?: (modelName: string, rows: TModel['data'][]) => MaybePromise<void>;
 			seedModel?: (meta: ResolvedModelMeta, rows: TModel['data'][]) => MaybePromise<void>;
@@ -157,11 +160,11 @@ export class ActiveTestContext {
 		try {
 			const seedModel = testingAdapterMethod(store, 'seedModel');
 			const seed = seedModel ? undefined : testingAdapterMethod(store, 'seed');
-			if (seedModel) await seedModel(meta, cloneSeedRowsForAdapter(safeRows));
-			else if (seed) await seed(meta.name, cloneSeedRowsForAdapter(safeRows));
+			if (seedModel) await seedModel(meta, cloneSeedRowsForAdapter(encodedRows));
+			else if (seed) await seed(meta.name, cloneSeedRowsForAdapter(encodedRows));
 			else {
-				for (let index = 0; index < safeRows.length; index++) {
-					await this.store.create(meta, ids[index], cloneSafeDataObject(safeRows[index], `ActiveTestContext.seed() rows[${index}]`));
+				for (let index = 0; index < encodedRows.length; index++) {
+					await this.store.create(meta, ids[index], cloneSafeDataObject(encodedRows[index], `ActiveTestContext.seed() rows[${index}]`));
 				}
 			}
 		} catch (error) {
