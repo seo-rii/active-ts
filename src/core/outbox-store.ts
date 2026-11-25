@@ -125,7 +125,7 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 		const limit = normalizeOutboxBatchLimit(options, 'store outbox lease options');
 		const context = this.activeContext();
 		const store = contextInternalStore(context, this.meta.store);
-		if (store.capabilities?.optimisticLock !== true && !storeSupportsOutboxLeaseTransactions(store)) {
+		if (!storeOutboxUsesOptimisticWrites(store) && !storeSupportsOutboxLeaseTransactions(store)) {
 			throw new ActiveTsConfigurationError(
 				`Store outbox adapter requires store "${store.kind}" to support optimistic locking or conflict-detecting transactions for exclusive leases.`
 			);
@@ -189,7 +189,7 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 
 	supportsExclusiveLease() {
 		const store = contextInternalStore(this.activeContext(), this.meta.store);
-		return store.capabilities?.optimisticLock === true || storeSupportsOutboxLeaseTransactions(store);
+		return storeOutboxUsesOptimisticWrites(store) || storeSupportsOutboxLeaseTransactions(store);
 	}
 
 	async isLeaseCurrent(event: OutboxEvent) {
@@ -245,7 +245,7 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 					this.revisionMeta,
 					revisionId,
 					next,
-					store.capabilities?.optimisticLock === true
+					storeOutboxUsesOptimisticWrites(store)
 						? { expectedVersion: currentRevision.version }
 						: undefined
 				);
@@ -263,7 +263,7 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 			return revision;
 		};
 		try {
-			if (store.capabilities?.optimisticLock === true) return await run(context, true);
+			if (storeOutboxUsesOptimisticWrites(store)) return await run(context, true);
 			if (storeSupportsOutboxLeaseTransactions(store)) {
 				return await context.transaction((tx) => run(tx, false), { store: this.meta.store });
 			}
@@ -308,13 +308,13 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 				this.meta,
 				current.id,
 				renewed,
-				store.capabilities?.optimisticLock === true ? outboxExpectedVersionOption(current) : undefined
+				storeOutboxUsesOptimisticWrites(store) ? outboxExpectedVersionOption(current) : undefined
 			);
 			return renewed;
 		};
 		const store = contextInternalStore(context, this.meta.store);
 		try {
-			if (store.capabilities?.optimisticLock === true) return await run(context);
+			if (storeOutboxUsesOptimisticWrites(store)) return await run(context);
 			if (storeSupportsOutboxLeaseTransactions(store)) {
 				return await context.transaction((tx) => run(tx), { store: this.meta.store });
 			}
@@ -342,7 +342,7 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 						this.meta,
 						event.id,
 						released,
-						store.capabilities?.optimisticLock === true ? outboxExpectedVersionOption(current) : undefined
+						storeOutboxUsesOptimisticWrites(store) ? outboxExpectedVersionOption(current) : undefined
 					);
 				} catch (error) {
 					if (error instanceof ActiveTsConflictError || error instanceof ActiveTsNotFoundError) continue;
@@ -351,7 +351,7 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 			}
 		};
 		const store = contextInternalStore(context, this.meta.store);
-		if (store.capabilities?.optimisticLock !== true && storeSupportsOutboxLeaseTransactions(store)) {
+		if (!storeOutboxUsesOptimisticWrites(store) && storeSupportsOutboxLeaseTransactions(store)) {
 			const errors: unknown[] = [];
 			for (const event of normalized) {
 				try {
@@ -407,13 +407,13 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 					this.meta,
 					current.id,
 					next,
-					store.capabilities?.optimisticLock === true ? outboxExpectedVersionOption(current) : undefined
+					storeOutboxUsesOptimisticWrites(store) ? outboxExpectedVersionOption(current) : undefined
 				);
 			}
 		};
 		const context = this.activeContext();
 		const store = contextInternalStore(context, this.meta.store);
-		if (store.capabilities?.optimisticLock !== true && storeSupportsOutboxLeaseTransactions(store)) {
+		if (!storeOutboxUsesOptimisticWrites(store) && storeSupportsOutboxLeaseTransactions(store)) {
 			const errors: unknown[] = [];
 			for (const failure of normalized) {
 				try {
@@ -459,12 +459,12 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 				this.meta,
 				current.id,
 				claimed,
-				store.capabilities?.optimisticLock === true ? outboxExpectedVersionOption(current) : undefined
+				storeOutboxUsesOptimisticWrites(store) ? outboxExpectedVersionOption(current) : undefined
 			);
 			return { current: claimed, claimed };
 		};
 		const store = contextInternalStore(context, this.meta.store);
-		if (store.capabilities?.optimisticLock === true) return await run(context);
+		if (storeOutboxUsesOptimisticWrites(store)) return await run(context);
 		return await context.transaction((tx) => run(tx), { store: this.meta.store });
 	}
 
@@ -506,7 +506,7 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 				const event = batch[index];
 				const current = currentEvents[index];
 				const currentStore = contextInternalStore(context, this.meta.store);
-				const deleteOptions = currentStore.capabilities?.optimisticLock === true
+				const deleteOptions = storeOutboxUsesOptimisticWrites(currentStore)
 					? outboxExpectedVersionOption(current)
 					: undefined;
 				try {
@@ -542,7 +542,7 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 		};
 		const context = this.activeContext();
 		const store = contextInternalStore(context, this.meta.store);
-		if (store.capabilities?.optimisticLock !== true && storeSupportsOutboxLeaseTransactions(store)) {
+		if (!storeOutboxUsesOptimisticWrites(store) && storeSupportsOutboxLeaseTransactions(store)) {
 			const errors: unknown[] = [];
 			let acknowledged = true;
 			for (const event of normalized) {
@@ -618,14 +618,14 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 						await store.delete(
 							this.meta,
 							current.id,
-							store.capabilities?.optimisticLock === true ? outboxExpectedVersionOption(current) : undefined
+							storeOutboxUsesOptimisticWrites(store) ? outboxExpectedVersionOption(current) : undefined
 						);
 						if (recoverDeletes) deleted.push(current);
 						drained.push(current);
 						if (limit !== undefined && drained.length >= limit) break;
 					} catch (error) {
 						if (
-							store.capabilities?.optimisticLock === true &&
+							storeOutboxUsesOptimisticWrites(store) &&
 							(error instanceof ActiveTsConflictError || error instanceof ActiveTsNotFoundError)
 						) {
 							blockOutboxEntityOrderKeys(blockedEntityKeys, blockOrderKeys);
@@ -745,7 +745,7 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 				await store.delete(
 					this.meta,
 					event.id,
-					store.capabilities?.optimisticLock === true ? outboxExpectedVersionOption(currentEvent) : undefined
+					storeOutboxUsesOptimisticWrites(store) ? outboxExpectedVersionOption(currentEvent) : undefined
 				);
 			} catch (error) {
 				errors.push(error);
@@ -888,6 +888,18 @@ export function initialStoreOutboxSearchRevision() {
 		throw new ActiveTsConflictError('Store outbox search revision clock is outside the supported range.');
 	}
 	return revision;
+}
+
+/**
+ * Whether the outbox writes with version checks outside transactions. Datastore
+ * and Firestore implement optimistic locking with their own transactions, so
+ * the outbox keeps their per-event lease transactions, which also respect their
+ * transaction rules (Firestore reads before writes, Datastore entity groups).
+ */
+export function storeOutboxUsesOptimisticWrites(store: StoreAdapter) {
+	if (store.capabilities?.optimisticLock !== true) return false;
+	const transactionBackedLock = store.kind === 'datastore' || store.kind === 'firestore';
+	return !(transactionBackedLock && storeSupportsOutboxLeaseTransactions(store));
 }
 
 export function storeSupportsOutboxManagementTransactions(store: StoreAdapter) {
