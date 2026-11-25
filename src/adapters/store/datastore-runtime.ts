@@ -128,9 +128,27 @@ import type {
 
 type DatastoreSdkLoader = () => Promise<{ Datastore: any }>;
 
+/** The Datastore RPC an adapter call is about to start. */
+export type DatastoreRpcOperation =
+	| 'lookup'
+	| 'runQuery'
+	| 'runAggregationQuery'
+	| 'beginTransaction'
+	| 'commit'
+	| 'rollback';
+/**
+ * Returns SDK `gaxOptions` for one Datastore call, such as `{ timeout }` or a
+ * transport's cancellation options. It runs in the caller's async context
+ * immediately before the SDK call; the returned object is passed unchanged.
+ */
+export type DatastoreGaxOptionsProvider = (
+	call: Readonly<{ operation: DatastoreRpcOperation }>
+) => object | undefined;
+
 export type DatastoreStoreOptions = {
 	client?: any;
 	datastoreOptions?: Record<string, any>;
+	gaxOptions?: DatastoreGaxOptionsProvider;
 	namespace?: string;
 	cacheScope?: string;
 	keyEncoding?: DatastoreKeyEncoding;
@@ -142,6 +160,7 @@ export type DatastoreStoreOptions = {
 export type DatastoreNamespaceStoreFactoryOptions = {
 	client?: any;
 	datastoreOptions?: Record<string, any>;
+	gaxOptions?: DatastoreGaxOptionsProvider;
 	cacheScopePrefix?: string;
 	keyEncoding?: DatastoreKeyEncoding;
 	keySymbol?: symbol;
@@ -437,6 +456,7 @@ function withoutExpectedVersion(options: StoreWriteOptions): StoreWriteOptions {
 const DATASTORE_OPTION_KEYS = [
 	'client',
 	'datastoreOptions',
+	'gaxOptions',
 	'namespace',
 	'cacheScope',
 	'keyEncoding',
@@ -448,6 +468,7 @@ const DATASTORE_OPTION_KEYS = [
 const DATASTORE_NAMESPACE_FACTORY_OPTION_KEYS = [
 	'client',
 	'datastoreOptions',
+	'gaxOptions',
 	'cacheScopePrefix',
 	'keyEncoding',
 	'keySymbol',
@@ -1153,11 +1174,22 @@ function rejectDatastoreTransactionReadPolicy(options: StoreReadOptions, context
 }
 
 function runDatastoreRead(
-	method: (input: any, options?: DatastoreSdkReadOptions) => any,
+	method: (input: any, options?: any) => any,
 	input: any,
-	options: DatastoreSdkReadOptions | undefined
+	options: DatastoreSdkReadOptions | undefined,
+	gaxOptions?: Record<string, unknown>
 ) {
+	if (gaxOptions !== undefined) return method(input, { ...options, gaxOptions });
 	return options === undefined ? method(input) : method(input, options);
+}
+
+// Shallow merge: explicit per-transaction native options win over provided ones.
+function mergeDatastoreGaxOptions(
+	provided: Record<string, unknown> | undefined,
+	explicit: Record<string, unknown> | undefined
+) {
+	if (provided === undefined) return explicit;
+	return explicit === undefined ? provided : { ...provided, ...explicit };
 }
 
 function datastoreAncestorFromReadOptions(options: StoreReadOptions): DatastoreAncestorOverride {
@@ -1399,7 +1431,10 @@ export async function createDatastoreNamespaceStoreFactory(
 			record,
 			'requireAncestorTransactionQueries',
 			'Datastore namespace store factory option'
-		) as boolean | undefined
+		) as boolean | undefined,
+		gaxOptions: ownFactoryOptionValue(record, 'gaxOptions', 'Datastore namespace store factory option') as
+			| DatastoreGaxOptionsProvider
+			| undefined
 	});
 	if (
 		options.datastoreOptions !== undefined &&
@@ -1444,7 +1479,8 @@ export async function createDatastoreNamespaceStoreFactory(
 		keySymbol,
 		allowAggregateScanFallback: options.allowAggregateScanFallback,
 		allowQueryScanFallback: options.allowQueryScanFallback,
-		requireAncestorTransactionQueries: options.requireAncestorTransactionQueries
+		requireAncestorTransactionQueries: options.requireAncestorTransactionQueries,
+		gaxOptions: options.gaxOptions
 	};
 	const factory: DatastoreNamespaceStoreFactory = {
 		forNamespace: async (namespace?: string) => {
@@ -1482,6 +1518,18 @@ function createDatastoreAdapter(
 ): StoreAdapter {
 	const kindName = datastoreKindName;
 	const keyEncoding = options.keyEncoding ?? 'active-ts';
+	const gaxOptionsProvider = options.gaxOptions;
+	const callGaxOptions = (operation: DatastoreRpcOperation): Record<string, unknown> | undefined => {
+		if (gaxOptionsProvider === undefined) return undefined;
+		const value: unknown = gaxOptionsProvider(Object.freeze({ operation }));
+		if (value === undefined) return undefined;
+		if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+			throw new ActiveTsConfigurationError(
+				`Datastore adapter gaxOptions must return an object or undefined for ${operation}.`
+			);
+		}
+		return value as Record<string, unknown>;
+	};
 	const namespacedKey = (path: Array<string | number>, namespace: string | undefined) => {
 		if (namespace !== undefined && options.namespace !== undefined && namespace !== options.namespace) {
 			throw new ActiveTsConfigurationError('Datastore key namespace must match adapter namespace.');
@@ -1637,7 +1685,8 @@ function createDatastoreAdapter(
 				await runDatastoreRead(
 					datastoreMethod(client, 'runQuery', 'Datastore client.runQuery'),
 					scanQuery,
-					readOptions
+					readOptions,
+					callGaxOptions('runQuery')
 				),
 				context
 			);
@@ -1688,6 +1737,19 @@ function createDatastoreAdapter(
 	};
 
 	const adapterNamespace = options.namespace;
+	// insert() and update() accept no SDK call options, so a write that carries
+	// gaxOptions uses the equivalent save() method. Transaction-scoped writes only
+	// buffer mutations; their Commit receives the options instead.
+	const commitGaxOptions = () => (scopedTransaction ? undefined : callGaxOptions('commit'));
+	const saveWithGaxOptions = async (
+		entity: Record<string, unknown> | Record<string, unknown>[],
+		method: 'insert' | 'update' | undefined,
+		gaxOptions: Record<string, unknown>,
+		context: string
+	) => {
+		const withMethod = (item: Record<string, unknown>) => (method === undefined ? item : { ...item, method });
+		await client.save(Array.isArray(entity) ? entity.map(withMethod) : withMethod(entity), gaxOptions);
+	};
 	// A version-checked write outside a transaction runs in its own read-write
 	// transaction. The version read and the write commit together; a concurrent
 	// change aborts the commit, which the transaction reports as a conflict.
@@ -1856,7 +1918,10 @@ function createDatastoreAdapter(
 						let committing = false;
 						let result: Awaited<ReturnType<typeof fn>>;
 						try {
-						await transaction.run(runOptions);
+						const beginGaxOptions = mergeDatastoreGaxOptions(callGaxOptions('beginTransaction'), nativeGaxOptions);
+						await transaction.run(beginGaxOptions === nativeGaxOptions
+							? runOptions
+							: { ...runOptions, gaxOptions: beginGaxOptions });
 						started = true;
 						let closed: string | undefined;
 						const txStore = createDatastoreAdapter(
@@ -1976,8 +2041,12 @@ function createDatastoreAdapter(
 								resolvedAncestor === undefined && !ancestorOverride.provided
 									? ancestorOverride
 									: { provided: true, ancestor: resolvedAncestor };
+							const entityKey = makeEntityKey(model, id, data, entityKeyAncestorOverride);
+							const lookupGaxOptions = callGaxOptions('lookup');
 							const entity = datastoreRequiredResultSlot(
-								await transaction.client.get(makeEntityKey(model, id, data, entityKeyAncestorOverride)),
+								await (lookupGaxOptions === undefined
+									? transaction.client.get(entityKey)
+									: transaction.client.get(entityKey, { gaxOptions: lookupGaxOptions })),
 								context,
 								0
 							);
@@ -2733,8 +2802,11 @@ function createDatastoreAdapter(
 								}
 							}
 						}
+						// Ask the provider before marking the commit started: a provider
+						// failure (an aborted request, an invalid result) is not a commit.
+						const commitOptions = mergeDatastoreGaxOptions(callGaxOptions('commit'), nativeCommitGaxOptions);
 						committing = true;
-						await transaction.commit(nativeCommitGaxOptions);
+						await transaction.commit(commitOptions);
 						return result;
 					} catch (error) {
 						if (!started) throw error;
@@ -2764,7 +2836,7 @@ function createDatastoreAdapter(
 							));
 						}
 						try {
-							await transaction.rollback(nativeRollbackGaxOptions);
+							await transaction.rollback(mergeDatastoreGaxOptions(callGaxOptions('rollback'), nativeRollbackGaxOptions));
 						} catch (rollbackError) {
 							throw markTransactionRollbackSkipped(new AggregateError(
 								[error, rollbackError],
@@ -2802,7 +2874,8 @@ function createDatastoreAdapter(
 				await runDatastoreRead(
 					datastoreMethod(client, 'get', 'Datastore client.get'),
 					key,
-					sdkReadOptions
+					sdkReadOptions,
+					callGaxOptions('lookup')
 				),
 				'Datastore get',
 				0
@@ -2868,7 +2941,7 @@ function createDatastoreAdapter(
 					const end = Math.min(offset + DATASTORE_LOOKUP_MAX_KEYS, entityKeys.length);
 					for (let index = offset; index < end; index++) keys[keys.length] = entityKeys[index];
 					const entities = datastoreRequiredResultSlot(
-						await runDatastoreRead(get, keys, sdkReadOptions),
+						await runDatastoreRead(get, keys, sdkReadOptions, callGaxOptions('lookup')),
 						'Datastore getMany',
 						0
 					);
@@ -3104,7 +3177,8 @@ function createDatastoreAdapter(
 							await runDatastoreRead(
 								datastoreMethod(client, 'runQuery', 'Datastore client.runQuery'),
 								query,
-								sdkReadOptions
+								sdkReadOptions,
+								callGaxOptions('runQuery')
 							),
 							'Datastore runQuery'
 						);
@@ -3190,7 +3264,8 @@ function createDatastoreAdapter(
 				await runDatastoreRead(
 					datastoreMethod(client, 'runQuery', 'Datastore client.runQuery'),
 					query,
-					sdkReadOptions
+					sdkReadOptions,
+					callGaxOptions('runQuery')
 				),
 				'Datastore runQuery'
 			);
@@ -3472,7 +3547,8 @@ function createDatastoreAdapter(
 									'Datastore client.runAggregationQuery'
 								),
 								aggregateQuery,
-								sdkReadOptions
+								sdkReadOptions,
+								callGaxOptions('runAggregationQuery')
 							),
 							'Datastore runAggregationQuery'
 						);
@@ -3554,7 +3630,8 @@ function createDatastoreAdapter(
 							await runDatastoreRead(
 								datastoreMethod(client, 'runQuery', 'Datastore client.runQuery'),
 								query,
-								sdkReadOptions
+								sdkReadOptions,
+								callGaxOptions('runQuery')
 							),
 							'Datastore aggregate min/max runQuery'
 						);
@@ -3622,11 +3699,13 @@ function createDatastoreAdapter(
 				'Datastore store create options'
 			);
 			const entity = entityPayload(model, id, clean, ancestor);
-			if (!client.insert) {
+			const gaxOptions = commitGaxOptions();
+			if (!client.insert && gaxOptions === undefined) {
 				throw new ActiveTsConfigurationError('Datastore adapter client.insert is required for atomic create().');
 			}
 			try {
-				await client.insert(entity);
+				if (gaxOptions !== undefined) await saveWithGaxOptions(entity, 'insert', gaxOptions, 'Datastore create()');
+				else await client.insert!(entity);
 			} catch (error) {
 				if (isDatastoreAlreadyExistsError(error)) {
 					throw new ActiveTsConflictError(`Cannot create ${model.name}:${String(id)} because it already exists.`);
@@ -3654,11 +3733,13 @@ function createDatastoreAdapter(
 				'Datastore store write options'
 			);
 			const entity = entityPayload(model, id, clean, ancestor);
-			if (!client.update) {
+			const gaxOptions = commitGaxOptions();
+			if (!client.update && gaxOptions === undefined) {
 				throw new ActiveTsConfigurationError('Datastore adapter client.update is required for update().');
 			}
 			try {
-				await client.update(entity);
+				if (gaxOptions !== undefined) await saveWithGaxOptions(entity, 'update', gaxOptions, 'Datastore update()');
+				else await client.update(entity);
 			} catch (error) {
 				if (isDatastoreNotFoundError(error)) {
 					throw new ActiveTsNotFoundError(`Cannot update ${model.name}:${String(id)} because it does not exist.`);
@@ -3675,7 +3756,10 @@ function createDatastoreAdapter(
 			const ancestor = datastoreAncestorFromWriteOptions(safeOptions);
 			assertDatastoreDirectIdReadAllowed(model, ancestor);
 			const key = makeEntityKey(model, id, undefined, ancestor);
-			await datastoreMethod(client, 'delete', 'Datastore client.delete')(key);
+			const gaxOptions = commitGaxOptions();
+			const deleteEntity = datastoreMethod(client, 'delete', 'Datastore client.delete');
+			if (gaxOptions === undefined) await deleteEntity(key);
+			else await deleteEntity(key, gaxOptions);
 		},
 		schema: scopedTransaction
 			? undefined
@@ -3737,11 +3821,13 @@ function createDatastoreAdapter(
 				let started = false;
 				let committing = false;
 				try {
-					await transaction.run();
+					const beginOptions = callGaxOptions('beginTransaction');
+					await (beginOptions === undefined ? transaction.run() : transaction.run({ gaxOptions: beginOptions }));
 					started = true;
 					await mutate(transaction.client, items);
+					const commitOptions = callGaxOptions('commit');
 					committing = true;
-					await transaction.commit();
+					await (commitOptions === undefined ? transaction.commit() : transaction.commit(commitOptions));
 				} catch (error) {
 					if (!started) throw error;
 					if (committing) {
@@ -3750,7 +3836,8 @@ function createDatastoreAdapter(
 						throw markTransactionRollbackSkipped(error);
 					}
 					try {
-						await transaction.rollback();
+						const rollbackOptions = callGaxOptions('rollback');
+						await (rollbackOptions === undefined ? transaction.rollback() : transaction.rollback(rollbackOptions));
 					} catch (rollbackError) {
 						throw markTransactionRollbackSkipped(
 							new AggregateError(
@@ -3867,6 +3954,11 @@ function createDatastoreAdapter(
 						entityBytes,
 						safeMutationOptions,
 					async (target, batch) => {
+						const gaxOptions = target === client ? commitGaxOptions() : undefined;
+						if (gaxOptions !== undefined) {
+							await saveWithGaxOptions(batch, undefined, gaxOptions, 'Datastore bulk upsert');
+							return;
+						}
 						if (!target.upsert) {
 							throw new ActiveTsConfigurationError(
 								'Datastore bulk upsert requires client.upsert() or client.save().'
@@ -3933,7 +4025,9 @@ function createDatastoreAdapter(
 						keyBytes,
 						safeMutationOptions,
 					async (target, batch) => {
-						await target.delete(batch);
+						const gaxOptions = target === client ? commitGaxOptions() : undefined;
+						if (gaxOptions === undefined) await target.delete(batch);
+						else await target.delete(batch, gaxOptions);
 					},
 					'Datastore bulk delete',
 					'deleteMany'
@@ -4154,6 +4248,10 @@ function validateDatastoreOptions(options: DatastoreStoreOptions) {
 		'requireAncestorTransactionQueries',
 		'Datastore adapter option'
 	);
+	const gaxOptions = ownFactoryOptionValue(record, 'gaxOptions', 'Datastore adapter option');
+	if (gaxOptions !== undefined && typeof gaxOptions !== 'function') {
+		throw new ActiveTsConfigurationError('Datastore adapter gaxOptions must be a function.');
+	}
 	const safeDatastoreOptions =
 		datastoreOptions === undefined
 			? undefined
@@ -4199,7 +4297,8 @@ function validateDatastoreOptions(options: DatastoreStoreOptions) {
 		client,
 		allowAggregateScanFallback,
 		allowQueryScanFallback,
-		requireAncestorTransactionQueries
+		requireAncestorTransactionQueries,
+		gaxOptions: gaxOptions as DatastoreGaxOptionsProvider | undefined
 	} as DatastoreStoreOptions;
 }
 
@@ -4658,9 +4757,24 @@ function normalizeDatastoreClient(client: unknown) {
 	);
 	const insert = datastoreOptionalMethod(client, 'insert', 'Datastore adapter client.insert');
 	const update = datastoreMethod(client, 'update', 'Datastore adapter client.update');
-	const upsert = datastoreOptionalMethod(client, 'upsert', 'Datastore adapter client.upsert')
-		?? datastoreOptionalMethod(client, 'save', 'Datastore adapter client.save');
+	// As before the gaxOptions provider, an upsert-capable client exposes save()
+	// only when a write needs it; it is read on first use, not at construction.
+	let saveMethod: ((...args: any[]) => any) | undefined;
+	let saveRead = false;
+	const readSave = () => {
+		if (!saveRead) {
+			saveMethod = datastoreOptionalMethod(client, 'save', 'Datastore adapter client.save');
+			saveRead = true;
+		}
+		return saveMethod;
+	};
+	const upsert = datastoreOptionalMethod(client, 'upsert', 'Datastore adapter client.upsert') ?? readSave();
 	return Object.freeze({
+		save: (...args: any[]) => {
+			const method = readSave();
+			if (!method) throw new ActiveTsConfigurationError('Datastore adapter client.save() is required for writes with gaxOptions.');
+			return method(...args);
+		},
 		key,
 		int,
 		get,
@@ -4814,7 +4928,8 @@ function createDatastoreTransactionNativeReadClient(client: NormalizedDatastoreC
 			: undefined,
 		insert: client.insert ? rejectWrite : undefined,
 		update: rejectWrite,
-		upsert: client.upsert ? rejectWrite : undefined
+		upsert: client.upsert ? rejectWrite : undefined,
+		save: rejectWrite
 	});
 	return guarded;
 }
