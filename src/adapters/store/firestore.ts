@@ -3,6 +3,7 @@ import {
 	ActiveTsConfigurationError,
 	ActiveTsConflictError,
 	ActiveTsNotFoundError,
+	ActiveTsUnknownTransactionOutcomeError,
 	ActiveTsValidationError,
 	safeErrorMessage
 } from '../../core/errors.js';
@@ -1095,13 +1096,11 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 					transactionCallbackCompleted &&
 					isFirestoreCommitOutcomeUnknownError(error)
 				) {
-					const uncertain = new ActiveTsConfigurationError(
-						`Firestore transaction commit outcome is unknown: ${safeErrorMessage(error)}`
+					const uncertain = new ActiveTsUnknownTransactionOutcomeError(
+						`Firestore transaction commit outcome is unknown: ${safeErrorMessage(error)}`,
+						'commit',
+						error
 					);
-					defineDataProperty(uncertain, 'cause', error, {
-						enumerable: false,
-						configurable: true
-					});
 					throw markTransactionRollbackSkipped(uncertain);
 				}
 				if (isFirestoreDefiniteTransactionFailure(error)) confirmTransactionRollback(fn);
