@@ -1,4 +1,5 @@
 import { optionalImport } from '../../core/optional-import.js';
+import { createAdapterCloser } from '../../core/adapter-lifecycle.js';
 import {
 	ActiveTsCommittedTransactionError,
 	ActiveTsConfigurationError,
@@ -521,7 +522,9 @@ export async function createMongoStoreAdapter(options: MongoStoreOptions): Promi
 	options = validateMongoOptions(options);
 	const mod = options.client ? undefined : await optionalImport('mongodb', 'MongoStoreAdapter');
 	const MongoClient = mod?.MongoClient;
-	const client = normalizeMongoClient(options.client ?? new MongoClient(options.url ?? 'mongodb://127.0.0.1:27017'));
+	const rawClient = options.client ?? new MongoClient(options.url ?? 'mongodb://127.0.0.1:27017');
+	const client = normalizeMongoClient(rawClient);
+	const close = createAdapterCloser(options.client ? undefined : () => mongoMethod(rawClient, 'close', 'MongoDB client.close')());
 	const allowAggregateScanFallback = options.allowAggregateScanFallback === true;
 	if (!options.client && client.connect) await client.connect();
 	const db = normalizeMongoDb(client.db(options.dbName));
@@ -561,6 +564,7 @@ export async function createMongoStoreAdapter(options: MongoStoreOptions): Promi
 
 		const adapter: MongoStoreAdapter = {
 			kind: 'mongodb',
+			close: transactionState ? undefined : close,
 			cacheScope: options.cacheScope,
 			capabilities: Object.freeze({
 				or: true,

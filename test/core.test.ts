@@ -3952,7 +3952,11 @@ test('firestore adapter validates field paths, document ids, and write payloads'
 	);
 	await assert.rejects(
 		() => adapter.update(meta, 1, { id: 1, handle: 'locked' }, { expectedVersion: 1 } as any),
-		/Firestore store write options does not support expectedVersion/
+		/does not exist/
+	);
+	await assert.rejects(
+		() => adapter.update(meta, 1, { id: 1, handle: 'tagged' }, { meta: { tag: 'x' } } as any),
+		/Firestore store write options does not support metadata write options/
 	);
 	await assert.rejects(
 		() => adapter.update(meta, 1, { id: 1, handle: 'missing' }),
