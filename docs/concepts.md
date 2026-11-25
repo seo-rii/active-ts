@@ -472,6 +472,12 @@ unbounded for compatibility; the limit is per collection, not a global request
 or provider RPC quota. `batch.maxSize` continues to control unique read batch
 size independently.
 
+Projection types guarantee only explicitly selected data fields. The configured
+model key is still included in stored query results and available through the
+model's `id` accessor. A data property literally named `id` may be an unrelated
+field when the model uses a custom key, so select that property explicitly before
+using it as a required value.
+
 ## Cache key ownership
 
 Built-in entity cache keys are deterministic and retain no per-entity ownership

@@ -300,12 +300,12 @@ async function projectionTypes() {
 		void fullFindScore;
 	}
 	if (!projected) return;
-	const projectedId: number = projected.data.id;
+	const projectedId: number | undefined = projected.data.id;
 	const handle: string = projected.data.handle;
 	const maybeScore: number | undefined = projected.data.score;
 	const typed: PartialModel<
 		TypeProjectionRecord,
-		Partial<TypeProjectionData> & Pick<TypeProjectionData, 'id' | 'handle'>
+		Partial<TypeProjectionData> & Pick<TypeProjectionData, 'handle'>
 	> = projected;
 	void projectedId;
 	void handle;
