@@ -279,6 +279,7 @@ export {
 	markSearchDocumentIdentity
 } from './core/search-utils.js';
 export {
+	type MemoryCacheOptions,
 	MemoryCacheAdapter
 } from './adapters/cache/memory.js';
 export {
