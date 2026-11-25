@@ -8,7 +8,7 @@ import type { DatastoreModelMeta, FieldCodec, FieldType, IndexMeta, SearchIndexM
 export function validateModelFieldTransformMetadata(
 	modelName: string,
 	idField: string,
-	fieldCodecs: Map<string, FieldCodec>,
+	fieldCodecs: ReadonlyMap<string, Readonly<FieldCodec>>,
 	fieldTypes: Map<string, FieldType>
 ) {
 	validateIdentityFieldCodecs(modelName, idField, fieldCodecs);
@@ -96,7 +96,7 @@ export function validateDatastoreUnindexedMetadata<TData>(
 	return datastore;
 }
 
-function validateIdentityFieldCodecs(modelName: string, idField: string, fieldCodecs: Map<string, FieldCodec>) {
+function validateIdentityFieldCodecs(modelName: string, idField: string, fieldCodecs: ReadonlyMap<string, Readonly<FieldCodec>>) {
 	if (!MAP_SIZE.call(fieldCodecs)) return;
 	if (MAP_HAS.call(fieldCodecs, idField)) {
 		throw new ActiveTsConfigurationError(
@@ -125,7 +125,7 @@ function validateIdentityFieldTypes(modelName: string, idField: string, fieldTyp
 
 function validateFieldTransformPaths(
 	modelName: string,
-	fieldCodecs: Map<string, FieldCodec>,
+	fieldCodecs: ReadonlyMap<string, Readonly<FieldCodec>>,
 	fieldTypes: Map<string, FieldType>
 ) {
 	if (!MAP_SIZE.call(fieldCodecs) || !MAP_SIZE.call(fieldTypes)) return;
