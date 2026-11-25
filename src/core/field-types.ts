@@ -1,7 +1,7 @@
 import { ActiveTsValidationError } from './errors.js';
 import { validateAggregateSpecs, normalizeAggregateResult } from './aggregate.js';
 import { assertSafeFieldPath, cloneSafeData } from './safe-keys.js';
-import { copyFieldCodecQueryOperandMarker } from './field-codecs.js';
+import { copyFieldCodecQueryOperandMarker, hasFieldCodecQueryOperandsEncoded } from './field-codecs.js';
 import {
 	assertValidWhereOperand,
 	assertWhereArrayArity,
@@ -13,7 +13,7 @@ import {
 } from './query-utils.js';
 import { snapshotArrayInput } from './array-input.js';
 import { dateIsoString, dateTime, isPortableDate } from './date-intrinsics.js';
-import { MAP_ENTRIES, MAP_GET, SET_ADD, SET_HAS } from './collection-intrinsics.js';
+import { MAP_ENTRIES, MAP_GET, MAP_HAS, SET_ADD, SET_HAS } from './collection-intrinsics.js';
 import type { AggregatePlan, AggregateResult, AggregateSpec, FieldType, QueryPlan, ResolvedModelMeta, WhereShape } from './types.js';
 
 type FieldTypeOperation = 'read' | 'write';
@@ -42,12 +42,20 @@ export function applyFieldTypeTransforms(
 }
 
 export function normalizeWhereFieldTypes(meta: ResolvedModelMeta, entries: QueryPlan['where']) {
+	return normalizeWherePlanFieldTypes(meta, entries, false);
+}
+
+function normalizeWherePlanFieldTypes(meta: ResolvedModelMeta, entries: QueryPlan['where'], encoded: boolean) {
 	const safeEntries = snapshotArrayInput<QueryPlan['where'][number]>(entries, 'where entries');
 	const normalizedEntries: QueryPlan['where'] = [];
 	for (let index = 0; index < safeEntries.length; index++) {
 		const where = safeEntries[index];
 		const entry = normalizeWhereEntry(where, `where entries[${index}]`);
-		const type = fieldTypeFor(meta, entry.field);
+		// The trusted plan marker identifies storage operands. A codec may change
+		// their representation, so only ordinary fields still use domain types.
+		const type = encoded && MAP_HAS.call(meta.fieldCodecs, entry.field)
+			? undefined
+			: fieldTypeFor(meta, entry.field);
 		if (type !== 'date') {
 			assertWhereCompatibleWithFieldType(type, entry, `${meta.name}.${entry.field}`);
 			normalizedEntries[index] = entry;
@@ -87,25 +95,27 @@ export function normalizeWhereShapeFieldTypes(meta: ResolvedModelMeta, where: Wh
 }
 
 export function normalizeQueryPlanFieldTypes(meta: ResolvedModelMeta, plan: QueryPlan): QueryPlan {
+	const encoded = hasFieldCodecQueryOperandsEncoded(plan);
 	const or: QueryPlan['or'] = [];
 	for (let index = 0; index < plan.or.length; index++) {
 		or[index] = normalizeQueryPlanFieldTypes(meta, plan.or[index]);
 	}
 	return copyFieldCodecQueryOperandMarker(plan, {
 		...plan,
-		where: normalizeWhereFieldTypes(meta, plan.where),
+		where: normalizeWherePlanFieldTypes(meta, plan.where, encoded),
 		or
 	});
 }
 
 export function normalizeAggregatePlanFieldTypes(meta: ResolvedModelMeta, plan: AggregatePlan): AggregatePlan {
+	const encoded = hasFieldCodecQueryOperandsEncoded(plan);
 	const or: AggregatePlan['or'] = [];
 	for (let index = 0; index < plan.or.length; index++) {
 		or[index] = normalizeQueryPlanFieldTypes(meta, plan.or[index]);
 	}
 	return copyFieldCodecQueryOperandMarker(plan, {
 		...plan,
-		where: normalizeWhereFieldTypes(meta, plan.where),
+		where: normalizeWherePlanFieldTypes(meta, plan.where, encoded),
 		or
 	});
 }
