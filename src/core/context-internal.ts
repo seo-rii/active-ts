@@ -11,6 +11,7 @@ export type ActiveContextInternalAccess = {
 	assertWritable(operation: string): void;
 	markRollbackOnly(error: unknown): void;
 	trackOperation<T>(run: () => Promise<T>): Promise<T>;
+	mapConcurrent<T, TResult>(items: readonly T[], operation: (item: T, index: number) => Promise<TResult> | TResult): Promise<TResult[]>;
 	validateReadConstructorResult(meta: ResolvedModelMeta, id: EntityId, before: Record<string, unknown> | undefined, item: unknown): void;
 	hasQueryHooks(model: ResolvedModelMeta): boolean;
 };
@@ -89,6 +90,14 @@ export function runTrackedContextOperation<T>(
 
 export function currentTransactionContext() {
 	return transactionContextStorage.getStore();
+}
+
+export function contextMapConcurrent<T, TResult>(
+	context: ActiveContext,
+	items: readonly T[],
+	operation: (item: T, index: number) => Promise<TResult> | TResult
+) {
+	return activeContextInternals(context).mapConcurrent(items, operation);
 }
 
 export function contextHasQueryHooks(context: ActiveContext, model: ResolvedModelMeta) {

@@ -13,12 +13,12 @@ test('nested use of the same testing context keeps outer globals installed', asy
 		});
 		assert.equal(getCurrentDefaultContext(), context.context);
 		assert.equal(ActiveTestContext.hasInstalledContext(context), true);
-		console.warn('outer warning after nested context');
+		console.warn('active-ts lazy relation "outer warning after nested context"');
 		await assert.rejects(withTestContext(context, async () => { throw new Error('nested failure'); }), /nested failure/);
 		assert.equal(getCurrentDefaultContext(), context.context);
-		console.warn('outer warning after nested failure');
+		console.warn('active-ts lazy relation "outer warning after nested failure"');
 	});
-	assert.deepEqual(context.warnings, ['outer warning after nested context', 'outer warning after nested failure']);
+	assert.deepEqual(context.warnings, ['active-ts lazy relation "outer warning after nested context"', 'active-ts lazy relation "outer warning after nested failure"']);
 	assert.equal(getCurrentDefaultContext(), previous);
 	assert.equal(console.warn, originalWarn);
 	assert.equal(ActiveTestContext.hasInstalledContext(), false);

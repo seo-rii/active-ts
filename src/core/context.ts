@@ -1,3 +1,4 @@
+import { mapConcurrent } from './concurrent-map.js';
 import {
 	assertStoreSchemaPlanSupported,
 	assertStoreSchemaModelsSupported,
@@ -294,7 +295,7 @@ const ACTIVE_TS_CONFIG_KEYS = [
 ] as const;
 const ACTIVE_CONTEXT_OPTION_KEYS = ['skipPluginSetup'] as const;
 const SCHEMA_CONFIG_KEYS = ['autoSync'] as const;
-const BATCH_CONFIG_KEYS = ['maxSize'] as const;
+const BATCH_CONFIG_KEYS = ['maxSize', 'concurrency'] as const;
 const AGGREGATE_CONFIG_KEYS = ['allowQueryFallback'] as const;
 const QUERY_PLANNER_KEYS = ['routeQuery', 'routeAggregate', 'routeSearch', 'schemaSearchAdapters'] as const;
 const SCHEMA_APPLY_OPTION_KEYS = ['mode'] as const;
@@ -1246,6 +1247,7 @@ export class ActiveContext {
 			assertWritable: (operation) => this.assertTransactionWritable(operation),
 			markRollbackOnly: (error) => this.markTransactionRollbackOnly(error),
 			trackOperation: (run) => this.trackOperation(run),
+			mapConcurrent: (items, operation) => mapConcurrent(items, this.config.batch?.concurrency, operation),
 			validateReadConstructorResult
 		};
 	}
@@ -1946,21 +1948,35 @@ export class ActiveContext {
 				if (!ids.length) return [];
 				const meta = this.meta(model);
 				assertDirectIdReadAllowed(meta);
-				if (ids.length > this.maxBatchSize) {
-					const results: Array<TModel | null> = [];
-					const chunks = chunkItems(ids, this.maxBatchSize);
-					for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
-						const chunkResults = await this.loadManyNow(model, chunks[chunkIndex]);
-						for (let resultIndex = 0; resultIndex < chunkResults.length; resultIndex++) {
-							results[results.length] = chunkResults[resultIndex];
+				const idsByKey = new Map<string, EntityId>();
+				const indexesByKey = new Map<string, number[]>();
+				for (let index = 0; index < ids.length; index++) {
+					const key = entityIdKey(ids[index]);
+					mapSet(idsByKey, key, ids[index]);
+					const indexes = mapGet(indexesByKey, key) ?? [];
+					indexes[indexes.length] = index;
+					mapSet(indexesByKey, key, indexes);
+				}
+				const uniqueIds = iterableToArray(MAP_VALUES.call(idsByKey) as Iterable<EntityId>);
+				if (uniqueIds.length > this.maxBatchSize) {
+					const results: Array<TModel | null> = new Array(ids.length);
+					for (const uniqueChunk of chunkItems(uniqueIds, this.maxBatchSize)) {
+						const chunk: EntityId[] = [];
+						const resultIndexes: number[] = [];
+						for (const id of uniqueChunk) {
+							for (const index of mapGet(indexesByKey, entityIdKey(id))!) {
+								chunk[chunk.length] = ids[index];
+								resultIndexes[resultIndexes.length] = index;
+							}
+						}
+						const chunkResults = await this.loadManyNow(model, chunk);
+						for (let index = 0; index < chunkResults.length; index++) {
+							results[resultIndexes[index]] = chunkResults[index];
 						}
 					}
 					return results;
 				}
 				const store = this.internalStore(meta.store);
-				const idsByKey = new Map<string, EntityId>();
-				for (const id of ids) mapSet(idsByKey, entityIdKey(id), id);
-				const uniqueIds = iterableToArray(MAP_VALUES.call(idsByKey) as Iterable<EntityId>);
 				const cache = meta.cache && !this.transactionState ? this.internalCache(meta.cache.adapter) : undefined;
 				const distributedCache = cache && meta.cache?.consistency === 'distributed'
 					? this.assertDistributedCache(meta, cache)
@@ -2108,13 +2124,13 @@ export class ActiveContext {
 					mapSet(rawById, entityIdKey(id), value ?? null);
 				}
 				const list: Array<TModel | null> = [];
-				const afterInstantiateTasks: Array<Promise<unknown>> = [];
 				for (let index = 0; index < ids.length; index++) {
 					const item = this.instantiate(model, mapGet(rawById, entityIdKey(ids[index]))) as TModel | null;
 					list[index] = item;
-					if (item) afterInstantiateTasks[afterInstantiateTasks.length] = this.runAfterInstantiateHooks(meta, item as any);
 				}
-				await Promise.all(afterInstantiateTasks);
+				await mapConcurrent(list, this.config.batch?.concurrency, item =>
+					item ? this.runAfterInstantiateHooks(meta, item as any) : undefined
+				);
 				if (cache && missingIds.length && !this.transactionState) {
 					const cacheableMissingIds: EntityId[] = [];
 					for (let index = 0; index < missingIds.length; index++) {
@@ -4003,6 +4019,13 @@ function normalizeBatchConfig(batch: ActiveTsConfig['batch']) {
 	const maxSize = ownValue(batch as Record<string, unknown>, 'maxSize', 'batch');
 	const normalized = Object.create(null) as NonNullable<ActiveTsConfig['batch']>;
 	if (maxSize !== undefined) normalized.maxSize = maxSize as number;
+	const concurrency = ownValue(batch as Record<string, unknown>, 'concurrency', 'batch');
+	if (concurrency !== undefined) {
+		if (typeof concurrency !== 'number' || !Number.isSafeInteger(concurrency) || concurrency <= 0) {
+			throw new ActiveTsConfigurationError('batch.concurrency must be a positive safe integer.');
+		}
+		normalized.concurrency = concurrency;
+	}
 	return Object.freeze(normalized);
 }
 
