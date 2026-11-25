@@ -3623,7 +3623,7 @@ test('mongodb adapter rejects operator keys and escapes startsWith regex values'
 			]
 		},
 		data: { id: 1, handle: 'locked', version: 2, _id: 'number:1' },
-		options: { upsert: false }
+		options: { upsert: false, collation: { locale: 'simple' } }
 	});
 	await assert.rejects(
 		() => adapter.update(meta, 1, { id: 1, handle: 'bad-version', version: 2 }, { expectedVersion: -1 }),
@@ -3667,7 +3667,7 @@ test('mongodb adapter rejects operator keys and escapes startsWith regex values'
 	assert.deepEqual(aggregate, { count: 2, total: 50, highest: 30 });
 	const aggregateFindCall = calls.find((call) => call.op === 'find');
 	assert.deepEqual(aggregateFindCall.filter, scalarFilter('score', { $gte: 20 }));
-	assert.deepEqual(aggregateFindCall.options, { projection: { id: 1, score: 1, _id: 1 } });
+	assert.deepEqual(aggregateFindCall.options, { projection: { id: 1, score: 1, _id: 1 }, collation: { locale: 'simple' } });
 	assert.equal(calls.some((call) => call.op === 'aggregate'), false);
 
 	await assert.rejects(
