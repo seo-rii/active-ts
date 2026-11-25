@@ -1,3 +1,5 @@
+import { JSON_STRINGIFY } from './json-intrinsics.js';
+import { datastoreSearchScopeNamespace, normalizeDatastoreSearchScope } from './datastore-search-scope.js';
 import { createHash } from 'node:crypto';
 import type { DatastoreKey, QueryPlan, ResolvedModelMeta, SearchAdapter, SearchIndexMeta, SearchOptions, SearchWriteOptions, StoreAdapter, WhereValue } from './types.js';
 import { ActiveTsConfigurationError, ActiveTsValidationError } from './errors.js';
@@ -17,7 +19,7 @@ import {
 import { assertPlainWhereShape, entityIdKey, setPath, valueFor, whereShapeToPlan } from './query-utils.js';
 import { applyFieldTypeTransforms } from './field-types.js';
 import { searchCapability, searchWhereOperatorCapability } from './capabilities.js';
-import { cloneNativePayload } from './native-payload.js';
+import { cloneNativePayload, cloneJsonTransportPayload } from './native-payload.js';
 import {
 	datastoreAncestorFromEntityKey,
 	datastoreKeyIdentity,
@@ -44,6 +46,7 @@ const SEARCH_WRITE_OPTION_KEY_SET = stringSet(['revision']);
 const NATIVE_SEARCH_SOURCE_STORE = Symbol('active-ts.native-search.source-store');
 const NATIVE_SEARCH_REBIND = Symbol('active-ts.native-search.rebind');
 const SEARCH_ADAPTER_SOURCE = Symbol('active-ts.search-adapter.source');
+export const CONTEXT_BOUND_SEARCH_DATASTORE_SCOPE = Symbol('active-ts.context-bound-search-datastore-scope');
 export const CONTEXT_BOUND_SEARCH_DATASTORE_NAMESPACE = Symbol('active-ts.context-bound-search-datastore-namespace');
 const PROJECTING_SEARCH_ADAPTER = Symbol('active-ts.search-adapter.projecting');
 const SEARCH_DOCUMENT_IDENTITIES = new WeakMap<object, string>();
@@ -162,6 +165,19 @@ export function searchAdapterSourceChain(adapter: SearchAdapter): SearchAdapter[
 		current = searchAdapterSource(current);
 	}
 	return chain;
+}
+
+export function contextBoundSearchDatastoreScope(adapter: unknown, model: ResolvedModelMeta): string | undefined {
+	if (!adapter || typeof adapter !== 'object' || Array.isArray(adapter)) return undefined;
+	for (const source of searchAdapterSourceChain(adapter as SearchAdapter)) {
+		const descriptor = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(source, CONTEXT_BOUND_SEARCH_DATASTORE_SCOPE);
+		if (!descriptor) continue;
+		if (!('value' in descriptor) || typeof descriptor.value !== 'function') {
+			throw new ActiveTsConfigurationError('Context-bound search Datastore scope reader must be a data function.');
+		}
+		return normalizeDatastoreSearchScope(descriptor.value(model));
+	}
+	return undefined;
 }
 
 export function contextBoundSearchDatastoreNamespace(
@@ -468,6 +484,10 @@ export function searchDocumentIdentity(
 	const identity = model.searchDocumentIdentity;
 	if (identity !== undefined) {
 		const safeIdentity = assertSafeCacheKey(identity, context);
+		if (model.datastoreSearchScope !== undefined && !model.datastore?.ancestor &&
+			safeIdentity !== datastoreSearchDocumentIdentity(model, id, undefined)) {
+			throw new ActiveTsValidationError(`Search document identity for Datastore model "${model.name}" does not match its physical scope.`);
+		}
 		if (model.datastore?.ancestor && data !== undefined) {
 			const canResolvePayloadAncestor = datastorePayloadCanResolveAncestor(model, id, data, context);
 			if (
@@ -546,7 +566,7 @@ export function searchDocumentIdentity(
 		);
 	}
 	assertSafeEntityId(id, context);
-	return entityIdKey(id);
+	return model.datastoreSearchScope === undefined ? entityIdKey(id) : datastoreSearchDocumentIdentity(model, id, undefined);
 }
 
 function datastoreSearchPayloadIdentityMatches(
@@ -646,8 +666,10 @@ function datastoreSearchDocumentAncestorFromEntityKey(
 
 export function withDatastoreSearchNamespace(
 	model: ResolvedModelMeta,
-	namespace: string | undefined
+	namespace: string | undefined,
+	scope?: string
 ): ResolvedModelMeta {
+	if (scope !== undefined) model = { ...model, datastoreSearchScope: normalizeDatastoreSearchScope(scope) };
 	if (namespace === undefined || !model.datastore?.ancestor) return model;
 	const datastore = model.datastore;
 	const ancestorForModel = datastore.ancestor!;
@@ -668,6 +690,7 @@ export function withDatastoreSearchNamespace(
 }
 
 function datastoreSearchNamespace(model: ResolvedModelMeta) {
+	if (model.datastoreSearchScope !== undefined) return datastoreSearchScopeNamespace(model.datastoreSearchScope);
 	const ancestor = model.datastore?.ancestor;
 	return ancestor === undefined ? undefined : WEAKMAP_GET.call(DATASTORE_SEARCH_NAMESPACES, ancestor);
 }
@@ -693,18 +716,20 @@ function datastoreSearchAncestorWithPayloadNamespace(
 }
 
 export function datastoreSearchDocumentIdentity(
-	model: Pick<ResolvedModelMeta, 'name'>,
+	model: Pick<ResolvedModelMeta, 'name' | 'datastoreSearchScope'>,
 	id: string | number,
 	ancestor: DatastoreKey | undefined,
 	namespace?: string
 ) {
+	const scope = normalizeDatastoreSearchScope(model.datastoreSearchScope);
+	if (scope !== undefined) namespace = datastoreSearchScopeNamespace(scope);
 	const safeAncestor = ancestor === undefined
 		? undefined
 		: datastoreKeyWithNamespace(ancestor, namespace, `Datastore search ancestor for "${model.name}"`);
 	const path = safeAncestor ? [...safeAncestor.path] : [];
 	path[path.length] = { kind: model.name, id };
 	const physicalIdentity = datastoreKeyIdentity({ path, namespace: safeAncestor?.namespace ?? namespace });
-	return `datastore:${createHash('sha256').update(physicalIdentity).digest('base64url')}`;
+	return `datastore:${createHash('sha256').update(scope === undefined ? physicalIdentity : JSON_STRINGIFY(cloneJsonTransportPayload([scope, physicalIdentity]))).digest('base64url')}`;
 }
 
 export function projectSearchDocument(

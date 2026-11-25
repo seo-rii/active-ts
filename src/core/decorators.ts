@@ -3,6 +3,7 @@ import {
 	addFieldTypeMeta,
 	addRelationMeta,
 	addSearchIndexMeta,
+	getModelMeta,
 	sanitizeFieldType,
 	setEntityMeta,
 	setIdField
@@ -23,6 +24,7 @@ import {
 	defineGetterProperty
 } from './safe-keys.js';
 import { ActiveTsConfigurationError } from './errors.js';
+import { assertGeneratedSchemaName, defaultSchemaName, markGeneratedSchemaName } from './schema-names.js';
 import { SET_ADD, SET_HAS } from './collection-intrinsics.js';
 
 function stringSet(values: readonly string[]) {
@@ -52,7 +54,7 @@ export function field(options: Partial<IndexMeta> = {}): PropertyDecorator {
 		const optionDirections = ownOptionValue(optionRecord, 'directions');
 		if (optionUnique === undefined && optionName === undefined && optionFields === undefined && optionDirections === undefined) return;
 		const propertyName = assertSafeFieldPath(propertyKey, 'index field');
-		addIndexMeta(target.constructor as ModelConstructor, decoratorIndexMeta(
+		const indexMeta = decoratorIndexMeta(
 			propertyName,
 			optionFields === undefined ? [propertyName] : optionFields,
 			'index fields',
@@ -60,7 +62,12 @@ export function field(options: Partial<IndexMeta> = {}): PropertyDecorator {
 			optionName,
 			optionUnique,
 			optionDirections
-		));
+		);
+		if (optionName === undefined) {
+			assertGeneratedSchemaName('index', indexMeta.name, indexMeta.fields, getModelMeta(target.constructor as ModelConstructor).indexes);
+			markGeneratedSchemaName(indexMeta);
+		}
+		addIndexMeta(target.constructor as ModelConstructor, indexMeta);
 	};
 }
 
@@ -89,6 +96,10 @@ export function typedField(type: FieldType, options: Partial<IndexMeta> = {}): P
 					optionDirections
 				)
 			: undefined;
+		if (indexMeta && optionName === undefined) {
+			assertGeneratedSchemaName('index', indexMeta.name, indexMeta.fields, getModelMeta(target.constructor as ModelConstructor).indexes);
+			markGeneratedSchemaName(indexMeta);
+		}
 		addFieldTypeMeta(target.constructor as ModelConstructor, fieldName, safeType);
 		if (indexMeta) addIndexMeta(target.constructor as ModelConstructor, indexMeta);
 	};
@@ -105,14 +116,17 @@ export function index(fields: string[], options: Partial<IndexMeta> = {}): Class
 		if (optionUnique !== undefined && typeof optionUnique !== 'boolean') {
 			throw new ActiveTsConfigurationError('index unique must be a boolean.');
 		}
-		addIndexMeta(target as unknown as ModelConstructor, {
-			name: optionName === undefined
-				? defaultSchemaName('index', safeFields)
-				: assertSafeSchemaIdentifier(optionName, 'index name'),
+		const name = optionName === undefined ? defaultSchemaName('index', safeFields) : assertSafeSchemaIdentifier(optionName, 'index name');
+		if (optionName === undefined) {
+			assertGeneratedSchemaName('index', name, safeFields, getModelMeta(target as unknown as ModelConstructor).indexes);
+		}
+		const indexMeta: IndexMeta = {
+			name,
 			fields: safeFields,
 			...(directions === undefined ? {} : { directions }),
 			unique: optionUnique as boolean | undefined
-		});
+		};
+		addIndexMeta(target as unknown as ModelConstructor, optionName === undefined ? markGeneratedSchemaName(indexMeta) : indexMeta);
 	};
 }
 
@@ -122,11 +136,16 @@ export function searchIndex(fields: string[], options: Partial<SearchIndexMeta> 
 		const optionName = ownOptionValue(optionRecord, 'name');
 		const adapter = ownOptionValue(optionRecord, 'adapter');
 		const safeFields = normalizeDecoratorFields(fields, 'search fields', 'search field');
-		addSearchIndexMeta(target as unknown as ModelConstructor, {
-			name: optionName === undefined ? defaultSchemaName('search', safeFields) : optionName as string,
+		const name = optionName === undefined ? defaultSchemaName('search', safeFields) : optionName as string;
+		if (optionName === undefined) {
+			assertGeneratedSchemaName('search index', name, safeFields, getModelMeta(target as unknown as ModelConstructor).searchIndexes, adapter as string | undefined);
+		}
+		const indexMeta: SearchIndexMeta = {
+			name,
 			adapter: adapter as string | undefined,
 			fields: safeFields
-		});
+		};
+		addSearchIndexMeta(target as unknown as ModelConstructor, optionName === undefined ? markGeneratedSchemaName(indexMeta) : indexMeta);
 	};
 }
 
@@ -155,7 +174,7 @@ export function ref(
 	targetModel: () => ModelConstructor,
 	options: Omit<RelationMeta, 'name' | 'kind' | 'target'>
 ) {
-	const relationOptions = normalizeDecoratorOptions(options, 'relation options', ['localKey', 'foreignKey', 'preload', 'warnOnLazy']);
+	const relationOptions = normalizeDecoratorOptions(options, 'relation options', ['localKey', 'foreignKey', 'preload', 'warnOnLazy', 'ancestor']);
 	return relation(targetModel, { kind: 'one', ...relationOptions } as Omit<RelationMeta, 'name' | 'target'>);
 }
 
@@ -163,7 +182,7 @@ export function hasMany(
 	targetModel: () => ModelConstructor,
 	options: Omit<RelationMeta, 'name' | 'kind' | 'target'>
 ) {
-	const relationOptions = normalizeDecoratorOptions(options, 'relation options', ['localKey', 'foreignKey', 'preload', 'warnOnLazy']);
+	const relationOptions = normalizeDecoratorOptions(options, 'relation options', ['localKey', 'foreignKey', 'preload', 'warnOnLazy', 'ancestor']);
 	return relation(targetModel, { kind: 'many', ...relationOptions } as Omit<RelationMeta, 'name' | 'target'>);
 }
 
@@ -229,9 +248,10 @@ function normalizeRelationPreload(preload: string[] | undefined) {
 }
 
 function normalizeRelationOptions(options: Omit<RelationMeta, 'name' | 'target'>) {
-	const record = normalizeDecoratorOptions(options, 'relation options', ['kind', 'localKey', 'foreignKey', 'preload', 'warnOnLazy']);
+	const record = normalizeDecoratorOptions(options, 'relation options', ['kind', 'localKey', 'foreignKey', 'preload', 'warnOnLazy', 'ancestor']);
 	const kind = ownOptionValue(record, 'kind');
 	const warnOnLazy = ownOptionValue(record, 'warnOnLazy');
+	const ancestor = ownOptionValue(record, 'ancestor');
 	if (kind !== 'one' && kind !== 'many') {
 		const detail = typeof kind === 'string' ? ` "${kind}"` : '';
 		throw new ActiveTsConfigurationError(`Relation kind${detail} is not allowed.`);
@@ -239,12 +259,16 @@ function normalizeRelationOptions(options: Omit<RelationMeta, 'name' | 'target'>
 	if (warnOnLazy !== undefined && typeof warnOnLazy !== 'boolean') {
 		throw new ActiveTsConfigurationError('relation warnOnLazy must be a boolean.');
 	}
+	if (ancestor !== undefined && typeof ancestor !== 'function') {
+		throw new ActiveTsConfigurationError('relation ancestor must be a function.');
+	}
 	return {
 		kind: kind as RelationMeta['kind'],
 		localKey: assertSafeFieldPath(ownOptionValue(record, 'localKey'), 'relation localKey'),
 		foreignKey: assertSafeFieldPath(ownOptionValue(record, 'foreignKey'), 'relation foreignKey'),
 		preload: normalizeRelationPreload(ownOptionValue(record, 'preload') as string[] | undefined),
-		warnOnLazy: warnOnLazy as boolean | undefined
+		warnOnLazy: warnOnLazy as boolean | undefined,
+		ancestor: ancestor as RelationMeta['ancestor']
 	};
 }
 
@@ -273,19 +297,6 @@ function normalizeDecoratorOptions(options: unknown, context: string, allowed: r
 		}
 	}
 	return options as Record<string, unknown>;
-}
-
-function defaultSchemaName(prefix: string, fields: string[]) {
-	let joined = '';
-	for (let index = 0; index < fields.length; index++) {
-		if (index > 0) joined += '_';
-		joined += fields[index].replace(/[^A-Za-z0-9_-]/g, '_');
-	}
-	const name = joined
-		.replace(/_+/g, '_')
-		.replace(/^_+|_+$/g, '');
-	if (/^[A-Za-z]/.test(name)) return name;
-	return `${prefix}_${name || 'field'}`;
 }
 
 function ownOptionValue(record: Record<string, unknown>, key: string) {
