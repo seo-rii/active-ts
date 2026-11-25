@@ -243,6 +243,11 @@ Relation `preload` fields are translated into `select()` projections for both
 lazy and batched relation loads. active-ts also includes the target id and
 foreign key so relation matching remains stable.
 
+Relation queries apply the target model's query hooks consistently, including
+soft-delete filters. A one/id relation may use a batched direct-read shortcut
+only when no target-model or context query hooks are configured. Adding a
+`preload` projection therefore changes fields, not relation membership.
+
 Relation arrays must contain the complete matching result. If a store returns
 `more: true` for a relation query, lazy loading and `include()` throw instead of
 caching an incomplete array. Load the related model through an explicitly

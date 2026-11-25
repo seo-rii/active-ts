@@ -13,6 +13,7 @@ export type ActiveContextInternalAccess = {
 	trackOperation<T>(run: () => Promise<T>): Promise<T>;
 	mapConcurrent<T, TResult>(items: readonly T[], operation: (item: T, index: number) => Promise<TResult> | TResult): Promise<TResult[]>;
 	validateReadConstructorResult(meta: ResolvedModelMeta, id: EntityId, before: Record<string, unknown> | undefined, item: unknown): void;
+	hasQueryHooks(model: ResolvedModelMeta): boolean;
 };
 
 export const ACTIVE_CONTEXT_INTERNALS = Symbol('active-ts.context-internals');
@@ -97,4 +98,8 @@ export function contextMapConcurrent<T, TResult>(
 	operation: (item: T, index: number) => Promise<TResult> | TResult
 ) {
 	return activeContextInternals(context).mapConcurrent(items, operation);
+}
+
+export function contextHasQueryHooks(context: ActiveContext, model: ResolvedModelMeta) {
+	return activeContextInternals(context).hasQueryHooks(model);
 }

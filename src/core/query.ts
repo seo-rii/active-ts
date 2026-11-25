@@ -139,6 +139,7 @@ import {
 	relationTargetJoinKeys
 } from './relation-ancestor.js';
 import {
+	contextHasQueryHooks,
 	contextInternalStore,
 	contextMapConcurrent,
 	runTrackedContextOperation,
@@ -2004,7 +2005,8 @@ async function preloadIncludes(
 					relation.foreignKey === targetMeta.idField &&
 					!relation.preload?.length &&
 					!needsTargetAncestorFieldMatch &&
-					!targetHasDatastoreAncestorFields
+					!targetHasDatastoreAncestorFields &&
+					!contextHasQueryHooks(context, targetMeta)
 				) {
 					for (let index = 0; index < values.length; index++) {
 						assertSafeEntityId(values[index], `${ownerMeta.name}.${relation.name} relation key`);
