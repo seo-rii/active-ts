@@ -138,7 +138,8 @@ export class ActiveFunctionCache<TInput, TValue> {
 			...this.diagnosticCounters,
 			memoryEntries: MAP_SIZE.call(this.memory),
 			inFlightEntries: MAP_SIZE.call(this.inFlight),
-			adapterFailedKeys: adapter ? functionCacheInvalidationFailures.failedKeyCount(cacheFailureSource(adapter)) : 0
+			adapterFailedKeys: adapter ? functionCacheInvalidationFailures.failedKeyCount(cacheFailureSource(adapter)) : 0,
+			adapterFailureOverflow: adapter ? functionCacheInvalidationFailures.overflowed(cacheFailureSource(adapter)) : false
 		};
 	}
 

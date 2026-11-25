@@ -41,3 +41,19 @@ test('ordinary successful recovery removes only its failed key', () => {
 	failures.clear(source, 'b');
 	assert.equal(failures.has(source, 'b'), false);
 });
+
+test('diagnostic counts report tracked failures and overflow state', () => {
+	const failures = new CacheInvalidationFailures(2);
+	const source = {};
+	assert.equal(failures.failedKeyCount(source), 0);
+	assert.equal(failures.overflowed(source), false);
+	failures.mark(source, 'a');
+	failures.mark(source, 'b');
+	assert.equal(failures.failedKeyCount(source), 2);
+	assert.equal(failures.overflowed(source), false);
+	failures.mark(source, 'c');
+	assert.equal(failures.failedKeyCount(source), 0);
+	assert.equal(failures.overflowed(source), true);
+	failures.mark(source, 'd');
+	assert.equal(failures.failedKeyCount(source), 1);
+});

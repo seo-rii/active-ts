@@ -33,6 +33,12 @@ export class CacheInvalidationFailures {
 		return state ? SET_SIZE.call(state.failures) as number : 0;
 	}
 
+	/** Whether overflow protects every key on this source that has not recovered since. */
+	overflowed(source: object) {
+		const state = WEAKMAP_GET.call(this.sources, source) as FailureState | undefined;
+		return state !== undefined && state.generation > 0;
+	}
+
 	mark(source: object, key: string) {
 		let state = WEAKMAP_GET.call(this.sources, source) as FailureState | undefined;
 		if (!state) {
