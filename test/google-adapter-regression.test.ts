@@ -17752,3 +17752,237 @@ for (const useFallback of [false, true]) {
 		assert.equal(nativeCalls, 1);
 	});
 }
+
+test('Datastore ancestor round-trip validation re-encodes only ancestorFields when non-ancestor field codecs coexist', async () => {
+	type CoexistingCodecData = {
+		id: number;
+		parentId: string;
+		secret: string;
+	};
+	class CoexistingCodecRecord extends Model<CoexistingCodecData> {}
+	let secretEncodeCalls = 0;
+	let secretDecodeCalls = 0;
+	defineModel<CoexistingCodecData>('datastore_coexisting_ancestor_and_secret_codec')
+		.id('id')
+		.fieldCodec('parentId', {
+			name: 'string_prefix_parent',
+			encode: (value) => `enc:${String(value)}`,
+			decode: (value) => {
+				if (typeof value !== 'string' || !value.startsWith('enc:')) {
+					throw new Error('expected encoded parentId');
+				}
+				return value.slice(4);
+			}
+		})
+		.fieldCodec('secret', {
+			name: 'non_ancestor_secret',
+			encode: (value) => {
+				secretEncodeCalls++;
+				return `cipher:${secretEncodeCalls}:${String(value)}`;
+			},
+			decode: (value) => {
+				secretDecodeCalls++;
+				if (typeof value !== 'string' || !value.startsWith('cipher:')) {
+					throw new Error('expected encoded secret');
+				}
+				return value.split(':').slice(2).join(':');
+			}
+		})
+		.datastore({
+			ancestor: ({ data }) => data?.parentId === undefined ? undefined : datastoreKey('tenant_parent', data.parentId),
+			ancestorFields: ['parentId']
+		})
+		.attach(CoexistingCodecRecord);
+
+	const scopedAncestor = datastoreKey('tenant_parent', '10');
+	const storedRow = {
+		id: 1,
+		parentId: 'enc:10',
+		secret: 'cipher:1:top-secret'
+	};
+	const wrongStoredRow = {
+		id: 2,
+		parentId: 'enc:20',
+		secret: 'cipher:2:top-secret'
+	};
+	const queryStub = {
+		hasAncestor() { return this; },
+		filter() { return this; },
+		order() { return this; },
+		limit() { return this; },
+		select() { return this; },
+		start() { return this; }
+	};
+	const datastore = await createDatastoreStoreAdapter({
+		client: datastoreClient({
+			createQuery: () => queryStub,
+			get: async (input: unknown) => Array.isArray(input) ? [[storedRow]] : [storedRow],
+			runQuery: async () => [[storedRow], { moreResults: 'NO_MORE_RESULTS' }],
+			insert: async () => undefined,
+			update: async () => undefined
+		}),
+		allowQueryScanFallback: true
+	});
+	const middlewareStore = createStoreMiddlewareAdapter(datastore, [
+		async (_operation, next) => await next()
+	]);
+	const context = createActiveTs({ stores: { default: middlewareStore } });
+	const meta = context.meta(CoexistingCodecRecord);
+	const plan: QueryPlan = {
+		where: [],
+		or: [],
+		sort: [],
+		include: [],
+		meta: { datastoreAncestor: scopedAncestor }
+	};
+
+	// Reading/writing stored rows must resolve decoded parentId ('10') without re-encoding non-ancestor `secret`.
+	assert.deepEqual(await context.store('default').get(meta, 1, { meta: { datastoreAncestor: scopedAncestor } }), storedRow);
+	assert.deepEqual(await context.store('default').getMany(meta, [1], { meta: { datastoreAncestor: scopedAncestor } }), [storedRow]);
+	assert.deepEqual(await context.store('default').query(meta, plan), { list: [storedRow], cursor: undefined, more: false, count: 1, total: undefined });
+	await context.store('default').create(meta, 1, storedRow, { meta: { datastoreAncestor: scopedAncestor } });
+	await context.store('default').update(meta, 1, storedRow, { meta: { datastoreAncestor: scopedAncestor } });
+	await assert.rejects(
+		() => context.store('default').create(meta, 2, wrongStoredRow, { meta: { datastoreAncestor: scopedAncestor } }),
+		/Datastore ancestor does not match its payload data/
+	);
+	assert.equal(secretEncodeCalls, 0);
+	assert.equal(secretDecodeCalls, 0);
+});
+
+test('Datastore ancestor validation decodes and round-trips parent-path codecs on nested ancestorFields alongside non-ancestor codecs', async () => {
+	type NestedObjectCodecData = {
+		id: number;
+		tenant: { id: string; region: string };
+		secret: string;
+	};
+	class NestedJsonAncestorRecord extends Model<NestedObjectCodecData> {}
+	class NestedObjectAncestorRecord extends Model<NestedObjectCodecData> {}
+	let secretEncodeCalls = 0;
+	let secretDecodeCalls = 0;
+	const nonAncestorSecretCodec = {
+		name: 'non_ancestor_secret',
+		encode: (value: unknown) => {
+			secretEncodeCalls++;
+			return `sealed:${secretEncodeCalls}:${String(value)}`;
+		},
+		decode: (value: unknown) => {
+			secretDecodeCalls++;
+			return String(value).replace(/^sealed:\d+:/, '');
+		}
+	};
+
+	defineModel<NestedObjectCodecData>('datastore_nested_json_ancestor_with_secret_codec')
+		.id('id')
+		.fieldCodec('tenant', {
+			name: 'tenant_json',
+			encode: (value) => JSON.stringify(value),
+			decode: (value) => {
+				if (typeof value !== 'string') throw new Error('expected JSON string');
+				return JSON.parse(value);
+			}
+		})
+		.fieldCodec('secret', nonAncestorSecretCodec)
+		.datastore({
+			ancestor: ({ data }) => {
+				const tenant = data?.tenant as { id?: string } | undefined;
+				return tenant && typeof tenant === 'object' && tenant.id !== undefined
+					? datastoreKey('tenant_parent', tenant.id)
+					: undefined;
+			},
+			ancestorFields: ['tenant.id']
+		})
+		.attach(NestedJsonAncestorRecord);
+
+	defineModel<NestedObjectCodecData>('datastore_nested_object_ancestor_with_secret_codec')
+		.id('id')
+		.fieldCodec('tenant', {
+			name: 'tenant_object_codec',
+			encode: (value) => {
+				const tenant = value as { id: string; region: string };
+				return { id: `enc:${tenant.id}`, region: tenant.region };
+			},
+			decode: (value) => {
+				const tenant = value as { id: string; region: string };
+				if (!tenant || typeof tenant !== 'object' || typeof tenant.id !== 'string' || !tenant.id.startsWith('enc:')) {
+					throw new Error('expected encoded tenant object');
+				}
+				return { id: tenant.id.slice(4), region: tenant.region };
+			}
+		})
+		.fieldCodec('secret', nonAncestorSecretCodec)
+		.datastore({
+			ancestor: ({ data }) => {
+				const tenant = data?.tenant as { id?: string } | undefined;
+				return tenant && typeof tenant === 'object' && tenant.id !== undefined
+					? datastoreKey('tenant_parent', tenant.id)
+					: undefined;
+			},
+			ancestorFields: ['tenant.id']
+		})
+		.attach(NestedObjectAncestorRecord);
+
+	const scopedAncestor = datastoreKey('tenant_parent', '10');
+	const jsonRow = {
+		id: 1,
+		tenant: JSON.stringify({ id: '10', region: 'us' }),
+		secret: 'sealed:1:alpha'
+	};
+	const wrongJsonRow = {
+		id: 2,
+		tenant: JSON.stringify({ id: '20', region: 'us' }),
+		secret: 'sealed:2:beta'
+	};
+	const objRow = {
+		id: 3,
+		tenant: { id: 'enc:10', region: 'eu' },
+		secret: 'sealed:3:gamma'
+	};
+	const wrongObjRow = {
+		id: 4,
+		tenant: { id: 'enc:20', region: 'eu' },
+		secret: 'sealed:4:delta'
+	};
+	const store: StoreAdapter = {
+		kind: 'nested-ancestor-codec-store',
+		capabilities: { datastoreAncestor: true },
+		get: async (model) => model.name.includes('json') ? jsonRow : objRow,
+		getMany: async (model, ids) => ids.map(() => model.name.includes('json') ? jsonRow : objRow),
+		query: async (model) => ({ list: [model.name.includes('json') ? jsonRow : objRow], more: false }),
+		create: async () => undefined,
+		update: async () => undefined,
+		delete: async () => undefined
+	};
+	const context = createActiveTs({ stores: { default: store } });
+	const jsonMeta = context.meta(NestedJsonAncestorRecord);
+	const objMeta = context.meta(NestedObjectAncestorRecord);
+	const handle = context.store('default');
+	const plan: QueryPlan = {
+		where: [],
+		or: [],
+		sort: [],
+		include: [],
+		meta: { datastoreAncestor: scopedAncestor }
+	};
+
+	// JSON-encoded ancestor object + non-ancestor codec
+	assert.deepEqual((await handle.query(jsonMeta, plan)).list, [jsonRow]);
+	await handle.create(jsonMeta, 1, jsonRow, { meta: { datastoreAncestor: scopedAncestor } });
+	await handle.create(jsonMeta, 1, { id: 1, tenant: { id: '10', region: 'us' }, secret: 'alpha' }, { meta: { datastoreAncestor: scopedAncestor } });
+	await assert.rejects(
+		() => handle.create(jsonMeta, 2, wrongJsonRow, { meta: { datastoreAncestor: scopedAncestor } }),
+		/Datastore ancestor does not match its payload data/
+	);
+
+	// Object-to-object ancestor codec where child path `tenant.id` is already defined on both read and write
+	assert.deepEqual((await handle.query(objMeta, plan)).list, [objRow]);
+	await handle.create(objMeta, 3, objRow, { meta: { datastoreAncestor: scopedAncestor } });
+	await handle.create(objMeta, 3, { id: 3, tenant: { id: '10', region: 'eu' }, secret: 'gamma' }, { meta: { datastoreAncestor: scopedAncestor } });
+	await assert.rejects(
+		() => handle.create(objMeta, 4, wrongObjRow, { meta: { datastoreAncestor: scopedAncestor } }),
+		/Datastore ancestor does not match its payload data/
+	);
+
+	assert.equal(secretEncodeCalls, 0);
+	assert.equal(secretDecodeCalls, 0);
+});

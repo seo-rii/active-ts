@@ -247,7 +247,7 @@ function createStoreMiddlewareAdapterWithSource(
 				trust.sourceRows,
 				trust.trustedRows
 			);
-			validateMiddlewareStoreReadRow(
+			const validatedRow = validateMiddlewareStoreReadRow(
 				model,
 				row,
 				readOptions,
@@ -256,8 +256,8 @@ function createStoreMiddlewareAdapterWithSource(
 				datastoreNamespace,
 				trust.trustedRows
 			);
-			if (row) assertStoreDataMatchesId(model, safeId, row, `store middleware adapter "${adapterKind}" get result`);
-			return row;
+			if (validatedRow) assertStoreDataMatchesId(model, safeId, validatedRow, `store middleware adapter "${adapterKind}" get result`);
+			return validatedRow;
 		}),
 		getMany: (model: ResolvedModelMeta, ids: EntityId[], options?: StoreReadOptions) => track(async () => {
 			model = snapshotAdapterModel(model, 'store middleware model metadata');
@@ -279,10 +279,9 @@ function createStoreMiddlewareAdapterWithSource(
 				trust.trustedRows
 			);
 			for (let index = 0; index < rows.length; index++) {
-				const row = rows[index];
-				validateMiddlewareStoreReadRow(
+				const row = validateMiddlewareStoreReadRow(
 					model,
-					row,
+					rows[index],
 					readOptions,
 					adapterKind,
 					`store middleware adapter "${adapterKind}" getMany result[${index}]`,
@@ -290,6 +289,7 @@ function createStoreMiddlewareAdapterWithSource(
 					trust.trustedRows
 				);
 				if (row) assertStoreDataMatchesId(model, safeIds[index], row, `store middleware adapter "${adapterKind}" getMany result[${index}]`);
+				rows[index] = row;
 			}
 			return rows;
 		}),
@@ -1528,7 +1528,8 @@ function normalizeMiddlewareQueryResult(
 	const list = ownResultValue(record, 'list', context);
 	if (!Array.isArray(list)) throw new ActiveTsValidationError(`${context} result.list must be an array.`);
 	const safeInput = snapshotArrayInput(list, `${context} result.list`);
-	const safeList: any[] = [];
+	let safeList: any[] = [];
+	const searchIdentities: Array<string | undefined> = [];
 	const ids = new Set<string>();
 	for (let index = 0; index < safeInput.length; index++) {
 		const item = safeInput[index];
@@ -1536,6 +1537,7 @@ function normalizeMiddlewareQueryResult(
 		const searchIdentity = options.adapterType === 'Search'
 			? datastoreSearchHitDocumentIdentityOrForced(model, item, `${context} result.list[${index}]`)
 			: searchHitDocumentIdentity(item);
+		searchIdentities[index] = searchIdentity;
 		const row = options.adapterType === 'Search'
 			? cloneSafeDataObjectWithoutActiveEntityKey(item, `${context} result.list[${index}]`)
 			: cloneSafeData(item);
@@ -1548,19 +1550,26 @@ function normalizeMiddlewareQueryResult(
 		);
 		const id = assertStoreDataHasModelId(model, row, `${context} result.list[${index}]`);
 		if (searchIdentity !== undefined) markSearchDocumentIdentity(row, searchIdentity);
-		const key = middlewareResultIdentityKey(model, id, searchIdentity, row, `${context} result.list[${index}]`);
-		if (SET_HAS.call(ids, key)) {
-			throw new ActiveTsValidationError(`${context} result contains duplicate id "${String(id)}".`);
+		if (options.adapterType === 'Search') {
+			const key = middlewareResultIdentityKey(model, id, searchIdentity, row, `${context} result.list[${index}]`);
+			if (SET_HAS.call(ids, key)) {
+				throw new ActiveTsValidationError(`${context} result contains duplicate id "${String(id)}".`);
+			}
+			SET_ADD.call(ids, key);
 		}
-		SET_ADD.call(ids, key);
 		safeList[index] = row;
 	}
 	if (options.adapterType === 'Store') {
-		validateMiddlewareStoreReadRows(model, safeList, options.adapterKind, context, {
+		safeList = validateMiddlewareStoreReadRows(model, safeList, options.adapterKind, context, {
 			datastoreAncestor: options.datastoreAncestor,
 			datastoreNamespace: options.datastoreNamespace,
 			trustedDatastoreEntityKeys: options.trustedDatastoreEntityKeys
 		});
+		for (let index = 0; index < safeList.length; index++) {
+			if (searchIdentities[index] !== undefined) {
+				markSearchDocumentIdentity(safeList[index], searchIdentities[index]);
+			}
+		}
 	}
 	const cursor = assertSafeCursor(ownResultValue(record, 'cursor', context), `${context} result cursor`);
 	const more = ownResultValue(record, 'more', context);
@@ -1685,13 +1694,13 @@ function validateMiddlewareStoreReadRow(
 	context: string,
 	datastoreNamespace: string | undefined,
 	trustedDatastoreEntityKeys: boolean | WeakSet<object>
-) {
-	if (row === null) return;
-	validateMiddlewareStoreReadRows(model, [row], adapterKind, context, {
+): Record<string, any> | null {
+	if (row === null) return null;
+	return validateMiddlewareStoreReadRows(model, [row], adapterKind, context, {
 		datastoreAncestor: options.meta?.datastoreAncestor,
 		datastoreNamespace,
 		trustedDatastoreEntityKeys
-	});
+	})[0];
 }
 
 function validateMiddlewareStoreReadRows(
@@ -1700,13 +1709,13 @@ function validateMiddlewareStoreReadRows(
 	adapterKind: string,
 	context: string,
 	options: { datastoreAncestor?: unknown; datastoreNamespace?: string; trustedDatastoreEntityKeys?: boolean | WeakSet<object> }
-) {
-	normalizeStoreQueryResultForModel(model, { list: rows }, context, {
+): Array<Record<string, any>> {
+	return normalizeStoreQueryResultForModel(model, { list: rows }, context, {
 		adapterKind,
 		datastoreAncestor: options.datastoreAncestor,
 		datastoreNamespace: options.datastoreNamespace,
 		trustedDatastoreEntityKeys: options.trustedDatastoreEntityKeys
-	});
+	}).list;
 }
 
 function normalizeMiddlewareAggregateResult(value: unknown, specs: AggregatePlan['aggregates'], context: string) {
