@@ -31,7 +31,9 @@ import {
 	normalizeStoreQueryResultForModel,
 	normalizeStoreQueryPlan,
 	normalizeStoreTransactionOptions,
+	normalizeStoreWriteOptions,
 	rejectUnsupportedStoreReadOptions,
+	rejectUnsupportedStoreWriteMetadata,
 	rejectUnsupportedStoreWriteOptions,
 	validateStoreQueryReadOptions
 } from '../../core/store-options.js';
@@ -91,6 +93,30 @@ const FIRESTORE_TRANSACTION_NATIVE_OPTION_KEYS = ['readOnly', 'readTime', 'maxAt
 type FirestoreTransactionMutation =
 	| { operation: 'create' | 'update'; data: Record<string, unknown> }
 	| { operation: 'delete' };
+
+function firestoreVersionMatches(row: unknown, expectedVersion: number) {
+	return (
+		!!row &&
+		typeof row === 'object' &&
+		Object.prototype.hasOwnProperty.call(row, 'version') &&
+		(row as { version?: unknown }).version === expectedVersion
+	);
+}
+
+function firestoreOptimisticLockConflict(model: ResolvedModelMeta, id: EntityId, expectedVersion: number) {
+	return new ActiveTsConflictError(
+		`Optimistic lock failed for ${model.name}:${String(id)}. Expected version ${expectedVersion}.`
+	);
+}
+
+function firestoreDeleteNotFound(model: ResolvedModelMeta, id: EntityId) {
+	return new ActiveTsNotFoundError(`Cannot delete ${model.name}:${String(id)} because it does not exist.`);
+}
+
+/** Firestore writes accept expectedVersion; write metadata stays unsupported. */
+function normalizeFirestoreWriteOptions(options: unknown, context: string) {
+	return rejectUnsupportedStoreWriteMetadata(normalizeStoreWriteOptions(options, context), context);
+}
 
 function uniqueStrings(values: readonly string[]) {
 	const seen = new Set<string>();
@@ -356,7 +382,7 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 			transactionConflictDetection: true,
 			savepoint: false,
 			uniqueIndex: false,
-			optimisticLock: false,
+			optimisticLock: true,
 			nullOperators: true,
 			missingFieldNulls: false,
 			native: true
@@ -654,18 +680,22 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 		},
 		async update(model, id, data, options = {}) {
 			model = snapshotFirestoreModel(model, 'Firestore model metadata');
-			rejectUnsupportedStoreWriteOptions(options, 'Firestore store write options');
+			const safeOptions = normalizeFirestoreWriteOptions(options, 'Firestore store write options');
 			assertSafeEntityId(id, `${model.name} store id`);
 			const clean = cloneFirestoreDataObject(data, `${model.name} stored data`);
 			assertStoreDataMatchesId(model, id, clean);
 			const ref = doc(client, model, id);
-			await replaceFirestoreDocument(client, model, id, ref, clean);
+			await replaceFirestoreDocument(client, model, id, ref, clean, safeOptions.expectedVersion);
 		},
 		async delete(model, id, options = {}) {
 			model = snapshotFirestoreModel(model, 'Firestore model metadata');
-			rejectUnsupportedStoreWriteOptions(options, 'Firestore store delete options');
+			const safeOptions = normalizeFirestoreWriteOptions(options, 'Firestore store delete options');
 			assertSafeEntityId(id, `${model.name} store id`);
 			const ref = doc(client, model, id);
+			if (safeOptions.expectedVersion !== undefined) {
+				await deleteFirestoreDocumentAtVersion(client, model, id, ref, safeOptions.expectedVersion);
+				return;
+			}
 			await firestoreMethod(ref, 'delete', 'Firestore document.delete')();
 		},
 		async transaction<T>(fn: (tx: StoreAdapter) => Promise<T>, transactionOptions?: StoreTransactionOptions) {
@@ -841,6 +871,12 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 					});
 					return data;
 				};
+				const currentDocumentForWrite = async (model: ResolvedModelMeta, id: EntityId, operation: 'update' | 'delete') => {
+					const cached = cachedPointRead(model, id);
+					if (cached !== undefined) return cached;
+					assertSdkReadAllowed(operation);
+					return await readDocument(model, id, `Firestore transaction ${operation}`);
+				};
 				const tx: StoreAdapter = {
 					kind: 'firestore',
 					cacheScope: options.cacheScope,
@@ -944,7 +980,7 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 					},
 					update: async (model, id, data, options = {}) => {
 						model = snapshotFirestoreModel(model, 'Firestore transaction model metadata');
-						rejectUnsupportedStoreWriteOptions(options, 'Firestore transaction write options');
+						const { expectedVersion } = normalizeFirestoreWriteOptions(options, 'Firestore transaction write options');
 						assertSafeEntityId(id, `${model.name} store id`);
 						const clean = cloneFirestoreDataObject(data, `${model.name} stored data`);
 						assertStoreDataMatchesId(model, id, clean);
@@ -952,13 +988,10 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 						return serializeBufferedMutation(key, async () => {
 							const existing = MAP_GET.call(buffered, key) as FirestoreTransactionMutation | undefined;
 							if (existing?.operation === 'delete') throw firestoreUpdateNotFound(model, id);
-							if (!existing) {
-								let current = cachedPointRead(model, id);
-								if (current === undefined) {
-									assertSdkReadAllowed('update');
-									current = await readDocument(model, id, 'Firestore transaction update');
-								}
-								if (!current) throw firestoreUpdateNotFound(model, id);
+							const current = existing ? existing.data : await currentDocumentForWrite(model, id, 'update');
+							if (!current) throw firestoreUpdateNotFound(model, id);
+							if (expectedVersion !== undefined && !firestoreVersionMatches(current, expectedVersion)) {
+								throw firestoreOptimisticLockConflict(model, id, expectedVersion);
 							}
 							const ref = doc(client, model, id);
 							const write = transaction.set(ref, clean);
@@ -970,10 +1003,19 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 					},
 					delete: async (model, id, options = {}) => {
 						model = snapshotFirestoreModel(model, 'Firestore transaction model metadata');
-						rejectUnsupportedStoreWriteOptions(options, 'Firestore transaction delete options');
+						const { expectedVersion } = normalizeFirestoreWriteOptions(options, 'Firestore transaction delete options');
 						assertSafeEntityId(id, `${model.name} store id`);
 						const key = mutationKey(model, id);
 						return serializeBufferedMutation(key, async () => {
+							if (expectedVersion !== undefined) {
+								const existing = MAP_GET.call(buffered, key) as FirestoreTransactionMutation | undefined;
+								if (existing?.operation === 'delete') throw firestoreDeleteNotFound(model, id);
+								const current = existing ? existing.data : await currentDocumentForWrite(model, id, 'delete');
+								if (!current) throw firestoreDeleteNotFound(model, id);
+								if (!firestoreVersionMatches(current, expectedVersion)) {
+									throw firestoreOptimisticLockConflict(model, id, expectedVersion);
+								}
+							}
 							const ref = doc(client, model, id);
 							const write = transaction.delete(ref);
 							dirty = true;
@@ -1469,12 +1511,40 @@ function firestoreUpdateNotFound(model: ResolvedModelMeta, id: EntityId) {
 	return new ActiveTsNotFoundError(`Cannot update ${model.name}:${String(id)} because it does not exist.`);
 }
 
+/**
+ * Reads the document inside a Firestore transaction and fails when it is
+ * missing or, with an expected version, when the stored version differs.
+ * Firestore aborts the commit (and the SDK retries the callback) when the read
+ * document changes before commit, so the check and the write are atomic.
+ */
+async function readFirestoreDocumentForWrite(
+	transaction: object,
+	model: ResolvedModelMeta,
+	id: EntityId,
+	ref: object,
+	expectedVersion: number | undefined,
+	missing: () => Error
+) {
+	const snap = normalizeFirestoreObject(
+		await firestoreMethod(transaction, 'get', 'Firestore transaction.get')(ref),
+		'Firestore transaction document snapshot'
+	);
+	if (!firestoreSnapshotExists(snap, 'Firestore transaction document snapshot')) throw missing();
+	if (expectedVersion === undefined) return;
+	assertFirestoreDocumentMatchesExpectedId(snap, id, 'Firestore transaction document snapshot');
+	const current = firestoreDocumentData(snap, 'Firestore transaction document snapshot');
+	if (!firestoreVersionMatches(current, expectedVersion)) {
+		throw firestoreOptimisticLockConflict(model, id, expectedVersion);
+	}
+}
+
 async function replaceFirestoreDocument(
 	client: ReturnType<typeof normalizeFirestoreClient>,
 	model: ResolvedModelMeta,
 	id: EntityId,
 	ref: object,
-	data: Record<string, unknown>
+	data: Record<string, unknown>,
+	expectedVersion?: number
 ) {
 	if (!client.runTransaction) {
 		throw new ActiveTsConfigurationError('Firestore adapter client.runTransaction is required for update().');
@@ -1482,20 +1552,37 @@ async function replaceFirestoreDocument(
 	try {
 		await client.runTransaction(async (transaction: unknown) => {
 			const safeTransaction = normalizeFirestoreObject(transaction, 'Firestore transaction');
-			const snap = normalizeFirestoreObject(
-				await firestoreMethod(safeTransaction, 'get', 'Firestore transaction.get')(ref),
-				'Firestore transaction document snapshot'
+			await readFirestoreDocumentForWrite(safeTransaction, model, id, ref, expectedVersion, () =>
+				firestoreUpdateNotFound(model, id)
 			);
-			if (!firestoreSnapshotExists(snap, 'Firestore transaction document snapshot')) {
-				throw firestoreUpdateNotFound(model, id);
-			}
 			await firestoreMethod(safeTransaction, 'set', 'Firestore transaction.set')(ref, data);
 		});
 	} catch (error) {
-		if (error instanceof ActiveTsNotFoundError) throw error;
+		if (error instanceof ActiveTsNotFoundError || error instanceof ActiveTsConflictError) throw error;
 		if (isFirestoreNotFoundError(error)) throw firestoreUpdateNotFound(model, id);
 		throw error;
 	}
+}
+
+async function deleteFirestoreDocumentAtVersion(
+	client: ReturnType<typeof normalizeFirestoreClient>,
+	model: ResolvedModelMeta,
+	id: EntityId,
+	ref: object,
+	expectedVersion: number
+) {
+	if (!client.runTransaction) {
+		throw new ActiveTsConfigurationError(
+			'Firestore adapter client.runTransaction is required for delete() with expectedVersion.'
+		);
+	}
+	await client.runTransaction(async (transaction: unknown) => {
+		const safeTransaction = normalizeFirestoreObject(transaction, 'Firestore transaction');
+		await readFirestoreDocumentForWrite(safeTransaction, model, id, ref, expectedVersion, () =>
+			firestoreDeleteNotFound(model, id)
+		);
+		await firestoreMethod(safeTransaction, 'delete', 'Firestore transaction.delete')(ref);
+	});
 }
 
 function firestoreOptionalMethod(target: object, method: string, context: string) {
