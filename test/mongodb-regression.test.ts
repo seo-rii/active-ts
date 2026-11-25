@@ -1097,8 +1097,8 @@ test('MongoDB adapter direct array paths ignore patched Array transforms', async
 	]);
 	assert.equal((queryResult as any).count, 2);
 	assert.deepEqual(sortSpec, { score: -1, id: 1 });
-	assert.deepEqual(queryFindOptions, { projection: { id: 1, handle: 1, _id: 1 } });
-	assert.deepEqual(fallbackFindOptions, { projection: { id: 1, score: 1, _id: 1 } });
+	assert.deepEqual(queryFindOptions, { projection: { id: 1, handle: 1, _id: 1 }, collation: { locale: 'simple' } });
+	assert.deepEqual(fallbackFindOptions, { projection: { id: 1, score: 1, _id: 1 }, collation: { locale: 'simple' } });
 	assert.deepEqual(fallbackAggregateResult, { top: 7 });
 	assert.deepEqual(pipelineAggregateResult, { total: 10 });
 	assert.deepEqual((aggregatePipeline as any[])[1].$group.total, { $sum: '$score' });
@@ -1379,7 +1379,7 @@ test('MongoDB min and max aggregate fallback ignores null fields with core seman
 		{ count: 4, lowest: 5, highest: 8 }
 	);
 	assert.deepEqual(capturedFindFilter, {});
-	assert.deepEqual(capturedFindOptions, { projection: { id: 1, score: 1, _id: 1 } });
+	assert.deepEqual(capturedFindOptions, { projection: { id: 1, score: 1, _id: 1 }, collation: { locale: 'simple' } });
 	assert.equal(aggregateCalls, 0);
 });
 
