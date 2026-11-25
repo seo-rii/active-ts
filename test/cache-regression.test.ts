@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createCipheriv } from 'node:crypto';
 import {
 	ActiveTsCommittedTransactionError,
 	ActiveTsCommittedWriteError,
@@ -1874,6 +1875,89 @@ test('AES-GCM cache codec rejects non-string payloads without coercion', async (
 		/AES-GCM cache codec payload must be a string or Buffer/
 	);
 	assert.equal(toStringCalls, 0);
+});
+
+test('AES-GCM cache codec enforces 12-byte IV, 16-byte auth tag, and canonical base64url on decode', async () => {
+	const key = Buffer.alloc(32, 0x2a);
+	const aad = Buffer.from('tenant-scope', 'utf8');
+	const cacheKey = 'row:1';
+	const fullAad = Buffer.concat([aad, Buffer.from([0]), Buffer.from(cacheKey, 'utf8')]);
+	const codec = createAesGcmCacheCodec({
+		key,
+		aad,
+		randomBytes: (size) => Buffer.alloc(size, 0x11)
+	});
+
+	const original = { id: 1, value: 'secret-payload', nested: { ok: true } };
+	const encoded = await codec.encode(original, { key: cacheKey, operation: 'set' });
+	assert.equal(typeof encoded, 'string');
+	assert.deepEqual(await codec.decode(encoded, { key: cacheKey, operation: 'get' }), original);
+	assert.deepEqual(await codec.decode(Buffer.from(encoded as string, 'utf8'), { key: cacheKey, operation: 'get' }), original);
+
+	const [version, validIv, validTag, validCiphertext] = (encoded as string).split(':');
+	assert.equal(Buffer.from(validIv, 'base64url').length, 12);
+	assert.equal(Buffer.from(validTag, 'base64url').length, 16);
+
+	const craftPayload = (ivBytes: Buffer, authTagLength: number) => {
+		const cipher = createCipheriv('aes-256-gcm', key, ivBytes, { authTagLength });
+		cipher.setAAD(fullAad);
+		const plaintext = Buffer.from(JSON.stringify(original), 'utf8');
+		const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+		const tag = cipher.getAuthTag();
+		return [version, ivBytes.toString('base64url'), tag.toString('base64url'), ciphertext.toString('base64url')].join(':');
+	};
+
+	const isDecodeValidationError = (error: unknown) =>
+		error instanceof ActiveTsValidationError && /Failed to decode AES-GCM cache codec payload/.test(error.message);
+
+	for (const authTagLength of [4, 12]) {
+		const forgedTruncated = craftPayload(Buffer.alloc(12, 0x22), authTagLength);
+		assert.throws(
+			() => codec.decode(forgedTruncated, { key: cacheKey, operation: 'get' }),
+			isDecodeValidationError
+		);
+
+		const truncatedValidTag = Buffer.from(validTag, 'base64url').subarray(0, authTagLength).toString('base64url');
+		assert.throws(
+			() => codec.decode([version, validIv, truncatedValidTag, validCiphertext].join(':'), { key: cacheKey, operation: 'get' }),
+			isDecodeValidationError
+		);
+	}
+
+	const overlongTag = Buffer.concat([Buffer.from(validTag, 'base64url'), Buffer.alloc(4, 0x01)]).toString('base64url');
+	assert.throws(
+		() => codec.decode([version, validIv, overlongTag, validCiphertext].join(':'), { key: cacheKey, operation: 'get' }),
+		isDecodeValidationError
+	);
+
+	for (const ivLength of [8, 16]) {
+		const forgedNonStandardIv = craftPayload(Buffer.alloc(ivLength, 0x33), 16);
+		assert.throws(
+			() => codec.decode(forgedNonStandardIv, { key: cacheKey, operation: 'get' }),
+			isDecodeValidationError
+		);
+	}
+
+	const base64UrlAlphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+	const lastTagCharIndex = base64UrlAlphabet.indexOf(validTag[validTag.length - 1]);
+	assert.ok(lastTagCharIndex >= 0);
+	const nonCanonicalTag = `${validTag.slice(0, -1)}${base64UrlAlphabet[lastTagCharIndex ^ 1]}`;
+	assert.deepEqual(Buffer.from(nonCanonicalTag, 'base64url'), Buffer.from(validTag, 'base64url'));
+
+	const nonCanonicalPayloads = [
+		[version, `${validIv}==`, validTag, validCiphertext].join(':'),
+		[version, validIv, `${validTag}==`, validCiphertext].join(':'),
+		[version, validIv, nonCanonicalTag, validCiphertext].join(':'),
+		[version, ` ${validIv}`, validTag, validCiphertext].join(':'),
+		[version, validIv, validTag, `${validCiphertext}\n`].join(':'),
+		[version, validIv, validTag, `${validCiphertext}=`].join(':')
+	];
+	for (const malformed of nonCanonicalPayloads) {
+		assert.throws(
+			() => codec.decode(malformed, { key: cacheKey, operation: 'get' }),
+			isDecodeValidationError
+		);
+	}
 });
 
 test('AES-GCM cache codec ignores inherited toJSON before encryption', async () => {
