@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { optionalImport } from '../../core/optional-import.js';
+import { createAdapterCloser } from '../../core/adapter-lifecycle.js';
 import {
 	ActiveTsCommittedTransactionError,
 	ActiveTsConfigurationError,
@@ -311,6 +312,9 @@ function jsonPathParam(field: string, params: any[]) {
 }
 
 function modelFieldType(model: ResolvedModelMeta, field: string) {
+	// Field types describe domain values. Codec predicates/sorts operate on
+	// encoded JSON, whose scalar type is inferred from operands or stored rows.
+	if (MAP_HAS.call(model.fieldCodecs, field)) return undefined;
 	return MAP_GET.call(model.fieldTypes, field) as FieldType | undefined;
 }
 
@@ -678,20 +682,23 @@ function offsetSql(offset: number | undefined) {
 	return ` offset ${offset}`;
 }
 
-function numericAggregateSql(field: string, params: any[]) {
+function numericAggregateSql(field: string, params: any[], type = 'double precision') {
 	const path = jsonPathParam(field, params);
 	const json = `data #> ${path}`;
 	const text = `data #>> ${path}`;
-	return `(case when ${json} is null or jsonb_typeof(${json}) = 'null' then null when jsonb_typeof(${json}) = 'number' then ${text} else 'active-ts-invalid-numeric-aggregate' end)::double precision`;
+	return `(case when ${json} is null or jsonb_typeof(${json}) = 'null' then null when jsonb_typeof(${json}) = 'number' then ${text} else 'active-ts-invalid-numeric-aggregate' end)::${type}`;
 }
 
 function aggregateSql(model: ResolvedModelMeta, spec: AggregateSpec, params: any[]) {
 	const alias = quote(spec.as);
 	if (spec.op === 'count') return `count(*)::double precision as ${alias}`;
 	if (spec.op === 'sum' || spec.op === 'avg') {
-		const numericValue = numericAggregateSql(spec.field!, params);
+		// A finite mean can have a sum outside the double-precision range.
+		// Accumulate as numeric, then let shared JS-number normalization handle
+		// the text result; a PostgreSQL numeric-to-double cast rejects underflow.
+		const numericValue = numericAggregateSql(spec.field!, params, spec.op === 'avg' ? 'numeric' : 'double precision');
 		if (spec.op === 'sum') return `coalesce(sum(${numericValue}), 0)::double precision as ${alias}`;
-		return `avg(${numericValue})::double precision as ${alias}`;
+		return `avg(${numericValue})::text as ${alias}`;
 	}
 	const comparableValue = typedJsonFieldParam(model, spec.field!, params);
 	return `${spec.op}(${modelFieldType(model, spec.field!) === 'string' ? postgresStringOrderKey(comparableValue) : comparableValue}) as ${alias}`;
@@ -1336,11 +1343,14 @@ async function createPostgresStoreAdapterInternal(
 	options = validatePostgresOptions(options);
 	const mod = options.pool ? undefined : await optionalImport('pg', 'PostgresStoreAdapter');
 	const Pool = mod?.Pool;
-	const pool = normalizePostgresPool(options.pool ?? new Pool({ connectionString: options.connectionString }));
+	const rawPool = options.pool ?? new Pool({ connectionString: options.connectionString });
+	const pool = normalizePostgresPool(rawPool);
+	const close = createAdapterCloser(options.pool ? undefined : () => postgresMethod(rawPool, 'end', 'PostgreSQL pool.end')());
 	const supportsTransaction = !options.inTransaction && pool.connect !== undefined;
 
 	const adapter: StoreAdapter = {
 		kind: 'postgresql',
+		close,
 		cacheScope: options.cacheScope,
 		capabilities: {
 			or: true,

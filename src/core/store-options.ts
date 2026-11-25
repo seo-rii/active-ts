@@ -1683,6 +1683,7 @@ function createCloseGuardedStoreAdapterWithSavepointGate(
 		datastoreProjectId: adapter.datastoreProjectId,
 		datastoreDatabaseId: adapter.datastoreDatabaseId,
 		datastoreKeyEncoding: adapter.datastoreKeyEncoding,
+		datastoreCacheScopeStability: adapter.datastoreCacheScopeStability,
 		capabilities: adapter.capabilities,
 		get: (model, id, options) => track('get rows', () => adapter.get(model, id, options)),
 		getMany: (model, ids, options) => track('get rows', () => adapter.getMany(model, ids, options)),
@@ -1851,7 +1852,7 @@ function normalizeStoreQueryBranch(
 	if (!branch.where.length && !branch.or.length) {
 		throw new ActiveTsValidationError(`${context} requires at least one where condition.`);
 	}
-	return branch;
+	return copyFieldCodecQueryOperandMarker(plan, branch);
 }
 
 function normalizeWhereEntries(value: unknown, context: string, fieldContext?: string): QueryPlan['where'] {
@@ -1987,11 +1988,11 @@ function constrainOrBranch(branch: QueryPlan, constraints: QueryPlan['where']): 
 	for (let index = 0; index < branch.or.length; index++) {
 		or[index] = constrainOrBranch(branch.or[index], constraints);
 	}
-	return {
+	return copyFieldCodecQueryOperandMarker(branch, {
 		...branch,
 		where,
 		or
-	};
+	});
 }
 
 function mergeWhereConstraints(
