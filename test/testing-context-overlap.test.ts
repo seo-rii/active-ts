@@ -21,12 +21,12 @@ test('independent callbacks cannot overlap a global installation of the same con
 		assert.equal(secondRan, false);
 		assert.equal(getCurrentDefaultContext(), context.context);
 		assert.equal(ActiveTestContext.hasInstalledContext(context), true);
-		console.warn('first remains installed');
+		console.warn('active-ts lazy relation "first remains installed"');
 	} finally {
 		release.resolve();
 		await first;
 	}
-	assert.deepEqual(context.warnings, ['first remains installed']);
+	assert.deepEqual(context.warnings, ['active-ts lazy relation "first remains installed"']);
 	assert.equal(getCurrentDefaultContext(), previous);
 	assert.equal(console.warn, warn);
 	assert.equal(ActiveTestContext.hasInstalledContext(), false);
@@ -60,7 +60,7 @@ test('nested callbacks keep their shared global installation until the last call
 				entered.resolve();
 				await release.promise;
 				assert.equal(getCurrentDefaultContext(), context.context);
-				console.warn('nested remains installed');
+				console.warn('active-ts lazy relation "nested remains installed"');
 			});
 			await entered.promise;
 		});
@@ -70,7 +70,7 @@ test('nested callbacks keep their shared global installation until the last call
 		release.resolve();
 		await nested;
 	}
-	assert.deepEqual(context.warnings, ['nested remains installed']);
+	assert.deepEqual(context.warnings, ['active-ts lazy relation "nested remains installed"']);
 	assert.equal(getCurrentDefaultContext(), previous);
 	assert.equal(console.warn, warn);
 	assert.equal(ActiveTestContext.hasInstalledContext(), false);

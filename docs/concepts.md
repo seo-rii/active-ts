@@ -199,6 +199,16 @@ const profile = await profileCache.get(1);
 await profileCache.invalidate(1);
 ```
 
+For bounded in-process retention, configure `new MemoryCacheAdapter({
+maxEntries: 4096, sweepSize: 16 })` and function-cache `memory: { ttl: 60,
+maxEntries: 4096, sweepSize: 16 }`. Capacity remains unlimited when `maxEntries`
+is omitted. The configured capacity evicts the oldest inserted entry as needed.
+Each memory lookup or insertion inspects at most `sweepSize` entries for expiry
+(16 by default), so unrelated traffic also releases expired keys that are never
+read again. No timer is installed; an idle cache retains entries until its next
+operation. Function-cache sweeps preserve values within their configured
+stale-while-revalidate window.
+
 ## Relations
 
 Relations are declared as metadata and loaded explicitly:
@@ -442,6 +452,14 @@ and indexes. Destructive changes are intentionally out of scope.
 
 `schemaMigration(models, name)` captures the same plans as a migration snapshot
 without applying them.
+
+Use `batch: { concurrency: 16 }` in the active-ts context configuration to bound
+asynchronous relation loading, search hydration and `afterInstantiate` hooks
+within each collection. Results retain input order. With a configured limit, started work is drained
+before rejection and queued work is not started after failure. The default remains
+unbounded for compatibility; the limit is per collection, not a global request
+or provider RPC quota. `batch.maxSize` continues to control unique read batch
+size independently.
 
 ## Cache key ownership
 

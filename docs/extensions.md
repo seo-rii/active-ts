@@ -253,7 +253,7 @@ Built-in store adapters support different transaction options and savepoints:
 | --- | --- | --- | --- | --- |
 | Memory | Yes | Yes | `readOnly` | Rejects `isolation`, `timeoutMs`, and `native`; intended for deterministic tests. |
 | PostgreSQL | Yes | Yes | `isolation`, `readOnly`, `timeoutMs` | Rejects transaction `native`; native SQL is still available through query builders outside read-only transaction guards. |
-| SQLite | Yes | Yes | `readOnly`, `isolation: 'serializable'` | `BEGIN IMMEDIATE`; rejects other isolation levels, `timeoutMs`, transaction `native`, and native query payloads. |
+| SQLite | Yes | Yes | `readOnly`, `isolation: 'serializable'` | `BEGIN IMMEDIATE` (deferred `BEGIN` when `readOnly`); rejects other isolation levels, `timeoutMs`, transaction `native`, and native query payloads. |
 | MongoDB | When the client exposes `startSession()` | No | `readOnly`, `timeoutMs`, plus `native.readConcern`, `native.writeConcern`, `native.readPreference`, and `native.maxCommitTimeMS` | Requires a replica set or sharded cluster; transaction handles reject native query payloads and serialize portable driver operations on one session. |
 | Datastore | When the SDK client exposes `transaction()` | No | `readOnly`, plus `native.gaxOptions`, `native.commitGaxOptions`, and `native.rollbackGaxOptions` | Write transactions allow native query callbacks before buffered writes; read-only transactions reject native callbacks. |
 | Firestore | Yes | No | `readOnly`, plus `native.maxAttempts`, `native.readOnly`, and `native.readTime` | Transaction queries reject native function payloads; Firestore requires all unbuffered reads before writes. Queries wait for earlier pending mutations before enforcing that boundary. |
@@ -539,6 +539,15 @@ batchSize }` into `lease()` or `drain()`, and the built-in memory/store outbox
 adapters honor that limit directly. Custom adapters should do the same; the
 worker also releases or requeues overflow defensively if an adapter returns more
 than the requested limit.
+
+Store-backed outbox listing, leasing and draining also follow a store's default
+continuation pages when no limit is supplied. A page containing only dead
+letters or unavailable events does not mean that the queue is empty. Continuing
+stores must advertise cursor support and return an advancing cursor; otherwise
+the adapter rejects an incomplete scan instead of silently omitting events.
+If a later page fails, claimed leases are released and nontransactional drains
+attempt to restore already removed events before returning the error. Cleanup
+failures are reported together with the original failure.
 
 For Datastore models with ancestor metadata, outbox search sync keeps the public
 model id unchanged but carries a bounded per-entity `modelIdentity` for the

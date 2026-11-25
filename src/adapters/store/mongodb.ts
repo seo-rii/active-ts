@@ -585,7 +585,7 @@ export async function createMongoStoreAdapter(options: MongoStoreOptions): Promi
 			const coll = collection(model);
 			const row = await mongoMethod(coll, 'findOne', 'MongoDB collection.findOne')(
 				idFilter(model, id),
-				mongoSessionOptions(transactionState)
+				mongoPortableOptions(transactionState)
 			);
 			return row !== null && row !== undefined;
 		};
@@ -637,7 +637,7 @@ export async function createMongoStoreAdapter(options: MongoStoreOptions): Promi
 					const coll = collection(model);
 					const row = await mongoMethod(coll, 'findOne', 'MongoDB collection.findOne')(
 						idFilter(model, id),
-						mongoSessionOptions(transactionState)
+						mongoPortableOptions(transactionState)
 					);
 					if (row === null || row === undefined) return null;
 					return mongoDocumentDataForExpectedId(row, model, id, 'MongoDB document');
@@ -652,7 +652,7 @@ export async function createMongoStoreAdapter(options: MongoStoreOptions): Promi
 					const coll = collection(model);
 					const cursor = mongoMethod(coll, 'find', 'MongoDB collection.find')(
 						{ _id: { $in: entityIdKeyArray(ids) } },
-						mongoSessionOptions(transactionState)
+						mongoPortableOptions(transactionState)
 					);
 					const list = mongoArrayResult(
 						await mongoMethod(normalizeMongoCursor(cursor, 'MongoDB find cursor'), 'toArray', 'MongoDB find cursor.toArray')(),
@@ -709,7 +709,7 @@ export async function createMongoStoreAdapter(options: MongoStoreOptions): Promi
 					let cursor = normalizeMongoCursor(
 						mongoMethod(coll, 'find', 'MongoDB collection.find')(
 							mongoFilter(plan),
-							mongoSessionOptions(
+							mongoPortableOptions(
 								transactionState,
 								projection === undefined ? undefined : { projection }
 							)
@@ -773,7 +773,7 @@ export async function createMongoStoreAdapter(options: MongoStoreOptions): Promi
 						const cursor = normalizeMongoCursor(
 							mongoMethod(coll, 'find', 'MongoDB collection.find')(
 								mongoFilter({ where: plan.where, or: plan.or }),
-								mongoSessionOptions(transactionState, { projection })
+								mongoPortableOptions(transactionState, { projection })
 							),
 							'MongoDB aggregate fallback cursor'
 						);
@@ -792,7 +792,7 @@ export async function createMongoStoreAdapter(options: MongoStoreOptions): Promi
 									$group: mongoAggregateGroup(specs, invalidAliases)
 								}
 							],
-							mongoSessionOptions(transactionState)
+							mongoPortableOptions(transactionState)
 						),
 						'MongoDB aggregate cursor'
 					);
@@ -850,7 +850,7 @@ export async function createMongoStoreAdapter(options: MongoStoreOptions): Promi
 						res = await mongoMethod(coll, 'replaceOne', 'MongoDB collection.replaceOne')(
 							filter,
 							document,
-							mongoSessionOptions(transactionState, { upsert: false })
+							mongoPortableOptions(transactionState, { upsert: false })
 						);
 					} catch (error) {
 						if (mongoErrorCode(error) === 11000) {
@@ -890,7 +890,7 @@ export async function createMongoStoreAdapter(options: MongoStoreOptions): Promi
 				return runMongoOperation(transactionState, async () => {
 					const res = await mongoMethod(coll, 'deleteOne', 'MongoDB collection.deleteOne')(
 						filter,
-						mongoSessionOptions(transactionState)
+						mongoPortableOptions(transactionState)
 					);
 					const deletedCount = mongoDeletedCount(res, 'MongoDB deleteOne');
 					if (options.expectedVersion !== undefined && deletedCount === 0) {
@@ -1071,6 +1071,11 @@ export async function createMongoStoreAdapter(options: MongoStoreOptions): Promi
 								`MongoDB collection "${model.name}" exists as ${existingCollection.type}; expected collection.`
 							);
 						}
+						if (existingCollection && !existingCollection.portableCollation) {
+							throw new ActiveTsConfigurationError(
+								`MongoDB collection "${model.name}" requires simple collation for portable queries and indexes.`
+							);
+						}
 						const collectionExists = existingCollection !== undefined;
 						if (!collectionExists) changes.push({ type: 'create-collection', target: model.name });
 						const existingIndexes = collectionExists
@@ -1150,18 +1155,23 @@ type MongoIndexDefinition = {
 type MongoCollectionDefinition = {
 	name: string;
 	type?: string;
+	portableCollation: boolean;
 };
 const MONGO_SUPPORTED_INDEX_METADATA = ['v', 'key', 'name', 'unique'] as const;
 
 function mongoCollectionDefinition(collection: unknown): MongoCollectionDefinition {
 	const name = mongoDocumentValue(collection, 'name', 'MongoDB collection');
 	const type = mongoDocumentValue(collection, 'type', 'MongoDB collection');
+	const options = mongoDocumentValue(collection, 'options', 'MongoDB collection');
+	const collation = options === undefined ? undefined : mongoDocumentValue(options, 'collation', 'MongoDB collection options');
+	const locale = collation === undefined ? undefined : mongoDocumentValue(collation, 'locale', 'MongoDB collection collation');
 	if (type !== undefined && typeof type !== 'string') {
 		throw new ActiveTsValidationError('MongoDB collection.type must be a string.');
 	}
 	return {
 		name: mongoOptionalString(name, 'MongoDB collection.name'),
-		type
+		type,
+		portableCollation: collation === undefined || locale === 'simple'
 	};
 }
 
@@ -1634,6 +1644,15 @@ function runMongoOperation<T>(
 			throw normalizeMongoTransactionConflict(error);
 		}
 	})();
+}
+
+function mongoPortableOptions(
+	transactionState: MongoTransactionState | undefined,
+	options?: Record<string, unknown>
+) {
+	// Portable equality, ordering and typed physical IDs must not inherit an
+	// existing collection's locale or case-insensitive comparison rules.
+	return mongoSessionOptions(transactionState, { ...options, collation: { locale: 'simple' } });
 }
 
 function mongoSessionOptions(

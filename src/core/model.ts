@@ -39,6 +39,7 @@ import { MAP_CLEAR, MAP_ENTRIES, MAP_GET, MAP_SET, SET_ADD, SET_HAS } from './co
 import {
 	assertContextTransactionWritable,
 	contextInternalStore,
+	contextMapConcurrent,
 	markContextTransactionRollbackOnly,
 	runTrackedContextOperation
 } from './context-internal.js';
@@ -359,11 +360,7 @@ export abstract class Model<TData extends Record<string, any> = Record<string, a
 						);
 						if (nested.length && result) {
 							if (Array.isArray(result)) {
-								const tasks: Array<Promise<unknown>> = [];
-								for (let index = 0; index < result.length; index++) {
-									tasks[index] = result[index].include(...nested);
-								}
-								await Promise.all(tasks);
+								await contextMapConcurrent(context, result, item => item.include(...nested));
 							} else {
 								await (result as any).include(...nested);
 							}
@@ -563,22 +560,37 @@ export abstract class Model<TData extends Record<string, any> = Record<string, a
 			prepared.context, prepared.model, prepared.id,
 			() => prepared.store.update(prepared.meta, prepared.id, prepared.encodedData, prepared.writeOptions)
 		);
-		replaceData(this.data, prepared.data);
-		this.persistedId = prepared.id;
-		this.persistedVersion = typeof prepared.data.version === 'number' ? prepared.data.version : undefined;
-		MAP_CLEAR.call(this.relationCache);
+		await afterStoreWrite(prepared.context, prepared.meta.name, 'update', prepared.id, async () => {
+			try {
+				replaceData(this.data, prepared.data);
+				this.persistedId = prepared.id;
+				this.persistedVersion = typeof prepared.data.version === 'number' ? prepared.data.version : undefined;
+				MAP_CLEAR.call(this.relationCache);
+			} catch (error) {
+				try {
+					await this.runPreparedSaveBoundaryEffects(prepared);
+				} catch (boundaryError) {
+					throw new AggregateError([error, boundaryError], 'Committed update model copy and boundary effects failed.');
+				}
+				throw error;
+			}
+		});
+	}
+
+	private runPreparedSaveBoundaryEffects(prepared: PreparedModelUpdate) {
+		return runCommittedWriteBoundaryEffects(prepared.context, prepared.meta, prepared.id, {
+			model: prepared.meta,
+			target: this,
+			id: prepared.id,
+			data: prepared.data,
+			result: this,
+			operation: 'update'
+		});
 	}
 
 	private async finishPreparedSave(prepared: PreparedModelUpdate) {
 		await afterStoreWrite(prepared.context, prepared.meta.name, 'update', prepared.id, async () => {
-			await runCommittedWriteBoundaryEffects(prepared.context, prepared.meta, prepared.id, {
-				model: prepared.meta,
-				target: this,
-				id: prepared.id,
-				data: prepared.data,
-				result: this,
-				operation: 'update'
-			});
+			await this.runPreparedSaveBoundaryEffects(prepared);
 			await prepared.context.runHooks('afterUpdate', {
 				model: prepared.meta,
 				target: this,

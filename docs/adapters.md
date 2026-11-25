@@ -1,6 +1,6 @@
 # Adapters
 
-Adapters created by the PostgreSQL, MongoDB, and Redis/Valkey factories expose
+Adapters created by the PostgreSQL, MongoDB, Firestore, and Redis/Valkey factories expose
 an optional `close()` lifecycle method. Retain the factory result and call
 `await adapter.close?.()` after application work and transactions have stopped.
 It closes only the pool/client created internally by that factory. An injected
@@ -787,6 +787,12 @@ Firestore always provides `capabilities.optimisticLock`, so models with a
 numeric `version` field can `save()` and `delete()`; see
 [optimistic locking](extensions.md#optimistic-locking).
 
+MongoDB portable reads, updates and deletes explicitly use `locale: "simple"`
+collation so a collection default cannot change string ID or predicate matching.
+Schema planning rejects existing collections with a non-simple default collation;
+create or migrate a simple-collation collection before managing its indexes.
+Native callbacks remain explicit SDK escape hatches.
+
 ## SQLite
 
 `createSqliteStoreAdapter()` uses Node's built-in
@@ -838,7 +844,10 @@ Create tables and indexes with `store.schema.apply()`. Schema health checks
 require the adapter's exact table/index definitions, including JSON validation
 and strict tables; independently authored equivalent DDL may be rejected.
 
-Transactions use `BEGIN IMMEDIATE` and serialize access to a shared connection.
+Writable transactions use `BEGIN IMMEDIATE`; read-only transactions use deferred
+`BEGIN` so they do not reserve the writer lock. Both serialize access to a
+shared connection and retain SQLite snapshot isolation. Independent writers can
+commit while a WAL-mode read-only transaction keeps its existing snapshot.
 Unrelated root operations wait for the active transaction; using that root
 handle from its own callback rejects. Use the supplied transaction handle,
 which closes when the callback settles. Savepoints isolate child callbacks.
@@ -878,6 +887,14 @@ versioned CAS batches. Backend failures can still produce partial writes.
 The default leaves payload size unrestricted for compatibility. This budget
 applies to encoded entries; codecs that expand compressed data also need their
 own decoded-size limits. It does not limit aggregate batch bytes or Redis RPCs.
+
+`maxConcurrency` controls simultaneous per-key Redis script calls and defaults
+to 16. Set it to a positive safe integer to fit the application's connection and
+request budget. Versioned reads, writes and invalidations preserve input result
+order. A failure stops queued work and waits for already dispatched calls before
+rejecting; successful peer writes are not rolled back. Payload encoding still
+finishes before any write script is dispatched, so codec/size failures cannot
+partially write a prepared batch. This option bounds concurrency, not total RPCs.
 
 Cache codecs can wrap any cache adapter, or be passed directly to Redis/Valkey
 for encryption-style extensions:
