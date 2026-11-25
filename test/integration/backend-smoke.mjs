@@ -65,6 +65,19 @@ const allowedRealGoogleBackendProjects = new Set(
 		.filter(Boolean)
 );
 
+// The Datastore SDK sends readTime with whole-second precision: it floors epoch
+// milliseconds to seconds. A read time taken in the same second as a write can
+// therefore select a snapshot from before that write. Wait until the next whole
+// second has started and use that boundary, which is at or after every earlier
+// write and is never in the future.
+async function nextDatastoreReadTime() {
+	const boundary = (Math.floor(Date.now() / 1000) + 1) * 1000;
+	while (Date.now() <= boundary) {
+		await new Promise((resolve) => setTimeout(resolve, boundary - Date.now() + 5));
+	}
+	return boundary;
+}
+
 function assertGoogleBackendSmokeSafety(target, emulatorEnvName) {
 	if (process.env[emulatorEnvName]) return;
 	if (!allowRealGoogleBackendSmoke) {
@@ -611,13 +624,13 @@ if (targets.has('datastore')) {
 			if (!Array.isArray(specs) || specs.length <= 1) return directAggregate(model, plan);
 			const metaDescriptor = Object.getOwnPropertyDescriptor(plan, 'meta');
 			if (metaDescriptor && !('value' in metaDescriptor)) return directAggregate(model, plan);
-			return directAggregate(model, {
+			return nextDatastoreReadTime().then((readTime) => directAggregate(model, {
 				...plan,
 				meta: {
 					...(metaDescriptor?.value ?? {}),
-					...datastoreReadOptions({ readTime: Date.now() }).meta
+					...datastoreReadOptions({ readTime }).meta
 				}
-			});
+			}));
 		};
 	}
 	await runStoreAdapterContract(diagnosticAdapter, {
@@ -1109,8 +1122,7 @@ if (targets.has('datastore')) {
 			(await NestedRecord.ancestor(nestedParent).readConsistency('strong').find(1).load())?.data.id,
 			1
 		);
-		const historicalReadTime = Date.now();
-		await new Promise((resolve) => setTimeout(resolve, 10));
+		const historicalReadTime = await nextDatastoreReadTime();
 		await NestedRecord.ancestor(nestedParent).find(3).update({
 			metadata: { category: 'group-c', createdAt: 40 }
 		});
@@ -1118,7 +1130,7 @@ if (targets.has('datastore')) {
 			(await NestedRecord.ancestor(nestedParent).find(3).load())?.data.metadata.createdAt,
 			40
 		);
-		const emulatorReadTime = Date.now();
+		const emulatorReadTime = await nextDatastoreReadTime();
 		const pointInTime = process.env.DATASTORE_EMULATOR_HOST ? emulatorReadTime : historicalReadTime;
 		assert.equal(
 			(await NestedRecord.ancestor(nestedParent).readAt(pointInTime).find(3).load())?.data.metadata.createdAt,
