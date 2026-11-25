@@ -1,3 +1,4 @@
+import { normalizeDatastoreCacheScopeStability } from './datastore-search-scope.js';
 import type {
 	AggregatePlan,
 	AggregateResult,
@@ -49,6 +50,7 @@ import {
 	assertSearchOptionsSupported,
 	assertSearchWriteOptionsSupported,
 	contextBoundSearchDatastoreNamespace,
+	contextBoundSearchDatastoreScope,
 	datastoreSearchHitDocumentIdentityOrForced,
 	markNativeSearchAdapter,
 	markSearchDocumentIdentity,
@@ -201,6 +203,7 @@ function createStoreMiddlewareAdapterWithSource(
 		? sourceAdapter?.datastoreDatabaseId
 		: wrapped.datastoreDatabaseId;
 	const datastoreKeyEncoding = wrapped.datastoreKeyEncoding ?? sourceAdapter?.datastoreKeyEncoding;
+	const datastoreCacheScopeStability = wrapped.datastoreCacheScopeStability ?? sourceAdapter?.datastoreCacheScopeStability;
 	const trustsDatastoreEntityKeyRows =
 		storeTrustsDatastoreEntityKeyRows(adapter) ||
 		(sourceAdapter ? storeTrustsDatastoreEntityKeyRows(sourceAdapter) : false);
@@ -223,6 +226,7 @@ function createStoreMiddlewareAdapterWithSource(
 		datastoreProjectId,
 		datastoreDatabaseId,
 		datastoreKeyEncoding,
+		datastoreCacheScopeStability,
 		capabilities: wrapped.capabilities,
 		schema: wrapStoreMiddlewareSchema(wrapped.schema, adapterKind, track, dispatch),
 		get: (model: ResolvedModelMeta, id: EntityId, options?: StoreReadOptions) => track(async () => {
@@ -592,7 +596,8 @@ export function createSearchMiddlewareAdapter(
 			assertSearchOptionsSupported({ kind: adapterKind, capabilities: wrapped.capabilities }, searchOptions);
 			const resultModel = withDatastoreSearchNamespace(
 				model,
-				contextBoundSearchDatastoreNamespace(adapter, model)
+				contextBoundSearchDatastoreNamespace(adapter, model),
+				contextBoundSearchDatastoreScope(adapter, model)
 			);
 			return normalizeMiddlewareQueryResult(
 				resultModel,
@@ -614,7 +619,8 @@ export function createSearchMiddlewareAdapter(
 			const safeOptions = normalizeSearchWriteOptions(options, 'search middleware index options');
 			const indexModel = withDatastoreSearchNamespace(
 				model,
-				contextBoundSearchDatastoreNamespace(adapter, model)
+				contextBoundSearchDatastoreNamespace(adapter, model),
+				contextBoundSearchDatastoreScope(adapter, model)
 			);
 			projectSearchDocument(indexModel, indexAdapterKind, safeId, safeData, {
 				trustDatastoreEntityKey: false
@@ -764,6 +770,9 @@ function normalizeStoreAdapter(adapter: unknown, context: string): StoreAdapter 
 		adapterMember(record, 'datastoreKeyEncoding', context, { requireEnumerableOwn: false }),
 		`${context}.datastoreKeyEncoding`
 	);
+	const datastoreCacheScopeStability = normalizeDatastoreCacheScopeStability(
+		adapterMember(record, 'datastoreCacheScopeStability', context, { requireEnumerableOwn: false }), context
+	);
 	const readCapabilities = () =>
 		normalizeStoreCapabilities(
 			adapterMember(record, 'capabilities', context, {
@@ -790,6 +799,7 @@ function normalizeStoreAdapter(adapter: unknown, context: string): StoreAdapter 
 		datastoreProjectId,
 		datastoreDatabaseId,
 		datastoreKeyEncoding,
+		datastoreCacheScopeStability,
 		capabilities,
 		schema
 	};

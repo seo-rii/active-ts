@@ -1,3 +1,4 @@
+import { normalizeDatastoreSearchScope } from './datastore-search-scope.js';
 import { ActiveTsConfigurationError } from './errors.js';
 import {
 	assertSafeFieldPath,
@@ -71,6 +72,7 @@ export function snapshotAdapterModel(model: ResolvedModelMeta, context: string):
 		}
 		defineDataProperty(snapshot, key, descriptor.value, { enumerable: true, configurable: true, writable: true });
 	}
+	if (snapshot.datastoreSearchScope !== undefined) normalizeDatastoreSearchScope(snapshot.datastoreSearchScope);
 	assertSafeSchemaIdentifier(snapshot.name, `${context}.name`);
 	const idField = assertSafeTopLevelField(snapshot.idField, `${context}.idField`);
 	const indexes = snapshotStoreIndexes(snapshot.indexes, `${context}.indexes`);
