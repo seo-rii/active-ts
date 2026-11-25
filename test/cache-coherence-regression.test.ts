@@ -103,11 +103,252 @@ class SharedVersionedCache implements CacheAdapter {
 }
 
 type FakeRedisEntry = { value: string | Buffer; expiresAt?: number };
+type FakeRedisLuaValue = string | Buffer | number | boolean | FakeRedisLuaValue[];
+type FakeRedisLuaToken =
+	| { type: 'ident'; value: string }
+	| { type: 'string'; value: string }
+	| { type: 'number'; value: number }
+	| { type: 'op'; value: string };
+type FakeRedisLuaExpr =
+	| { kind: 'literal'; value: string | number | boolean }
+	| { kind: 'var'; name: string }
+	| { kind: 'index'; target: 'KEYS' | 'ARGV'; index: FakeRedisLuaExpr }
+	| { kind: 'call'; args: FakeRedisLuaExpr[] }
+	| { kind: 'table'; items: FakeRedisLuaExpr[] }
+	| { kind: 'unary'; op: 'not' | '-'; operand: FakeRedisLuaExpr }
+	| { kind: 'binary'; op: 'and' | '==' | '~=' | '<' | '<=' | '>' | '>=' | '..'; left: FakeRedisLuaExpr; right: FakeRedisLuaExpr };
+type FakeRedisLuaStmt =
+	| { kind: 'local'; name: string; expr: FakeRedisLuaExpr }
+	| { kind: 'assign'; name: string; expr: FakeRedisLuaExpr }
+	| { kind: 'if'; branches: Array<{ condition: FakeRedisLuaExpr; body: FakeRedisLuaStmt[] }>; elseBody?: FakeRedisLuaStmt[] }
+	| { kind: 'return'; expr: FakeRedisLuaExpr }
+	| { kind: 'expr'; expr: FakeRedisLuaExpr };
+
+function tokenizeFakeRedisLua(script: string): FakeRedisLuaToken[] {
+	const tokens: FakeRedisLuaToken[] = [];
+	let index = 0;
+	while (index < script.length) {
+		const ch = script[index];
+		if (/\s/.test(ch)) {
+			index++;
+			continue;
+		}
+		if (ch === "'") {
+			let value = '';
+			index++;
+			while (index < script.length && script[index] !== "'") {
+				if (script[index] === '\\' && index + 1 < script.length) {
+					index++;
+				}
+				value += script[index++];
+			}
+			if (script[index] !== "'") throw new Error('Unterminated Lua string literal.');
+			index++;
+			tokens.push({ type: 'string', value });
+			continue;
+		}
+		if (/[0-9]/.test(ch)) {
+			let end = index + 1;
+			while (end < script.length && /[0-9]/.test(script[end])) end++;
+			tokens.push({ type: 'number', value: Number(script.slice(index, end)) });
+			index = end;
+			continue;
+		}
+		if (/[A-Za-z_]/.test(ch)) {
+			let end = index + 1;
+			while (end < script.length && /[A-Za-z0-9_]/.test(script[end])) end++;
+			tokens.push({ type: 'ident', value: script.slice(index, end) });
+			index = end;
+			continue;
+		}
+		const two = script.slice(index, index + 2);
+		if (two === '==' || two === '~=' || two === '<=' || two === '>=' || two === '..') {
+			tokens.push({ type: 'op', value: two });
+			index += 2;
+			continue;
+		}
+		if ('=<>-()[]{},.'.includes(ch)) {
+			tokens.push({ type: 'op', value: ch });
+			index++;
+			continue;
+		}
+		throw new Error(`Unexpected Lua token near: ${script.slice(index, index + 20)}`);
+	}
+	return tokens;
+}
+
+function parseFakeRedisLua(script: string): FakeRedisLuaStmt[] {
+	const tokens = tokenizeFakeRedisLua(script);
+	let pos = 0;
+	const peek = (offset = 0) => tokens[pos + offset];
+	const next = () => tokens[pos++];
+	const matchIdent = (word: string) => {
+		const token = peek();
+		if (token?.type === 'ident' && token.value === word) {
+			pos++;
+			return true;
+		}
+		return false;
+	};
+	const expectIdent = (word: string) => {
+		if (!matchIdent(word)) throw new Error(`Expected Lua keyword "${word}".`);
+	};
+	const matchOp = (op: string) => {
+		const token = peek();
+		if (token?.type === 'op' && token.value === op) {
+			pos++;
+			return true;
+		}
+		return false;
+	};
+	const expectOp = (op: string) => {
+		if (!matchOp(op)) throw new Error(`Expected Lua operator "${op}".`);
+	};
+	const parseBlock = (stopWords: readonly string[]): FakeRedisLuaStmt[] => {
+		const statements: FakeRedisLuaStmt[] = [];
+		while (pos < tokens.length) {
+			const token = peek();
+			if (token?.type === 'ident' && stopWords.includes(token.value)) break;
+			statements.push(parseStatement());
+		}
+		return statements;
+	};
+	const parseStatement = (): FakeRedisLuaStmt => {
+		if (matchIdent('local')) {
+			const name = next();
+			if (name?.type !== 'ident') throw new Error('Expected identifier after local.');
+			expectOp('=');
+			return { kind: 'local', name: name.value, expr: parseExpr() };
+		}
+		if (matchIdent('if')) {
+			const branches: Array<{ condition: FakeRedisLuaExpr; body: FakeRedisLuaStmt[] }> = [];
+			const condition = parseExpr();
+			expectIdent('then');
+			branches.push({ condition, body: parseBlock(['elseif', 'else', 'end']) });
+			while (matchIdent('elseif')) {
+				const branchCondition = parseExpr();
+				expectIdent('then');
+				branches.push({ condition: branchCondition, body: parseBlock(['elseif', 'else', 'end']) });
+			}
+			let elseBody: FakeRedisLuaStmt[] | undefined;
+			if (matchIdent('else')) {
+				elseBody = parseBlock(['end']);
+			}
+			expectIdent('end');
+			return { kind: 'if', branches, elseBody };
+		}
+		if (matchIdent('return')) {
+			return { kind: 'return', expr: parseExpr() };
+		}
+		if (peek()?.type === 'ident' && peek(1)?.type === 'op' && peek(1)?.value === '=') {
+			const name = (next() as { type: 'ident'; value: string }).value;
+			expectOp('=');
+			return { kind: 'assign', name, expr: parseExpr() };
+		}
+		return { kind: 'expr', expr: parseExpr() };
+	};
+	const parseExpr = (): FakeRedisLuaExpr => parseAnd();
+	const parseAnd = (): FakeRedisLuaExpr => {
+		let left = parseComparison();
+		while (matchIdent('and')) {
+			left = { kind: 'binary', op: 'and', left, right: parseComparison() };
+		}
+		return left;
+	};
+	const parseComparison = (): FakeRedisLuaExpr => {
+		let left = parseConcat();
+		const token = peek();
+		if (token?.type === 'op' && (token.value === '==' || token.value === '~=' || token.value === '<' || token.value === '<=' || token.value === '>' || token.value === '>=')) {
+			next();
+			left = { kind: 'binary', op: token.value as '==' | '~=' | '<' | '<=' | '>' | '>=', left, right: parseConcat() };
+		}
+		return left;
+	};
+	const parseConcat = (): FakeRedisLuaExpr => {
+		let left = parseUnary();
+		while (matchOp('..')) {
+			left = { kind: 'binary', op: '..', left, right: parseUnary() };
+		}
+		return left;
+	};
+	const parseUnary = (): FakeRedisLuaExpr => {
+		if (matchIdent('not')) return { kind: 'unary', op: 'not', operand: parseUnary() };
+		if (matchOp('-')) return { kind: 'unary', op: '-', operand: parseUnary() };
+		return parsePrimary();
+	};
+	const parsePrimary = (): FakeRedisLuaExpr => {
+		const token = next();
+		if (!token) throw new Error('Unexpected end of Lua script.');
+		if (token.type === 'string' || token.type === 'number') {
+			return { kind: 'literal', value: token.value };
+		}
+		if (token.type === 'op' && token.value === '{') {
+			const items: FakeRedisLuaExpr[] = [];
+			if (!matchOp('}')) {
+				do {
+					items.push(parseExpr());
+				} while (matchOp(','));
+				expectOp('}');
+			}
+			return { kind: 'table', items };
+		}
+		if (token.type === 'ident') {
+			if (token.value === 'true') return { kind: 'literal', value: true };
+			if (token.value === 'false') return { kind: 'literal', value: false };
+			if ((token.value === 'KEYS' || token.value === 'ARGV') && matchOp('[')) {
+				const index = parseExpr();
+				expectOp(']');
+				return { kind: 'index', target: token.value, index };
+			}
+			if (token.value === 'redis' && matchOp('.')) {
+				expectIdent('call');
+				expectOp('(');
+				const args: FakeRedisLuaExpr[] = [];
+				if (!matchOp(')')) {
+					do {
+						args.push(parseExpr());
+					} while (matchOp(','));
+					expectOp(')');
+				}
+				return { kind: 'call', args };
+			}
+			return { kind: 'var', name: token.value };
+		}
+		throw new Error(`Unexpected Lua primary token: ${JSON.stringify(token)}`);
+	};
+	const body = parseBlock([]);
+	if (pos !== tokens.length) throw new Error('Unparsed trailing Lua tokens.');
+	return body;
+}
+
+function luaTruthy(value: FakeRedisLuaValue | undefined): boolean {
+	return value !== false && value !== undefined;
+}
+
+function luaText(value: FakeRedisLuaValue | undefined): string {
+	if (Buffer.isBuffer(value)) return value.toString('utf8');
+	return String(value ?? '');
+}
+
+function luaEquals(left: FakeRedisLuaValue | undefined, right: FakeRedisLuaValue | undefined): boolean {
+	if (typeof left === 'number' && typeof right === 'number') return left === right;
+	if (typeof left === 'boolean' || typeof right === 'boolean') return left === right;
+	if ((typeof left === 'string' || Buffer.isBuffer(left)) && (typeof right === 'string' || Buffer.isBuffer(right))) {
+		return luaText(left) === luaText(right);
+	}
+	return left === right;
+}
 
 class FakeEvalRedisClient {
 	readonly entries = new Map<string, FakeRedisEntry>();
 	readonly evalCalls: Array<{ script: string; keys: string[]; arguments: Array<string | Buffer> }> = [];
+	readonly redisCalls: Array<{ command: string; args: Array<string | Buffer | number> }> = [];
+	onPttl?: (key: string, defaultPttl: number) => number;
 	private now = 1_000;
+
+	currentTime() {
+		return this.now;
+	}
 
 	advance(milliseconds: number) {
 		this.now += milliseconds;
@@ -148,56 +389,189 @@ class FakeEvalRedisClient {
 
 	async eval(script: string, options: { keys: string[]; arguments: Array<string | Buffer> }) {
 		this.evalCalls.push({ script, keys: [...options.keys], arguments: [...options.arguments] });
-		const [valueKey, versionKey] = options.keys;
-		if (script.includes("redis.call('PTTL', KEYS[1])")) {
-			const value = this.read(valueKey);
-			let version = this.read(versionKey);
-			if (version === null) {
-				version = options.arguments[0];
-				if (value === null) {
-					this.write(versionKey, version, redisTtl(options.arguments[1]));
-				} else {
-					this.writeMilliseconds(versionKey, version, this.remainingMilliseconds(valueKey));
+		const ast = parseFakeRedisLua(script);
+		const scopes: Array<Map<string, FakeRedisLuaValue>> = [new Map()];
+		const lookup = (name: string): FakeRedisLuaValue => {
+			for (let index = scopes.length - 1; index >= 0; index--) {
+				if (scopes[index].has(name)) return scopes[index].get(name)!;
+			}
+			return false;
+		};
+		const assign = (name: string, value: FakeRedisLuaValue) => {
+			for (let index = scopes.length - 1; index >= 0; index--) {
+				if (scopes[index].has(name)) {
+					scopes[index].set(name, value);
+					return;
 				}
-			} else if (value !== null) {
-				this.writeMilliseconds(versionKey, version, this.remainingMilliseconds(valueKey));
-			} else if (this.remainingMilliseconds(versionKey) < 0) {
-				this.write(versionKey, version, redisTtl(options.arguments[1]));
 			}
-			return [value, version];
-		}
-		if (script.includes('if version ~= ARGV[1]')) {
-			const version = this.read(versionKey);
-			if (version === null) {
-				let replacement = options.arguments[3];
-				if (String(replacement) === String(options.arguments[0])) replacement = `${String(replacement)}:rotated`;
-				this.write(versionKey, replacement, redisTtl(options.arguments[4]));
-				return 0;
+			scopes[0].set(name, value);
+		};
+		const evalExpr = (expr: FakeRedisLuaExpr): FakeRedisLuaValue => {
+			switch (expr.kind) {
+				case 'literal':
+					return expr.value;
+				case 'var':
+					return lookup(expr.name);
+				case 'index': {
+					const idx = Number(evalExpr(expr.index)) - 1;
+					const list = expr.target === 'KEYS' ? options.keys : options.arguments;
+					return list[idx] ?? false;
+				}
+				case 'table':
+					return expr.items.map((item) => evalExpr(item));
+				case 'unary': {
+					const value = evalExpr(expr.operand);
+					return expr.op === 'not' ? !luaTruthy(value) : -Number(value);
+				}
+				case 'binary': {
+					const left = evalExpr(expr.left);
+					if (expr.op === 'and') return luaTruthy(left) ? evalExpr(expr.right) : left;
+					const right = evalExpr(expr.right);
+					switch (expr.op) {
+						case '==': return luaEquals(left, right);
+						case '~=': return !luaEquals(left, right);
+						case '<': return Number(left) < Number(right);
+						case '<=': return Number(left) <= Number(right);
+						case '>': return Number(left) > Number(right);
+						case '>=': return Number(left) >= Number(right);
+						case '..': return `${luaText(left)}${luaText(right)}`;
+					}
+				}
+				case 'call': {
+					const evaluated = expr.args.map((arg) => evalExpr(arg));
+					const command = luaText(evaluated[0]).toUpperCase();
+					return this.executeRedisCommand(command, evaluated.slice(1) as Array<string | Buffer | number>);
+				}
 			}
-			if (String(version) !== String(options.arguments[0])) return 0;
-			const ttl = redisTtl(options.arguments[2]);
-			this.write(valueKey, options.arguments[1], ttl);
-			this.write(versionKey, version, ttl);
-			return 1;
+		};
+		const execBlock = (statements: FakeRedisLuaStmt[]): { returned: boolean; value?: FakeRedisLuaValue } => {
+			scopes.push(new Map());
+			try {
+				for (const stmt of statements) {
+					switch (stmt.kind) {
+						case 'local':
+							scopes[scopes.length - 1].set(stmt.name, evalExpr(stmt.expr));
+							break;
+						case 'assign':
+							assign(stmt.name, evalExpr(stmt.expr));
+							break;
+						case 'expr':
+							evalExpr(stmt.expr);
+							break;
+						case 'return':
+							return { returned: true, value: evalExpr(stmt.expr) };
+						case 'if': {
+							let matched = false;
+							for (const branch of stmt.branches) {
+								if (luaTruthy(evalExpr(branch.condition))) {
+									matched = true;
+									const result = execBlock(branch.body);
+									if (result.returned) return result;
+									break;
+								}
+							}
+							if (!matched && stmt.elseBody) {
+								const result = execBlock(stmt.elseBody);
+								if (result.returned) return result;
+							}
+							break;
+						}
+					}
+				}
+				return { returned: false };
+			} finally {
+				scopes.pop();
+			}
+		};
+		const result = execBlock(ast);
+		if (!result.returned) return null;
+		return this.toNodeRedisReply(result.value!);
+	}
+
+	private toNodeRedisReply(value: FakeRedisLuaValue): any {
+		if (value === false) return null;
+		if (Array.isArray(value)) return value.map((item) => this.toNodeRedisReply(item));
+		return value;
+	}
+
+	private executeRedisCommand(command: string, args: Array<string | Buffer | number>): FakeRedisLuaValue {
+		this.redisCalls.push({ command, args: [...args] });
+		switch (command) {
+			case 'GET': {
+				const value = this.read(luaText(args[0]));
+				return value === null ? false : value;
+			}
+			case 'SET': {
+				const key = luaText(args[0]);
+				const value = args[1] as string | Buffer;
+				if (args.length === 2) {
+					this.entries.set(key, { value, expiresAt: undefined });
+					return 'OK';
+				}
+				if (args.length === 4) {
+					const unit = luaText(args[2]).toUpperCase();
+					const rawTtl = Number(luaText(args[3]));
+					if (!Number.isSafeInteger(rawTtl) || rawTtl <= 0) {
+						throw new Error("ERR invalid expire time in 'set' command");
+					}
+					if (unit === 'EX') {
+						this.entries.set(key, { value, expiresAt: this.now + rawTtl * 1_000 });
+						return 'OK';
+					}
+					if (unit === 'PX') {
+						this.entries.set(key, { value, expiresAt: this.now + rawTtl });
+						return 'OK';
+					}
+				}
+				throw new Error(`Unsupported SET arguments: ${JSON.stringify(args)}`);
+			}
+			case 'PTTL': {
+				const key = luaText(args[0]);
+				const defaultPttl = this.remainingMilliseconds(key);
+				return this.onPttl ? this.onPttl(key, defaultPttl) : defaultPttl;
+			}
+			case 'TTL': {
+				const pttl = this.remainingMilliseconds(luaText(args[0]));
+				if (pttl < 0) return pttl;
+				return Math.floor(pttl / 1_000);
+			}
+			case 'PEXPIRE': {
+				const key = luaText(args[0]);
+				const ms = Number(luaText(args[1]));
+				if (this.read(key) === null) return 0;
+				if (ms <= 0) {
+					this.entries.delete(key);
+					return 1;
+				}
+				this.entries.get(key)!.expiresAt = this.now + ms;
+				return 1;
+			}
+			case 'EXPIRE': {
+				const key = luaText(args[0]);
+				const seconds = Number(luaText(args[1]));
+				if (this.read(key) === null) return 0;
+				if (seconds <= 0) {
+					this.entries.delete(key);
+					return 1;
+				}
+				this.entries.get(key)!.expiresAt = this.now + seconds * 1_000;
+				return 1;
+			}
+			case 'PERSIST': {
+				const key = luaText(args[0]);
+				if (this.read(key) === null) return 0;
+				const entry = this.entries.get(key)!;
+				if (entry.expiresAt === undefined) return 0;
+				entry.expiresAt = undefined;
+				return 1;
+			}
+			case 'DEL': {
+				const key = luaText(args[0]);
+				return this.entries.delete(key) ? 1 : 0;
+			}
+			default:
+				throw new Error(`Unexpected Redis command "${command}".`);
 		}
-		if (script.includes('local token = ARGV[3]')) {
-			let token = options.arguments[2];
-			const version = this.read(versionKey);
-			if (version !== null && String(token) === String(version)) token = `${String(token)}:rotated`;
-			const ttl = redisTtl(options.arguments[1]);
-			this.write(valueKey, options.arguments[0], ttl);
-			this.write(versionKey, token, ttl);
-			return 1;
-		}
-		if (script.includes("redis.call('DEL', KEYS[1])")) {
-			let token = options.arguments[0];
-			const version = this.read(versionKey);
-			if (version !== null && String(token) === String(version)) token = `${String(token)}:rotated`;
-			this.entries.delete(valueKey);
-			this.write(versionKey, token, redisTtl(options.arguments[1]));
-			return 1;
-		}
-		throw new Error('Unexpected Redis Lua script.');
 	}
 
 	private read(key: string) {
@@ -217,23 +591,11 @@ class FakeEvalRedisClient {
 		});
 	}
 
-	private writeMilliseconds(key: string, value: string | Buffer, ttl: number) {
-		this.entries.set(key, {
-			value,
-			expiresAt: ttl < 0 ? undefined : this.now + ttl
-		});
-	}
-
 	private remainingMilliseconds(key: string) {
 		if (this.read(key) === null) return -2;
 		const expiresAt = this.entries.get(key)?.expiresAt;
 		return expiresAt === undefined ? -1 : expiresAt - this.now;
 	}
-}
-
-function redisTtl(value: string | Buffer | undefined) {
-	if (value === undefined || String(value) === '') return undefined;
-	return Number(value);
 }
 
 function redisClusterHashInput(key: string) {
@@ -703,6 +1065,257 @@ test('Redis keeps the legacy physical key format when versioning is unavailable'
 		`active-ts:${Buffer.from('legacy').toString('base64url')}:${Buffer.from('entry').toString('base64url')}`
 	);
 	assert.equal(cache.getManyVersioned, undefined);
+});
+
+for (const ttl of [undefined, 60] as const) {
+	test(`Redis VERSIONED_SET_SCRIPT rotates version on CAS success (${ttl === undefined ? 'no ttl' : 'with ttl'}) to prevent concurrent overwrites`, async () => {
+		const client = new FakeEvalRedisClient();
+		const cache = await createRedisValkeyCacheAdapter({ client, prefix: 'cas-rotate' });
+		assert.ok(cache.getManyVersioned && cache.setManyVersioned);
+
+		// Two concurrent writers read the same missing key and receive the same fence version.
+		const [writerARead] = await cache.getManyVersioned(['entry']);
+		const [writerBRead] = await cache.getManyVersioned(['entry']);
+		assert.equal(writerARead.value, undefined);
+		assert.equal(writerBRead.version, writerARead.version);
+
+		const options = ttl === undefined ? {} : { ttl };
+		assert.deepEqual(await cache.setManyVersioned([['entry', { value: 'fresh-winner' }, writerARead.version]], options), [true]);
+
+		const [afterWinner] = await cache.getManyVersioned(['entry']);
+		assert.deepEqual(afterWinner.value, { value: 'fresh-winner' });
+		assert.notEqual(afterWinner.version, writerARead.version);
+
+		// The slower writer holding the original expected version must be rejected.
+		assert.deepEqual(await cache.setManyVersioned([['entry', { value: 'stale-loser' }, writerBRead.version]], options), [false]);
+		assert.deepEqual(await cache.getMany(['entry']), [{ value: 'fresh-winner' }]);
+
+		// A subsequent CAS write using the rotated version succeeds and rotates again.
+		assert.deepEqual(await cache.setManyVersioned([['entry', { value: 'next-winner' }, afterWinner.version]], options), [true]);
+		const [afterNext] = await cache.getManyVersioned(['entry']);
+		assert.deepEqual(afterNext.value, { value: 'next-winner' });
+		assert.notEqual(afterNext.version, afterWinner.version);
+		assert.deepEqual(await cache.setManyVersioned([['entry', { value: 'stale-second' }, afterWinner.version]], options), [false]);
+		assert.deepEqual(await cache.getMany(['entry']), [{ value: 'next-winner' }]);
+	});
+}
+
+test('Redis VERSIONED_SET_SCRIPT appends :rotated if replacement token collides with ARGV[1]', async () => {
+	const client = new FakeEvalRedisClient();
+	const cache = await createRedisValkeyCacheAdapter({ client, prefix: 'cas-collision' });
+	assert.ok(cache.getManyVersioned && cache.setManyVersioned);
+
+	const [initial] = await cache.getManyVersioned(['entry']);
+	assert.deepEqual(await cache.setManyVersioned([['entry', { value: 'seed' }, initial.version]]), [true]);
+	const versionedSetCall = client.evalCalls.find((call) => call.script.includes('if version ~= ARGV[1]'));
+	assert.ok(versionedSetCall);
+	const [valueKey, versionKey] = versionedSetCall.keys;
+
+	for (const ttlArg of ['', '30']) {
+		client.entries.set(versionKey, { value: 'same-token' });
+		const firstReply = await client.eval(versionedSetCall.script, {
+			keys: [valueKey, versionKey],
+			arguments: ['same-token', JSON.stringify({ value: 'winner' }), ttlArg, 'same-token', '86400']
+		});
+		assert.equal(firstReply, 1);
+		assert.equal(client.entries.get(versionKey)?.value, 'same-token:rotated');
+		if (ttlArg === '') {
+			assert.equal(client.entries.get(versionKey)?.expiresAt, undefined);
+		} else {
+			assert.equal(client.entries.get(versionKey)?.expiresAt, client.currentTime() + 30_000);
+		}
+
+		// A second concurrent writer holding 'same-token' must fail now that KEYS[2] rotated.
+		const secondReply = await client.eval(versionedSetCall.script, {
+			keys: [valueKey, versionKey],
+			arguments: ['same-token', JSON.stringify({ value: 'stale-overwrite' }), ttlArg, 'other-token', '86400']
+		});
+		assert.equal(secondReply, 0);
+		assert.equal(client.entries.get(valueKey)?.value, JSON.stringify({ value: 'winner' }));
+	}
+});
+
+test('Redis distributed function caches prevent a slower concurrent factory from overwriting a fresher backfill', async () => {
+	const client = new FakeEvalRedisClient();
+	let markSlowStarted!: () => void;
+	let releaseSlow!: () => void;
+	const slowStarted = new Promise<void>((resolve) => {
+		markSlowStarted = resolve;
+	});
+	const slowMayFinish = new Promise<void>((resolve) => {
+		releaseSlow = resolve;
+	});
+
+	const slow = createFunctionCache<number, string>({
+		prefix: 'redis-cas-race',
+		cache: await createRedisValkeyCacheAdapter({ client, prefix: 'race' }),
+		consistency: 'distributed',
+		memory: false,
+		ttl: 60,
+		factory: async () => {
+			markSlowStarted();
+			await slowMayFinish;
+			return 'stale-slow';
+		}
+	});
+	const fast = createFunctionCache<number, string>({
+		prefix: 'redis-cas-race',
+		cache: await createRedisValkeyCacheAdapter({ client, prefix: 'race' }),
+		consistency: 'distributed',
+		memory: false,
+		ttl: 60,
+		factory: async () => 'fresh-fast'
+	});
+
+	const slowPromise = slow.get(1);
+	await slowStarted;
+	assert.equal(await fast.get(1), 'fresh-fast');
+	releaseSlow();
+	assert.equal(await slowPromise, 'stale-slow');
+	assert.equal(await fast.peek(1), 'fresh-fast');
+});
+
+test('Redis VERSIONED_GET_SCRIPT clamps PTTL == 0 to 1ms instead of failing SET PX 0 or deleting via PEXPIRE 0', async () => {
+	const client = new FakeEvalRedisClient();
+	const cache = await createRedisValkeyCacheAdapter({ client, prefix: 'pttl-zero' });
+	assert.ok(cache.getManyVersioned && cache.setManyVersioned);
+	const valueKey = cache.codecKey!('entry');
+	const versionKey = `active-ts:version:{${valueKey}}`;
+
+	// Branch 1: version key missing, value key at PTTL == 0 boundary.
+	client.entries.set(valueKey, { value: JSON.stringify({ value: 'boundary-missing-version' }), expiresAt: client.currentTime() + 1 });
+	client.onPttl = (key, fallback) => (key === valueKey ? 0 : fallback);
+
+	const [missingVersionRead] = await cache.getManyVersioned(['entry']);
+	assert.deepEqual(missingVersionRead.value, { value: 'boundary-missing-version' });
+	assert.ok(missingVersionRead.version);
+	assert.equal(client.entries.get(versionKey)?.value, missingVersionRead.version);
+	assert.equal(client.entries.get(versionKey)?.expiresAt, client.currentTime() + 1);
+	const setVersionCall = client.redisCalls.find((call) => call.command === 'SET' && call.args[0] === versionKey);
+	assert.deepEqual(setVersionCall, {
+		command: 'SET',
+		args: [versionKey, missingVersionRead.version, 'PX', 1]
+	});
+
+	// Branch 2: version key already exists, value key at PTTL == 0 boundary.
+	client.redisCalls.length = 0;
+	client.entries.set(versionKey, { value: 'existing-version', expiresAt: client.currentTime() + 5_000 });
+	const [existingVersionRead] = await cache.getManyVersioned(['entry']);
+	assert.deepEqual(existingVersionRead.value, { value: 'boundary-missing-version' });
+	assert.equal(existingVersionRead.version, 'existing-version');
+	// Version key must NOT be deleted immediately; it must be clamped to 1ms.
+	assert.equal(client.entries.get(versionKey)?.value, 'existing-version');
+	assert.equal(client.entries.get(versionKey)?.expiresAt, client.currentTime() + 1);
+	const pexpireCall = client.redisCalls.find((call) => call.command === 'PEXPIRE' && call.args[0] === versionKey);
+	assert.deepEqual(pexpireCall, {
+		command: 'PEXPIRE',
+		args: [versionKey, 1]
+	});
+
+	// After 1ms elapses, the clamped version key expires cleanly.
+	client.onPttl = undefined;
+	client.advance(1);
+	assert.deepEqual(await cache.setManyVersioned([['entry', { value: 'late' }, 'existing-version']]), [false]);
+});
+
+test('Redis VERSIONED_GET_SCRIPT handles PTTL == -2 expiry between GET and PTTL without persisting version keys', async () => {
+	const client = new FakeEvalRedisClient();
+	const cache = await createRedisValkeyCacheAdapter({ client, prefix: 'pttl-missing' });
+	assert.ok(cache.getManyVersioned);
+	const valueKey = cache.codecKey!('entry');
+	const versionKey = `active-ts:version:{${valueKey}}`;
+	const tombstoneMs = 24 * 60 * 60 * 1_000;
+
+	const expireOnPttl = (key: string, fallback: number) => {
+		if (key !== valueKey) return fallback;
+		client.entries.delete(valueKey);
+		return -2;
+	};
+
+	// Branch 1: version key missing, value key expires between GET and PTTL.
+	client.entries.set(valueKey, { value: JSON.stringify({ value: 'vanishing' }), expiresAt: client.currentTime() + 1 });
+	client.onPttl = expireOnPttl;
+	const [missingVersionRead] = await cache.getManyVersioned(['entry']);
+	assert.equal(missingVersionRead.value, undefined);
+	assert.ok(missingVersionRead.version);
+	assert.equal(client.entries.get(versionKey)?.expiresAt, client.currentTime() + tombstoneMs);
+	assert.deepEqual(
+		client.redisCalls.find((call) => call.command === 'SET' && call.args[0] === versionKey),
+		{ command: 'SET', args: [versionKey, missingVersionRead.version, 'EX', String(24 * 60 * 60)] }
+	);
+
+	// Branch 2a: existing persistent version key must be bounded with EXPIRE, not left persistent.
+	client.redisCalls.length = 0;
+	client.entries.set(valueKey, { value: JSON.stringify({ value: 'vanishing-2' }), expiresAt: client.currentTime() + 1 });
+	client.entries.set(versionKey, { value: 'persistent-version', expiresAt: undefined });
+	const [persistentVersionRead] = await cache.getManyVersioned(['entry']);
+	assert.equal(persistentVersionRead.value, undefined);
+	assert.equal(persistentVersionRead.version, 'persistent-version');
+	assert.equal(client.entries.get(versionKey)?.expiresAt, client.currentTime() + tombstoneMs);
+	assert.equal(client.redisCalls.some((call) => call.command === 'PERSIST'), false);
+	assert.deepEqual(
+		client.redisCalls.find((call) => call.command === 'EXPIRE' && call.args[0] === versionKey),
+		{ command: 'EXPIRE', args: [versionKey, String(24 * 60 * 60)] }
+	);
+
+	// Branch 2b: existing version key with finite TTL keeps its finite TTL and is never persisted.
+	client.redisCalls.length = 0;
+	client.entries.set(valueKey, { value: JSON.stringify({ value: 'vanishing-3' }), expiresAt: client.currentTime() + 1 });
+	client.entries.set(versionKey, { value: 'bounded-version', expiresAt: client.currentTime() + 500 });
+	const [boundedVersionRead] = await cache.getManyVersioned(['entry']);
+	assert.equal(boundedVersionRead.value, undefined);
+	assert.equal(boundedVersionRead.version, 'bounded-version');
+	assert.equal(client.entries.get(versionKey)?.expiresAt, client.currentTime() + 500);
+	assert.equal(client.redisCalls.some((call) => call.command === 'PERSIST'), false);
+	assert.equal(client.redisCalls.some((call) => call.command === 'EXPIRE'), false);
+});
+
+test('Redis VERSIONED_GET_SCRIPT aligns version TTL for PTTL == -1 persistent keys and positive PTTL keys', async () => {
+	const client = new FakeEvalRedisClient();
+	const cache = await createRedisValkeyCacheAdapter({ client, prefix: 'pttl-align' });
+	assert.ok(cache.getManyVersioned);
+	const valueKey = cache.codecKey!('entry');
+	const versionKey = `active-ts:version:{${valueKey}}`;
+
+	// Persistent value (PTTL == -1) with missing version -> persistent SET.
+	client.entries.set(valueKey, { value: JSON.stringify({ value: 'persistent' }), expiresAt: undefined });
+	const [persistentNew] = await cache.getManyVersioned(['entry']);
+	assert.deepEqual(persistentNew.value, { value: 'persistent' });
+	assert.equal(client.entries.get(versionKey)?.expiresAt, undefined);
+
+	// Persistent value (PTTL == -1) with expiring version -> PERSIST.
+	client.redisCalls.length = 0;
+	client.entries.set(versionKey, { value: 'expiring-version', expiresAt: client.currentTime() + 5_000 });
+	const [persistentExisting] = await cache.getManyVersioned(['entry']);
+	assert.equal(persistentExisting.version, 'expiring-version');
+	assert.equal(client.entries.get(versionKey)?.expiresAt, undefined);
+	assert.deepEqual(
+		client.redisCalls.find((call) => call.command === 'PERSIST'),
+		{ command: 'PERSIST', args: [versionKey] }
+	);
+
+	// Positive PTTL value with missing version -> SET PX valueTtl.
+	client.redisCalls.length = 0;
+	client.entries.delete(versionKey);
+	client.entries.set(valueKey, { value: JSON.stringify({ value: 'expiring' }), expiresAt: client.currentTime() + 4_321 });
+	const [positiveNew] = await cache.getManyVersioned(['entry']);
+	assert.deepEqual(positiveNew.value, { value: 'expiring' });
+	assert.equal(client.entries.get(versionKey)?.expiresAt, client.currentTime() + 4_321);
+	assert.deepEqual(
+		client.redisCalls.find((call) => call.command === 'SET' && call.args[0] === versionKey),
+		{ command: 'SET', args: [versionKey, positiveNew.version, 'PX', 4_321] }
+	);
+
+	// Positive PTTL value with existing persistent version -> PEXPIRE valueTtl.
+	client.redisCalls.length = 0;
+	client.entries.set(versionKey, { value: 'unbounded-version', expiresAt: undefined });
+	const [positiveExisting] = await cache.getManyVersioned(['entry']);
+	assert.equal(positiveExisting.version, 'unbounded-version');
+	assert.equal(client.entries.get(versionKey)?.expiresAt, client.currentTime() + 4_321);
+	assert.deepEqual(
+		client.redisCalls.find((call) => call.command === 'PEXPIRE'),
+		{ command: 'PEXPIRE', args: [versionKey, 4_321] }
+	);
 });
 
 test('codec cache adapters preserve version snapshots and conditional write results', async () => {
