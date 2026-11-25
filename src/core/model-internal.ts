@@ -36,3 +36,13 @@ export function assertModelSnapshotRelationsAllowed(item: object) {
 		`Cannot load relations on a model loaded by readAt(${readTime}); historical relations require explicit snapshots with the same read policy.`
 	);
 }
+
+const MODEL_RELATION_GENERATIONS = new WeakMap<object, number>();
+
+export function modelRelationGeneration(item: object) {
+	return (WEAKMAP_GET.call(MODEL_RELATION_GENERATIONS, item) as number | undefined) ?? 0;
+}
+
+export function invalidateModelRelations(item: object) {
+	WEAKMAP_SET.call(MODEL_RELATION_GENERATIONS, item, modelRelationGeneration(item) + 1);
+}

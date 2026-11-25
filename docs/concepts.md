@@ -250,6 +250,12 @@ paginated query when a relation spans multiple pages, and manage its read policy
 and execution budget in the application. Relation loading does not automatically
 start an unbounded scan.
 
+A `LazyRef` follows its owner rather than preserving an old relation snapshot.
+After a successful owner save or delete, a retained handle discards its cached
+partial/full value when it is loaded again. This also applies when that handle
+was obtained before an earlier save and no longer appears in the owner's current
+relation map. Retain a loaded child value explicitly when a snapshot is needed.
+
 Decorator relation getters are supported:
 
 ```ts doc-test=fragment
