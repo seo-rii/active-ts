@@ -114,9 +114,11 @@
 		"build": "tsc -p tsconfig.json",
 		"typecheck": "tsc -p tsconfig.json --noEmit",
 		"audit": "pnpm audit --audit-level moderate",
-		"test": "pnpm build && node --test build/test/*.test.js",
+		"test": "pnpm build && pnpm test:built",
+		"test:built": "node --test build/test/*.test.js",
 		"test:integration:backends": "pnpm build && node test/integration/backend-smoke.mjs",
-		"pack:smoke": "pnpm build && node test/pack-smoke.mjs",
+		"pack:smoke": "pnpm build && pnpm pack:smoke:built",
+		"pack:smoke:built": "node test/pack-smoke.mjs",
 		"lint": "tsc -p tsconfig.json --noEmit",
 		"release:artifact": "node scripts/release-artifact.mjs"
 	},
