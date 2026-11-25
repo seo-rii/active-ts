@@ -21,6 +21,7 @@ import { assertDenseArrayItems, assertPlainDataObject, assertSafeFieldPath, asse
 import { assertNoOverlappingFieldPaths } from './query-utils.js';
 import { mergeHooks } from './hooks.js';
 import { ActiveTsConfigurationError } from './errors.js';
+import { assertGeneratedSchemaName, defaultSchemaName, markGeneratedSchemaName } from './schema-names.js';
 import { typedViewDetails, type TypedView } from './typed-view.js';
 import { MAP_SET, SET_ADD, SET_HAS } from './collection-intrinsics.js';
 import {
@@ -107,12 +108,15 @@ export class ModelBuilder<TData extends Record<string, any>> {
 		if (optionUnique !== undefined && typeof optionUnique !== 'boolean') {
 			throw new ActiveTsConfigurationError('index unique must be a boolean.');
 		}
-		this.meta.indexes.push({
-			name: optionName === undefined ? defaultSchemaName('index', fields) : optionName as string,
+		const name = optionName === undefined ? defaultSchemaName('index', fields) : optionName as string;
+		if (optionName === undefined) assertGeneratedSchemaName('index', name, fields, this.meta.indexes);
+		const index: IndexMeta = {
+			name,
 			fields,
 			...(directions === undefined ? {} : { directions }),
 			unique: optionUnique as boolean | undefined
-		});
+		};
+		this.meta.indexes.push(optionName === undefined ? markGeneratedSchemaName(index) : index);
 		return this;
 	}
 
@@ -123,11 +127,14 @@ export class ModelBuilder<TData extends Record<string, any>> {
 			normalizeSchemaFields(fields, 'search fields', 'search field'),
 			'search fields'
 		);
-		this.meta.searchIndexes.push({
-			name: optionName === undefined ? defaultSchemaName('search', safeFields) : optionName as string,
+		const name = optionName === undefined ? defaultSchemaName('search', safeFields) : optionName as string;
+		if (optionName === undefined) assertGeneratedSchemaName('search index', name, safeFields, this.meta.searchIndexes, adapterOrName);
+		const index: SearchIndexMeta = {
+			name,
 			adapter: adapterOrName,
 			fields: safeFields
-		});
+		};
+		this.meta.searchIndexes.push(optionName === undefined ? markGeneratedSchemaName(index) : index);
 		return this;
 	}
 
@@ -323,19 +330,6 @@ function normalizeBuilderOptions(options: unknown, context: string, allowed: rea
 		}
 	}
 	return options as Record<string, unknown>;
-}
-
-function defaultSchemaName(prefix: string, fields: string[]) {
-	let joined = '';
-	for (let index = 0; index < fields.length; index++) {
-		if (index > 0) joined += '_';
-		joined += fields[index].replace(/[^A-Za-z0-9_-]/g, '_');
-	}
-	const name = joined
-		.replace(/_+/g, '_')
-		.replace(/^_+|_+$/g, '');
-	if (/^[A-Za-z]/.test(name)) return name;
-	return `${prefix}_${name || 'field'}`;
 }
 
 function ownOptionValue(record: Record<string, unknown>, key: string) {

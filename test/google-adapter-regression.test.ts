@@ -6,6 +6,7 @@ import {
 	ActiveTsConfigurationError,
 	ActiveTsConflictError,
 	ActiveTsNotFoundError,
+	ActiveTsUnknownTransactionOutcomeError,
 	MemoryCacheAdapter,
 	MemoryOutboxAdapter,
 	MemorySearchAdapter,
@@ -707,6 +708,11 @@ function datastoreClient(overrides: Record<string, unknown> = {}) {
 		runQuery: async () => [[], { moreResults: 'NO_MORE_RESULTS' }],
 		...overrides
 	};
+}
+
+function isUnknownCommitOutcome(error: unknown, cause: unknown) {
+	return error instanceof ActiveTsUnknownTransactionOutcomeError &&
+		error.outcome === 'unknown' && error.phase === 'commit' && error.cause === cause;
 }
 
 test('Google transaction adapters reject unsupported savepoint joins before callbacks run', async () => {
@@ -4328,7 +4334,7 @@ test('Datastore transaction outcome classification fails closed for frozen commi
 		() => frozenContext.transaction(async (tx) => {
 			await tx.afterRollback(() => { frozenLifecycle.push('afterRollback'); });
 		}),
-		(error: unknown) => error === frozenCommitError
+		(error: unknown) => isUnknownCommitOutcome(error, frozenCommitError)
 	);
 	assert.deepEqual(frozenLifecycle, []);
 
@@ -4376,7 +4382,7 @@ test('PostgreSQL confirmed rollback preserves a concurrent Datastore unknown out
 			})
 		})
 	});
-	await assert.rejects(() => datastore.transaction!(async () => undefined), (error: unknown) => error === sharedError);
+	await assert.rejects(() => datastore.transaction!(async () => undefined), (error: unknown) => isUnknownCommitOutcome(error, sharedError));
 	let rollbackStarted!: () => void;
 	let finishRollback!: () => void;
 	const rollbackStartedPromise = new Promise<void>((resolve) => { rollbackStarted = resolve; });
@@ -4422,7 +4428,7 @@ test('PostgreSQL confirmed rollback preserves a concurrent Datastore unknown out
 	const datastoreResult = assert.rejects(() => datastoreContext.transaction(async (tx) => {
 		await tx.afterCommit(() => { datastoreLifecycle.push('commit'); });
 		await tx.afterRollback(() => { datastoreLifecycle.push('rollback'); });
-	}), (error: unknown) => error === sharedError);
+	}), (error: unknown) => isUnknownCommitOutcome(error, sharedError));
 	await datastoreOutcomeReadyPromise;
 	finishRollback();
 	try {
@@ -4743,6 +4749,8 @@ test('Datastore transaction buffered writes ignore stale entity key markers when
 test('Datastore ancestor model outbox includeData uses fallback payload inside transactions', async () => {
 	const calls: string[] = [];
 	const client = datastoreClient({
+		options: { projectId: 'outbox-scope-test', servicePath: 'datastore.googleapis.com', port: 443 },
+		getDatabaseId: () => undefined,
 		transaction: () => ({
 			run: async () => {
 				calls[calls.length] = 'run';
@@ -10387,6 +10395,8 @@ test('Search include reloads Datastore ancestor models with hit-derived ancestor
 	let queryCount = 0;
 	const datastore = await createDatastoreStoreAdapter({
 		client: datastoreClient({
+			options: { projectId: 'search-include-scope-test', servicePath: 'datastore.googleapis.com', port: 443 },
+			getDatabaseId: () => undefined,
 			key: (input: unknown) => ({ input }),
 			createQuery,
 			runQuery: async () => {
@@ -10403,7 +10413,7 @@ test('Search include reloads Datastore ancestor models with hit-derived ancestor
 		search: { memory: search }
 	});
 	const Record = DatastoreSearchRecord.use(context) as unknown as typeof DatastoreSearchRecord;
-	await search.index(context.meta(DatastoreSearchRecord), 7, {
+	await context.searchAdapter('memory').index(context.meta(DatastoreSearchRecord), 7, {
 		id: 7,
 		parentId: 10,
 		childId: 5,
@@ -15922,9 +15932,8 @@ test('Firestore commit transport failures report unknown outcomes without rollba
 				await TxRecord.create({ id: 61, handle: 'unknown-outcome' });
 			}),
 		(error: unknown) => {
-			assert.ok(error instanceof ActiveTsConfigurationError);
-			assert.match(error.message, /Firestore transaction commit outcome is unknown.*connection lost/);
-			assert.equal(error.cause, commitError);
+			assert.ok(isUnknownCommitOutcome(error, commitError));
+			assert.match((error as Error).message, /Firestore transaction commit outcome is unknown.*connection lost/);
 			return true;
 		}
 	);
