@@ -1,5 +1,15 @@
 # Adapters
 
+Adapters created by the PostgreSQL, MongoDB, and Redis/Valkey factories expose
+an optional `close()` lifecycle method. Retain the factory result and call
+`await adapter.close?.()` after application work and transactions have stopped.
+It closes only the pool/client created internally by that factory. An injected
+`pool` or `client` remains caller-owned, so adapter close is a no-op for those
+resources. Concurrent calls share one attempt, successful calls are idempotent,
+and a failed close can be retried. Transaction handles do not own their parent
+connection. Context and middleware handles do not transfer resource ownership;
+close the original factory result.
+
 Adapters isolate active-ts from backend SDKs. Applications register adapters in
 an `ActiveContext`; models select adapters by metadata or by context defaults.
 
@@ -38,7 +48,7 @@ and the distinction between support and rejection coverage.
 | Aggregate helpers | Yes | Yes | Yes | Conditional | Yes | Yes; scalar metadata for min/max |
 | Transactions | Yes | Requires pool `connect()` | Requires client `startSession()` | Requires SDK `transaction()` | Yes | Yes |
 | Transaction point-read conflict detection | Yes | **No** | With transactions | With transactions | Yes | No |
-| Optimistic `expectedVersion` writes | Yes | Yes | Yes | No | No | Yes |
+| Optimistic `expectedVersion` writes | Yes | Yes | Yes | Requires SDK `transaction()` | Yes | Yes |
 | Unique schema indexes | No | Yes | Yes | No | No | Yes |
 | Trusted native query payloads | No | Yes | Yes | Yes | Yes | No |
 
@@ -209,6 +219,41 @@ avoids duplicate rows from array property projections. An exact
 If an injected client does not expose a reliable SDK key symbol, active-ts keeps
 the full-row fallback. Transaction overlay queries also keep full rows so they
 can merge buffered writes correctly.
+
+Datastore adapters accept a `gaxOptions` provider for request deadlines and
+cancellation. It runs immediately before each Datastore RPC the adapter starts,
+in the caller's async context, and receives the `operation`: `lookup`,
+`runQuery`, `runAggregationQuery`, `beginTransaction`, `commit` or `rollback`.
+Return SDK `gaxOptions` for that call, or `undefined` to send the call
+unchanged. The returned object is passed as-is, so it may hold a transport's
+cancellation handle:
+
+```ts doc-test=typecheck
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { createDatastoreStoreAdapter } from 'active-ts/adapters/store/datastore-injected';
+
+declare const client: object;
+declare const keySymbol: symbol;
+
+// The request handler stores its absolute deadline here for the request's duration.
+const requestDeadline = new AsyncLocalStorage<number>();
+
+const store = await createDatastoreStoreAdapter({
+	client,
+	keySymbol,
+	gaxOptions: () => {
+		const deadline = requestDeadline.getStore();
+		return deadline === undefined ? undefined : { timeout: Math.max(1, deadline - Date.now()) };
+	}
+});
+```
+
+Writes outside a transaction that receive options use the SDK's `save()` with
+`method: 'insert'` or `'update'`, because `insert()` and `update()` take no call
+options; bulk writes use `save()` and `delete()`. Transaction-scoped writes only
+buffer mutations, so their options reach the Commit. Explicit transaction
+`native` options win over the provider for the same key. ID inventory and
+repair helpers do not call the provider.
 
 Datastore key encoding is selected once per adapter. The default
 `keyEncoding: 'active-ts'` preserves active-ts's canonical physical names:
@@ -479,6 +524,13 @@ const snapshot = await context.store('datastore').get(meta, 42, options);
 to the second SDK argument for `get()`, `runQuery()`, and
 `runAggregationQuery()`, including every query-scan fallback page and min/max
 probe. Reuse the same `readAt()` value when following a continuation cursor.
+The Datastore SDK sends that `readTime` with whole-second precision: it floors
+the epoch milliseconds to seconds (checked in SDK 10.1.0 and 11.1.0). A read
+time inside the current second therefore selects the snapshot at the start of
+that second, so `readAt(Date.now())` can omit a write committed a few
+milliseconds earlier. To observe a write, use a whole-second read time taken
+after that second has ended, or use `readConsistency('strong')` for a current
+read.
 Low-level `getMany()` calls with more than 1,000 unique IDs are split into SDK
 lookup chunks only inside a Datastore transaction or with an explicit
 `datastoreReadOptions({ readTime })`; otherwise they fail before backend access
@@ -664,8 +716,14 @@ conflicts; `retryInitialDelayMs`, `retryMaxDelayMs`, and `retryJitter` control
 bounded exponential backoff with jitter. The transaction callback can run up to
 `maxAttempts` times, so it must be idempotent and must not perform irreversible
 external side effects unless the application deduplicates or defers them.
-Definitive commit rejections are returned as ordinary failures, while transport
-errors with an unknowable commit outcome fail closed as unknown outcomes.
+Definitive commit rejections are returned as ordinary failures. Other commit
+failures, such as a lost response, `DEADLINE_EXCEEDED` or `UNAVAILABLE`, may
+have been applied: they raise `ActiveTsUnknownTransactionOutcomeError` with
+`phase === "commit"` and the SDK error in `cause`, and suppress both commit and
+rollback hooks. Firestore reports its unknown commit outcomes the same way.
+The same transaction support provides `capabilities.optimisticLock`, so models
+with a numeric `version` field can `save()` and `delete()`; see
+[optimistic locking](extensions.md#optimistic-locking).
 Datastore mode databases using
 `OPTIMISTIC_WITH_ENTITY_GROUPS` can set
 `requireAncestorTransactionQueries: true` on `createDatastoreStoreAdapter()` to
@@ -725,6 +783,9 @@ timeouts. Firestore SDK transactions do not expose portable savepoints, so
 `readOnly`, and `readTime`; active-ts `readOnly` is merged
 into those SDK options and rejects writes before reaching the SDK transaction
 object.
+Firestore always provides `capabilities.optimisticLock`, so models with a
+numeric `version` field can `save()` and `delete()`; see
+[optimistic locking](extensions.md#optimistic-locking).
 
 ## SQLite
 
@@ -765,6 +826,8 @@ or a shared file across hosts.
 
 Rows use a typed ID key and a JSON document. SQL performs filtering, ordering,
 pagination and aggregation; no implicit full-result JavaScript scan is used.
+The adapter registers internal deterministic SQLite functions on its connection
+to validate sortable scalars and preserve JavaScript UTF-16 string order.
 Declare scalar field metadata for `min`/`max`. Unique indexes, optimistic version
 checks, nested field predicates and portable projections are supported. Cursor,
 containment operators, native payloads and Datastore read policies reject.
@@ -1284,3 +1347,5 @@ JSON round trip without converting these IDs through JavaScript numbers. Applyin
 an int64 source, target, or ancestor requires the Datastore client's `int()` method.
 Key-wins repairs keep the branded logical ID in the entity payload; payload-wins
 repairs preserve the distinction between numeric IDs and decimal string names.
+
+SQLite schema application creates versioned expression indexes matching scalar equality/range predicates. Existing unique constraint indexes remain in place, and a separate lookup index is added without changing their null/missing semantics. Old nonunique `active_ts_` indexes from earlier releases are preserved; applications may remove them separately after reviewing their schema. Lookup indexes support filtering; a separate sort may still be needed for portable mixed-type ordering.

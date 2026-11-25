@@ -6,7 +6,17 @@ export {
 	isDatastoreInt64Id,
 	type DatastoreInt64Id
 } from './core/datastore-int64-id.js';
-export * from './core/cursor.js';
+export {
+	sortWithStableId,
+	encodeCursor,
+	decodeCursor,
+	assertCursorMatchesSort,
+	cursorValues,
+	compareRowsBySort,
+	compareRowToCursor,
+	type CursorSort,
+	type KeysetCursor
+} from './core/cursor.js';
 export { applyModelMeta, getModelMeta } from './core/metadata.js';
 export * from './core/define-model.js';
 export { defineTypedView, type TypedView } from './core/typed-view.js';
