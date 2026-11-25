@@ -524,6 +524,13 @@ const snapshot = await context.store('datastore').get(meta, 42, options);
 to the second SDK argument for `get()`, `runQuery()`, and
 `runAggregationQuery()`, including every query-scan fallback page and min/max
 probe. Reuse the same `readAt()` value when following a continuation cursor.
+The Datastore SDK sends that `readTime` with whole-second precision: it floors
+the epoch milliseconds to seconds (checked in SDK 10.1.0 and 11.1.0). A read
+time inside the current second therefore selects the snapshot at the start of
+that second, so `readAt(Date.now())` can omit a write committed a few
+milliseconds earlier. To observe a write, use a whole-second read time taken
+after that second has ended, or use `readConsistency('strong')` for a current
+read.
 Low-level `getMany()` calls with more than 1,000 unique IDs are split into SDK
 lookup chunks only inside a Datastore transaction or with an explicit
 `datastoreReadOptions({ readTime })`; otherwise they fail before backend access
