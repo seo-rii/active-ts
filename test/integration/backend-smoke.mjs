@@ -1147,6 +1147,20 @@ if (targets.has('datastore')) {
 		await NestedRecord.ancestor(nestedParent).find(2).delete().catch(() => undefined);
 		await NestedRecord.ancestor(nestedParent).find(3).delete().catch(() => undefined);
 	}
+	// Adapters and namespace factories that construct their own SDK client
+	// close its gRPC channels; later calls then fail instead of reconnecting.
+	const ownedStore = await createDatastoreStoreAdapter({
+		datastoreOptions: { projectId: googleProjectId },
+		namespace,
+		allowQueryScanFallback: true
+	});
+	assert.equal(await ownedStore.get(nativeMeta, 987_654_321), null);
+	await Promise.all([ownedStore.close(), ownedStore.close()]);
+	await assert.rejects(() => ownedStore.get(nativeMeta, 987_654_321), /closed/);
+	await ownedStore.close();
+	assert.equal(await adapter.get(nativeMeta, 987_654_321), null, 'the factory client is still open');
+	await namespaceStoreFactory.close();
+	await assert.rejects(() => adapter.get(nativeMeta, 987_654_321), /closed/);
 	ran++;
 	ranTargets.push('datastore');
 }

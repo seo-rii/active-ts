@@ -1,7 +1,7 @@
 # Adapters
 
-Adapters created by the PostgreSQL, MongoDB, Firestore, and Redis/Valkey factories expose
-an optional `close()` lifecycle method. Retain the factory result and call
+Adapters created by the PostgreSQL, MongoDB, Datastore, Firestore, and Redis/Valkey
+factories expose an optional `close()` lifecycle method. Retain the factory result and call
 `await adapter.close?.()` after application work and transactions have stopped.
 It closes only the pool/client created internally by that factory. An injected
 `pool` or `client` remains caller-owned, so adapter close is a no-op for those
@@ -9,6 +9,13 @@ resources. Concurrent calls share one attempt, successful calls are idempotent,
 and a failed close can be retried. Transaction handles do not own their parent
 connection. Context and middleware handles do not transfer resource ownership;
 close the original factory result.
+
+`@google-cloud/datastore` has no top-level close; a Datastore adapter that built
+its own SDK client closes the per-service GAPIC clients the SDK has opened, and
+later calls on that client fail instead of opening a new channel. A Datastore
+namespace store factory owns the client it creates, so call
+`await namespaceStores.close()` rather than closing the adapters returned by
+`forNamespace()`, which share that client and do not own it.
 
 Adapters isolate active-ts from backend SDKs. Applications register adapters in
 an `ActiveContext`; models select adapters by metadata or by context defaults.
@@ -597,6 +604,9 @@ options because those would make per-operation selection ambiguous.
 Native query callbacks deliberately receive the shared raw SDK client and may
 address another namespace; use that low-level escape hatch only when the
 callback validates its target namespace explicitly.
+When the factory creates the SDK client from `datastoreOptions`, it owns that
+client: `namespaceStores.close()` shuts it down for every namespace adapter. With
+an injected `client`, `close()` is a no-op and the caller keeps ownership.
 
 Every `DatastoreStoreAdapter`, including adapters returned by `forNamespace()`,
 also exposes low-level batch mutations for import, restore, and maintenance

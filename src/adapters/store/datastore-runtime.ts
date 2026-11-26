@@ -1,5 +1,7 @@
 import { datastoreMember, datastoreOptionalMethod, ownFactoryOptionValue } from './datastore-client-properties.js';
 import { datastorePhysicalCacheScope, resolveDatastorePhysicalIdentity } from './datastore-identity.js';
+import { closeOwnedDatastoreClient } from './datastore-lifecycle.js';
+import { createAdapterCloser } from '../../core/adapter-lifecycle.js';
 import { createHash, randomInt, randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
@@ -173,6 +175,12 @@ export type DatastoreNamespaceStoreFactoryOptions = {
 };
 export type DatastoreNamespaceStoreFactory = {
 	readonly forNamespace: (namespace?: string) => Promise<DatastoreStoreAdapter>;
+	/**
+	 * Closes the SDK client this factory created. Adapters from forNamespace()
+	 * share that client and do not own it, so their close() is a no-op. An
+	 * injected client stays caller-owned and this is a no-op as well.
+	 */
+	readonly close: () => Promise<void>;
 };
 export type DatastoreBulkMutationOptions = {
 	atomic?: boolean;
@@ -1363,7 +1371,7 @@ export async function createDatastoreStoreAdapter(
 		options = { ...options, cacheScope: datastorePhysicalCacheScope(rawClient, identity, options.namespace, keyEncoding) };
 	}
 
-	return createDatastoreAdapter(
+	const adapter = createDatastoreAdapter(
 		client,
 		client,
 		options,
@@ -1374,6 +1382,13 @@ export async function createDatastoreStoreAdapter(
 		supportsKeyOnlyProjection,
 		transactionFactory
 	) as DatastoreStoreAdapter;
+	// Only the adapter that constructed the SDK client owns it; transaction
+	// handles are built by createDatastoreAdapter() and never get close().
+	const ownedClient = injectedClient ? undefined : rawClient;
+	defineDataProperty(adapter, 'close', createAdapterCloser(
+		ownedClient === undefined ? undefined : () => closeOwnedDatastoreClient(ownedClient)
+	), { enumerable: true, configurable: false, writable: false });
+	return adapter;
 }
 
 export async function createDatastoreNamespaceStoreFactory(
@@ -1451,6 +1466,7 @@ export async function createDatastoreNamespaceStoreFactory(
 		);
 	}
 	let rawClient = options.client;
+	const ownsClient = rawClient === undefined;
 	let keySymbol = options.keySymbol;
 	if (rawClient === undefined) {
 		if (!loadSdk) throw new ActiveTsConfigurationError('Datastore injected namespace factory requires client.');
@@ -1499,7 +1515,8 @@ export async function createDatastoreNamespaceStoreFactory(
 						namespace === undefined ? '-' : `${namespace.length}:${namespace}`
 					}`;
 			return createDatastoreStoreAdapter({ ...baseOptions, namespace, cacheScope }, loadSdk);
-		}
+		},
+		close: createAdapterCloser(ownsClient ? () => closeOwnedDatastoreClient(rawClient) : undefined)
 	};
 	return Object.freeze(factory);
 }
