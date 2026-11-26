@@ -42,8 +42,10 @@ or through its ambient root context during a transaction callback, return a
 `not_committed` configuration error without starting nested work. A savepoint
 release or `join: 'reuse'` cannot establish the enclosing transaction's commit.
 
-Current rollback evidence is available for PostgreSQL and SQLite when their final
-rollback succeeds; for Datastore when rollback succeeds or the final commit is
+Current rollback evidence is available for PostgreSQL when its final rollback
+succeeds or the server definitively rejects COMMIT (a rollback-guaranteeing
+SQLSTATE or a `ROLLBACK` acknowledgement); for SQLite when its final rollback
+succeeds; for Datastore when rollback succeeds or the final commit is
 definitively rejected; and for Memory when failure occurs before applying the
 commit or commit validation rejects a conflict. MongoDB confirms successful
 abort and definitive transaction conflicts; Firestore confirms SDK-propagated

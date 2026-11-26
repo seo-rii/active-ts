@@ -274,9 +274,11 @@ settles and retains ignored preflight failures, including rejected callback
 overloads, query objects, and transaction-control SQL. It closes retained native
 query handles afterward, rejects transaction-control SQL such as
 `PREPARE TRANSACTION`, and verifies that PostgreSQL reports `COMMIT` rather than
-an implicit `ROLLBACK`. A failed or malformed commit response is reported as an
-unknown outcome without running rollback callbacks, and the indeterminate
-PostgreSQL client is discarded rather than returned to the connection pool.
+an implicit `ROLLBACK`. A COMMIT that the server definitively rejects did not
+commit, so rollback callbacks run and the client returns to the pool. Any other
+failed or malformed commit response is reported as an unknown outcome without
+running rollback callbacks, and the indeterminate PostgreSQL client is discarded
+rather than returned to the connection pool. See the outcome table below.
 Await each `query()` result when later callback code depends on it or needs to
 handle its error locally.
 
@@ -311,9 +313,30 @@ model lifecycle; call `context.invalidateModelExternal(Model, id)` after a
 confirmed external write. Separate contexts or separate caches alone do not
 provide a cross-process cache-coherence protocol.
 
+PostgreSQL treats a COMMIT as definitively rejected, and therefore not
+committed, in two cases:
+
+- The server returns a SQLSTATE that guarantees the transaction rolled back:
+  `40001` serialization failure, `40P01` deadlock, `40000`, `40002`, `25P02`
+  (transaction already aborted), or any class `23` integrity-constraint
+  violation, such as a deferred unique or foreign-key check.
+- The server acknowledges COMMIT with `ROLLBACK`, which it does for a
+  transaction that had already aborted.
+
+In both cases the adapter records rollback evidence, `afterRollback` runs, the
+client is returned to the pool, and no second `ROLLBACK` is sent. The caller
+receives the original driver error, except that a unique violation (`23505`)
+becomes `ActiveTsConflictError` with the driver error in `cause`, and a
+`ROLLBACK` acknowledgement becomes an `ActiveTsConfigurationError`. Only codes
+the server actually sent count: a `code` inherited from a prototype or exposed
+through a getter is not trusted. Earlier releases reported these rejections as
+unknown outcomes.
+
 PostgreSQL unknown outcomes use `ActiveTsUnknownTransactionOutcomeError` with
-`outcome: 'unknown'`. A failed or malformed COMMIT acknowledgement has
-`phase: 'commit'` and retains the original driver/protocol error in `cause`.
+`outcome: 'unknown'`. A COMMIT that fails without a definitive rejection, for
+example a lost connection, `40003` (statement completion unknown) or a malformed
+acknowledgement, has `phase: 'commit'` and retains the original driver/protocol
+error in `cause`.
 A failed final ROLLBACK has `phase: 'abort'`; its `cause` is an `AggregateError`
 containing the original failure followed by the rollback failure. Both paths
 discard the client and suppress `afterCommit` and `afterRollback` tasks, including
@@ -327,7 +350,9 @@ outer types; callers should migrate those catches to the public unknown type.
 | COMMIT acknowledged, cleanup succeeds | Callback result | `afterCommit` |
 | COMMIT acknowledged, release/cache/afterCommit work fails | `ActiveTsCommittedTransactionError`, retaining the callback result | Commit tasks still run; no rollback |
 | Callback fails and ROLLBACK succeeds | Original callback error | `afterRollback` |
-| COMMIT acknowledgement is lost or malformed | Unknown, `phase: 'commit'` | Neither |
+| COMMIT rejected with a definitive SQLSTATE (`40001`, `40P01`, `40000`, `40002`, `25P02`, class `23`) | Original driver error; `ActiveTsConflictError` for `23505` | `afterRollback` |
+| COMMIT acknowledged as `ROLLBACK` | `ActiveTsConfigurationError` | `afterRollback` |
+| COMMIT fails otherwise, or its acknowledgement is lost or malformed | Unknown, `phase: 'commit'` | Neither |
 | Final ROLLBACK fails | Unknown, `phase: 'abort'` | Neither |
 
 When the adapter reports an unconfirmed outcome, the context closes the attempt
