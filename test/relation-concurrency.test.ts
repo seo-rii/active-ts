@@ -105,3 +105,49 @@ test('batch concurrency does not split coalesced relation id loads', async () =>
     assert.deepEqual(childBatches, [6]);
   }
 });
+
+class NestedToy extends Model<{ id: number }> {}
+class NestedKid extends Model<{ id: number; parentId: number; toyId: number }> {}
+class NestedParent extends Model<{ id: number }> {}
+defineModel('bounded_nested_toy').id('id').attach(NestedToy);
+defineModel('bounded_nested_kid').id('id')
+  .ref('toy', () => NestedToy, { localKey: 'toyId', foreignKey: 'id', warnOnLazy: false }).attach(NestedKid);
+defineModel('bounded_nested_parent').id('id')
+  .hasMany('kids', () => NestedKid, { localKey: 'id', foreignKey: 'parentId', warnOnLazy: false }).attach(NestedParent);
+
+test('batch concurrency does not split nested instance include loads', async () => {
+  for (const concurrency of [2, undefined]) {
+    const store = new MemoryStoreAdapter();
+    const original = MemoryStoreAdapter.prototype.getMany;
+    const toyBatches: number[] = [];
+    let observe = false, toyHooks = 0, running = 0, maximum = 0;
+    Object.defineProperty(store, 'getMany', { enumerable: true, configurable: true, writable: true, value(this: unknown, meta: any, ids: any[], options?: any) {
+      if (observe && meta.name === 'bounded_nested_toy') toyBatches.push(ids.length);
+      return original.call(store, meta, ids, options);
+    } });
+    const context = createActiveTs({ stores: { default: store }, batch: { concurrency }, plugins: [{
+      name: 'observe-nested-relation-hooks', hooks: { async beforeRelationLoad(payload) {
+        if (!observe || payload.meta?.relation !== 'toy') return;
+        toyHooks++; running++; maximum = Math.max(maximum, running);
+        try { await new Promise<void>(resolve => setImmediate(resolve)); } finally { running--; }
+      } }
+    }] });
+    const Toy = NestedToy.use(context), Kid = NestedKid.use(context), Parent = NestedParent.use(context);
+    await Parent.create({ id: 1 });
+    for (let id = 1; id <= 8; id++) {
+      await Toy.create({ id });
+      await Kid.create({ id, parentId: 1, toyId: id });
+    }
+    const parent = await Parent.find(1).load();
+    assert.ok(parent);
+    observe = true;
+    await parent.include('kids.toy');
+    assert.deepEqual(toyBatches, [8], `one batched toy load (${concurrency})`);
+    assert.equal(toyHooks, 8, 'relation hooks still run once per kid');
+    assert.ok(maximum <= (concurrency ?? 8), 'relation hooks stay within the configured bound');
+    const kids = await parent.ref('kids') as NestedKid[];
+    assert.equal(kids.length, 8);
+    for (const kid of kids) assert.equal((await kid.ref('toy') as NestedToy | null)?.data.id, kid.data.toyId);
+    assert.deepEqual(toyBatches, [8], 'nested results were primed, not loaded again lazily');
+  }
+});

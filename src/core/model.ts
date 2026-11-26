@@ -12,7 +12,7 @@ import {
 	snapshotRelationResult,
 	runAfterRelationLoad
 } from './relation-result.js';
-import { FindBuilder, normalizeIncludeSpecs, QueryBuilder, SearchBuilder } from './query.js';
+import { FindBuilder, normalizeIncludeSpecs, preloadIncludes, QueryBuilder, SearchBuilder } from './query.js';
 import type { AggregateComparableValue, AggregateFieldConstraint } from './query.js';
 import {
 	ACTIVE_TS_ENTITY_KEY,
@@ -40,7 +40,6 @@ import { MAP_CLEAR, MAP_ENTRIES, MAP_GET, MAP_SET, SET_ADD, SET_HAS } from './co
 import {
 	assertContextTransactionWritable,
 	contextInternalStore,
-	contextMapConcurrent,
 	markContextTransactionRollbackOnly,
 	runTrackedContextOperation
 } from './context-internal.js';
@@ -361,7 +360,12 @@ export abstract class Model<TData extends Record<string, any> = Record<string, a
 						);
 						if (nested.length && result) {
 							if (Array.isArray(result)) {
-								await contextMapConcurrent(context, result, item => item.include(...nested));
+								// Preload nested relations for the whole related collection, as
+								// query includes do: one batched load per nested relation and
+								// relation hooks per item. Per-item include() calls fanned out
+								// through batch.concurrency split those loads into
+								// concurrency-sized getMany batches.
+								await preloadIncludes(context, relationMeta.target(), result, nested);
 							} else {
 								await (result as any).include(...nested);
 							}

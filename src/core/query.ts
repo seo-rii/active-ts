@@ -1896,7 +1896,8 @@ export class QueryBuilder<TModel extends { data: any }, TData extends Record<str
 	}
 }
 
-async function preloadIncludes(
+/** Load includes for a whole owner collection: one batched load per relation, hooks per owner. */
+export async function preloadIncludes(
 	context: ActiveContext,
 	ownerModel: ModelConstructor,
 	list: any[],
