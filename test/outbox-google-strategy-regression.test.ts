@@ -78,3 +78,34 @@ for (const kind of ['firestore', 'datastore'] as const) {
 		assert.deepEqual((await outbox.listDeadLetters!()).map(event => event.id), ['third']);
 	});
 }
+
+test('firestore outbox drain reads every candidate before deleting inside its transaction', async () => {
+	const { adapter, transactions } = googleRulesStore('firestore');
+	const context = createActiveTs({ stores: { default: adapter } });
+	const outbox = new StoreOutboxAdapter({ context });
+	const at = (second: number) => new Date(Date.UTC(2026, 10, 27, 0, 0, second)).toISOString();
+	for (const [index, id] of ['first', 'second', 'third', 'fourth'].entries()) {
+		await outbox.append({ id, model: 'outbox_google_drain', modelId: index + 1, operation: 'update', createdAt: at(index) });
+	}
+	const before = transactions();
+	const limited = await outbox.drain({ limit: 2 });
+	assert.deepEqual(limited.map(event => event.id), ['first', 'second']);
+	assert.equal(transactions() - before, 1, 'one management transaction');
+	assert.deepEqual((await outbox.list()).map(event => event.id), ['third', 'fourth']);
+	const rest = await outbox.drain();
+	assert.deepEqual(rest.map(event => event.id), ['third', 'fourth']);
+	assert.deepEqual(await outbox.list(), []);
+});
+
+test('firestore outbox drain keeps per-entity order when an earlier event is not deliverable', async () => {
+	const { adapter } = googleRulesStore('firestore');
+	const context = createActiveTs({ stores: { default: adapter } });
+	const outbox = new StoreOutboxAdapter({ context });
+	const at = (second: number) => new Date(Date.UTC(2026, 10, 27, 0, 0, second)).toISOString();
+	const later = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+	await outbox.append({ id: 'blocked', model: 'outbox_google_drain', modelId: 1, operation: 'update', createdAt: at(0), availableAt: later });
+	await outbox.append({ id: 'same-entity', model: 'outbox_google_drain', modelId: 1, operation: 'update', createdAt: at(1) });
+	await outbox.append({ id: 'other-entity', model: 'outbox_google_drain', modelId: 2, operation: 'update', createdAt: at(2) });
+	assert.deepEqual((await outbox.drain()).map(event => event.id), ['other-entity']);
+	assert.deepEqual((await outbox.list()).map(event => event.id).sort(), ['blocked', 'same-entity']);
+});

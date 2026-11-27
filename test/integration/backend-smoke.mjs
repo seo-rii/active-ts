@@ -1468,6 +1468,28 @@ if (targets.has('firestore')) {
 			await adapter.delete(bulkMeta, 74).catch(() => undefined);
 			await adapter.delete(bulkMeta, 75).catch(() => undefined);
 		}
+		// Firestore transactions reject reads after writes, so a management drain
+		// must read every candidate before it deletes any of them.
+		const firestoreOutboxModelName = `integration_firestore_outbox_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
+		const firestoreOutbox = new StoreOutboxAdapter({
+			context: createActiveTs({ stores: { default: adapter } }),
+			modelName: firestoreOutboxModelName,
+			revisionModelName: `${firestoreOutboxModelName}_revision`
+		});
+		for (let index = 0; index < 3; index++) {
+			await firestoreOutbox.append({
+				id: `firestore-drain-${index}`,
+				model: 'integration_firestore_outbox_entity',
+				modelId: index + 1,
+				operation: 'update',
+				createdAt: new Date(Date.UTC(2026, 10, 27, 0, 0, index)).toISOString()
+			});
+		}
+		assert.deepEqual(
+			(await firestoreOutbox.drain()).map(event => event.id).sort(),
+			['firestore-drain-0', 'firestore-drain-1', 'firestore-drain-2']
+		);
+		assert.deepEqual(await firestoreOutbox.list(), []);
 		ran++;
 		ranTargets.push('firestore');
 	} finally {
