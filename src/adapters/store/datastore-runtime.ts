@@ -686,6 +686,62 @@ function datastoreKindName(model: ResolvedModelMeta) {
 	);
 }
 
+const DATASTORE_ENCODED_PROPERTY = { enumerable: true, configurable: true, writable: true } as const;
+
+function isPlainDatastoreRecord(value: object) {
+	const prototype = Object.getPrototypeOf(value);
+	return prototype === Object.prototype || prototype === null;
+}
+
+function encodeDatastoreUnsafeIntegerNumbers(
+	value: unknown,
+	double: ((value: number) => unknown) | undefined,
+	context: string
+): unknown {
+	if (typeof value === 'number') {
+		if (!Number.isInteger(value) || Number.isSafeInteger(value)) return value;
+		if (!double) {
+			throw new ActiveTsValidationError(
+				`${context} contains ${value}, an integer-valued number outside the safe-integer range, which Datastore cannot store exactly without client.double().`
+			);
+		}
+		return double(value);
+	}
+	if (!value || typeof value !== 'object') return value;
+	if (Array.isArray(value)) {
+		let copy: unknown[] | undefined;
+		for (let index = 0; index < value.length; index++) {
+			const item = value[index];
+			const encoded = encodeDatastoreUnsafeIntegerNumbers(item, double, context);
+			if (encoded === item && copy === undefined) continue;
+			if (copy === undefined) {
+				copy = [];
+				for (let previous = 0; previous < index; previous++) copy[previous] = value[previous];
+			}
+			copy[index] = encoded;
+		}
+		return copy ?? value;
+	}
+	if (!isPlainDatastoreRecord(value)) return value;
+	let copy: Record<string, unknown> | undefined;
+	const record = value as Record<string, unknown>;
+	const keys = Object.keys(record);
+	for (let index = 0; index < keys.length; index++) {
+		const key = keys[index];
+		const item = record[key];
+		const encoded = encodeDatastoreUnsafeIntegerNumbers(item, double, context);
+		if (encoded === item) continue;
+		if (copy === undefined) {
+			copy = {};
+			for (let previous = 0; previous < keys.length; previous++) {
+				defineDataProperty(copy, keys[previous], record[keys[previous]], DATASTORE_ENCODED_PROPERTY);
+			}
+		}
+		defineDataProperty(copy, key, encoded, DATASTORE_ENCODED_PROPERTY);
+	}
+	return copy ?? value;
+}
+
 function applyDatastoreWhere(query: any, where: QueryPlan['where'][number]) {
 	const field = assertSafeDatastoreField(where.field, 'Datastore query field');
 	if (where.op === 'in') return datastoreMethod(query, 'filter', 'Datastore query.filter')(field, 'IN', where.value);
@@ -1618,6 +1674,11 @@ function createDatastoreAdapter(
 		const ancestor = datastoreAncestorForWrite(model, id, data, ancestorOverride);
 		return makeEntityKeyFromAncestor(model, id, ancestor);
 	};
+	// The SDK encodes every integer-valued number as a 64-bit integer from its
+	// decimal string, so 1e21 is stored as 1 and 2 ** 60 as a different integer.
+	// Store those numbers as doubles, the exact JavaScript value.
+	const encodeDatastoreValue = (value: unknown, context: string) =>
+		encodeDatastoreUnsafeIntegerNumbers(value, rootClient.double, context);
 	const entityPayloadFromAncestor = (
 		model: ResolvedModelMeta,
 		id: EntityId,
@@ -1627,7 +1688,7 @@ function createDatastoreAdapter(
 		const excludeFromIndexes = datastoreExcludeFromIndexes(model);
 		const entity: { key: unknown; data: any; excludeFromIndexes?: string[] } = {
 			key: makeEntityKeyFromAncestor(model, id, ancestor),
-			data
+			data: encodeDatastoreValue(data, `${model.name} Datastore entity`)
 		};
 		if (excludeFromIndexes) entity.excludeFromIndexes = excludeFromIndexes;
 		return entity;
@@ -4717,6 +4778,7 @@ function normalizeDatastoreClient(client: unknown) {
 	}
 	const key = datastoreMethod(client, 'key', 'Datastore adapter client.key');
 	const int = datastoreOptionalMethod(client, 'int', 'Datastore adapter client.int');
+	const double = datastoreOptionalMethod(client, 'double', 'Datastore adapter client.double');
 	const get = datastoreMethod(client, 'get', 'Datastore adapter client.get');
 	const deleteEntity = datastoreMethod(client, 'delete', 'Datastore adapter client.delete');
 	const createQuery = datastoreMethod(client, 'createQuery', 'Datastore adapter client.createQuery');
@@ -4753,6 +4815,7 @@ function normalizeDatastoreClient(client: unknown) {
 		},
 		key,
 		int,
+		double,
 		get,
 		delete: deleteEntity,
 		createQuery,
@@ -4797,6 +4860,7 @@ function normalizeDatastoreTransaction(transaction: unknown, rootClient: Normali
 		client: normalizeDatastoreClient({
 			key: rootClient.key,
 			int: rootClient.int,
+			double: rootClient.double,
 			get,
 			delete: deleteEntity,
 			createQuery: createQuery ?? rootClient.createQuery,
@@ -4888,6 +4952,7 @@ function createDatastoreTransactionNativeReadClient(client: NormalizedDatastoreC
 	guarded = Object.freeze({
 		key: (...args: any[]) => client.key(...args),
 		int: client.int ? (...args: any[]) => client.int!(...args) : undefined,
+		double: client.double ? (...args: any[]) => client.double!(...args) : undefined,
 		get: (...args: any[]) => trackRead('get', client.get, args),
 		delete: rejectWrite,
 		createQuery: (...args: any[]) => guardBuilder(client.createQuery(...args), 'query'),
