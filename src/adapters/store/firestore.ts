@@ -362,8 +362,21 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 		AggregateField ??= mod.AggregateField;
 	}
 	const rawClient = client;
-	const close = createAdapterCloser(options.client ? undefined :
+	// After terminate(), the Firestore SDK leaves reads pending forever (they
+	// reject only through an unhandled "client has already been terminated").
+	// Once an owned client starts closing, reject new adapter operations here.
+	let closeStarted = false;
+	const terminate = createAdapterCloser(options.client ? undefined :
 		() => firestoreMethod(rawClient, 'terminate', 'Firestore client.terminate')());
+	const close = options.client ? terminate : async () => {
+		closeStarted = true;
+		await terminate();
+	};
+	const assertOpen = (operation: string) => {
+		if (closeStarted) {
+			throw new ActiveTsConfigurationError(`Firestore store ${operation} cannot run after close().`);
+		}
+	};
 	client = normalizeFirestoreClient(client);
 	AggregateField = AggregateField === undefined ? undefined : normalizeFirestoreAggregateField(AggregateField);
 
@@ -394,6 +407,7 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 			native: true
 		},
 		async get(model, id, options) {
+			assertOpen('get');
 			model = snapshotFirestoreModel(model, 'Firestore model metadata');
 			rejectUnsupportedStoreReadOptions(options, 'Firestore store read options');
 			assertSafeEntityId(id, `${model.name} store id`);
@@ -406,6 +420,7 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 			return data;
 		},
 		async getMany(model, ids, options) {
+			assertOpen('getMany');
 			model = snapshotFirestoreModel(model, 'Firestore model metadata');
 			rejectUnsupportedStoreReadOptions(options, 'Firestore store read options');
 			ids = assertSafeEntityIdArray(ids, 'Firestore store ids');
@@ -452,6 +467,7 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 			return result;
 		},
 		async query(model, plan, options): Promise<QueryResult> {
+			assertOpen('query');
 			model = snapshotFirestoreModel(model, 'Firestore model metadata');
 			plan = normalizeStoreQueryPlan(plan, model.idField, 'Firestore query plan', {
 				limit: 'Firestore limit',
@@ -530,6 +546,7 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 			return result;
 		},
 		async aggregate(model, plan: AggregatePlan) {
+			assertOpen('aggregate');
 			model = snapshotFirestoreModel(model, 'Firestore model metadata');
 			plan = normalizeStoreAggregatePlan(plan, 'Firestore aggregate plan');
 			plan = normalizeAggregatePlanFieldTypes(model, plan);
@@ -669,6 +686,7 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 			);
 		},
 		async create(model, id, data, options = {}) {
+			assertOpen('create');
 			model = snapshotFirestoreModel(model, 'Firestore model metadata');
 			rejectUnsupportedStoreWriteOptions(options, 'Firestore store create options');
 			assertSafeEntityId(id, `${model.name} store id`);
@@ -685,6 +703,7 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 			}
 		},
 		async update(model, id, data, options = {}) {
+			assertOpen('update');
 			model = snapshotFirestoreModel(model, 'Firestore model metadata');
 			const safeOptions = normalizeFirestoreWriteOptions(options, 'Firestore store write options');
 			assertSafeEntityId(id, `${model.name} store id`);
@@ -694,6 +713,7 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 			await replaceFirestoreDocument(client, model, id, ref, clean, safeOptions.expectedVersion);
 		},
 		async delete(model, id, options = {}) {
+			assertOpen('delete');
 			model = snapshotFirestoreModel(model, 'Firestore model metadata');
 			const safeOptions = normalizeFirestoreWriteOptions(options, 'Firestore store delete options');
 			assertSafeEntityId(id, `${model.name} store id`);
@@ -705,6 +725,7 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 			await firestoreMethod(ref, 'delete', 'Firestore document.delete')();
 		},
 		async transaction<T>(fn: (tx: StoreAdapter) => Promise<T>, transactionOptions?: StoreTransactionOptions) {
+			assertOpen('transaction');
 			if (typeof fn !== 'function') {
 				throw new ActiveTsConfigurationError('Firestore transaction callback must be a function.');
 			}
