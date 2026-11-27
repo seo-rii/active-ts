@@ -594,9 +594,15 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 			const paged = store.capabilities?.cursor === true;
 			const seenCursors = new Set<string>();
 			let recoveryAttempted = false;
+			// Inside a management transaction, read every candidate before the first
+			// delete. Firestore transactions reject reads after writes, and the other
+			// transactional stores see the same snapshot either way. Without a
+			// transaction, deletes stay interleaved so failures can be recovered.
+			const deferDeletes = !recoverDeletes;
+			const selected: OutboxEvent[] = [];
 			try {
 				do {
-					const remaining = limit === undefined ? undefined : limit - drained.length;
+					const remaining = limit === undefined ? undefined : limit - drained.length - selected.length;
 					if (remaining !== undefined && remaining <= 0) break;
 					const page = await this.listPageWithContext(context, { limit: paged ? remaining : undefined, cursor });
 					for (const event of page.events) {
@@ -625,6 +631,11 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 						) {
 							blockOutboxEntityOrderKeys(blockedEntityKeys, blockOrderKeys);
 							if (current) blockOutboxEntityOrderKeys(blockedEntityKeys, outboxEntityOrderBlockKeys(current));
+							continue;
+						}
+						if (deferDeletes) {
+							selected.push(current);
+							if (limit !== undefined && selected.length >= limit) break;
 							continue;
 						}
 						try {
@@ -657,10 +668,34 @@ export class StoreOutboxAdapter implements OutboxAdapter {
 							throw error;
 						}
 					}
-					if (limit !== undefined && drained.length >= limit) break;
+					if (limit !== undefined && drained.length + selected.length >= limit) break;
 					cursor = nextStoreOutboxCursor(page, paged, seenCursors);
 					if (cursor === undefined) break;
-				} while (limit === undefined || drained.length < limit);
+				} while (limit === undefined || drained.length + selected.length < limit);
+				const deferredBlockedKeys = new Set<string>();
+				for (const current of selected) {
+					if (outboxEntityOrderKeysBlocked(deferredBlockedKeys, outboxEntityOrderCheckKeys(current))) {
+						blockOutboxEntityOrderKeys(deferredBlockedKeys, outboxEntityOrderBlockKeys(current));
+						continue;
+					}
+					try {
+						await store.delete(
+							this.meta,
+							current.id,
+							storeOutboxUsesOptimisticWrites(store) ? outboxExpectedVersionOption(current) : undefined
+						);
+						drained.push(current);
+					} catch (error) {
+						if (
+							storeOutboxUsesOptimisticWrites(store) &&
+							(error instanceof ActiveTsConflictError || error instanceof ActiveTsNotFoundError)
+						) {
+							blockOutboxEntityOrderKeys(deferredBlockedKeys, outboxEntityOrderBlockKeys(current));
+							continue;
+						}
+						throw error;
+					}
+				}
 				return drained;
 			} catch (error) {
 				if (recoverDeletes && !recoveryAttempted) {
