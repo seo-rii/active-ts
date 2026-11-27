@@ -21,6 +21,10 @@ After a Firestore adapter starts closing a client it owns, its reads, queries,
 writes and transactions reject immediately: the Firestore SDK otherwise leaves
 reads issued after `terminate()` pending forever.
 
+In Workers, adapters receive an injected client, so `close()` is a no-op there;
+see [closing clients in Workers](workers.md#closing-clients-in-workers) for who
+owns the client and when to close it.
+
 Adapters isolate active-ts from backend SDKs. Applications register adapters in
 an `ActiveContext`; models select adapters by metadata or by context defaults.
 
