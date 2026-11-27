@@ -4,6 +4,8 @@ import { WEAKMAP_GET, WEAKMAP_SET } from './collection-intrinsics.js';
 export const MODEL_PERSISTED_TOKEN: unique symbol = Symbol('active-ts.persisted-constructor-token') as any;
 export const ACTIVE_TS_MODEL_INSTANCE: unique symbol = Symbol('active-ts.model-instance') as any;
 export const MODEL_DATASTORE_WRITE_ANCESTOR: unique symbol = Symbol('active-ts.datastore-write-ancestor') as any;
+/** Records an included relation as planned on a model, as Model.include() does. */
+export const MODEL_PLAN_RELATION: unique symbol = Symbol('active-ts.plan-relation') as any;
 
 const TRANSACTION_MODEL_TRACKERS = new WeakMap<object, (item: object) => void>();
 const DATASTORE_HISTORICAL_READ_TIMES = new WeakMap<object, number>();
