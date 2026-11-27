@@ -994,6 +994,42 @@ if (targets.has('datastore')) {
 		await diagnosticAdapter.delete(aggregateMeta, 1).catch(() => undefined);
 		await diagnosticAdapter.delete(aggregateMeta, 2).catch(() => undefined);
 	}
+	// Typed min/max use ordered lookups without the scan fallback. A projection
+	// returns an embedded property as one flat "a.b" property, so nested fields
+	// must read the full entity.
+	const nestedMinMaxStore = await createDatastoreStoreAdapter({ client, namespace });
+	class IntegrationDatastoreNestedMinMaxRecord extends Model {}
+	defineModel({ name: `integration_datastore_nested_minmax_${randomUUID().replace(/-/g, '').slice(0, 12)}` })
+		.id('id')
+		.fieldType('metrics.score', 'number')
+		.validate((input) => input)
+		.attach(IntegrationDatastoreNestedMinMaxRecord);
+	const nestedMinMaxMeta = createActiveTs({ stores: { default: nestedMinMaxStore } })
+		.meta(IntegrationDatastoreNestedMinMaxRecord);
+	try {
+		await nestedMinMaxStore.create(nestedMinMaxMeta, 1, { id: 1, metrics: { score: 5 } });
+		await nestedMinMaxStore.create(nestedMinMaxMeta, 2, { id: 2, metrics: { score: 7 } });
+		await nestedMinMaxStore.create(nestedMinMaxMeta, 3, { id: 3, metrics: { score: 6 } });
+		const positiveScores = [{ field: 'metrics.score', op: '>', value: 0 }];
+		assert.deepEqual(
+			await nestedMinMaxStore.aggregate(nestedMinMaxMeta, {
+				where: positiveScores,
+				or: [],
+				aggregates: [{ op: 'min', field: 'metrics.score', as: 'minScore' }]
+			}),
+			{ minScore: 5 }
+		);
+		assert.deepEqual(
+			await nestedMinMaxStore.aggregate(nestedMinMaxMeta, {
+				where: positiveScores,
+				or: [],
+				aggregates: [{ op: 'max', field: 'metrics.score', as: 'maxScore' }]
+			}),
+			{ maxScore: 7 }
+		);
+	} finally {
+		await nestedMinMaxStore.bulk.deleteMany(nestedMinMaxMeta, [1, 2, 3]).catch(() => undefined);
+	}
 	try {
 		const created = await BulkRecord.createMany([
 			{ id: 71, handle: 'created-a', secret: 'alpha' },
