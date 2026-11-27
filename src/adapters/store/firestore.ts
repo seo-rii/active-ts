@@ -1675,10 +1675,17 @@ function firestoreMember(target: object, property: string, context: string) {
 	return undefined;
 }
 
+// Bundlers rename SDK classes without changing them: esbuild emits
+// `var DocumentSnapshot = class _DocumentSnapshot` for a class that refers to
+// itself and appends digits to resolve collisions (`QueryDocumentSnapshot2`);
+// Rollup appends `$1`. Accept only those exact rename shapes of the SDK names.
+const BUNDLER_RENAMED_CLASS = /^_?([A-Za-z]+?)(?:\$?\d+)?$/;
+
 function firestoreSdkSnapshotAccessorAllowed(owner: object, property: string) {
 	const constructor = Object.getOwnPropertyDescriptor(owner, 'constructor');
 	if (!constructor || !('value' in constructor) || typeof constructor.value !== 'function') return false;
-	const name = constructor.value.name;
+	const rawName = constructor.value.name;
+	const name = typeof rawName === 'string' ? BUNDLER_RENAMED_CLASS.exec(rawName)?.[1] : undefined;
 	return (
 		((name === 'DocumentSnapshot' || name === 'QueryDocumentSnapshot') && (property === 'exists' || property === 'id')) ||
 		(name === 'QuerySnapshot' && property === 'docs')
