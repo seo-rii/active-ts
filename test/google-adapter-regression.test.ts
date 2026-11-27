@@ -16313,6 +16313,66 @@ test('Firestore adapter rejects inherited snapshot result fields', async () => {
 		);
 	});
 
+	test('Firestore adapter accepts SDK snapshot accessors after bundler class renames', async () => {
+		// esbuild bundles the SDK's self-referencing classes as
+		// `var DocumentSnapshot = class _DocumentSnapshot` and deconflicts with
+		// digit suffixes; Rollup uses `$1`. The getters are still the SDK's own.
+		const renamed = (name: string, members: PropertyDescriptorMap) => {
+			const SdkClass = function () {} as unknown as { new (): any; prototype: object };
+			Object.defineProperty(SdkClass, 'name', { value: name });
+			Object.defineProperties(SdkClass.prototype, members);
+			return SdkClass;
+		};
+		const documentClass = (name: string, handle: string) =>
+			renamed(name, {
+				exists: { get: () => true },
+				id: { get: () => 'number:1' },
+				data: { value: () => ({ id: 1, handle }) }
+			});
+		const queryClass = (name: string, document: { new (): any }) =>
+			renamed(name, { docs: { get: () => [new document()] } });
+		const cases: Array<[string, string, string]> = [
+			['_DocumentSnapshot', 'QueryDocumentSnapshot2', '_QuerySnapshot'],
+			['DocumentSnapshot$1', 'QueryDocumentSnapshot$2', 'QuerySnapshot$1']
+		];
+		for (const [documentName, queryDocumentName, queryName] of cases) {
+			const Document = documentClass(documentName, 'sdk-get');
+			const Many = documentClass(documentName, 'sdk-many');
+			const Query = queryClass(queryName, documentClass(queryDocumentName, 'sdk-query'));
+			const adapter = await createFirestoreStoreAdapter({
+				client: firestoreClient({
+					collection: () => ({
+						doc: () => ({ get: async () => new Document() }),
+						get: async () => new Query()
+					}),
+					getAll: async () => [new Many()]
+				})
+			});
+			assert.deepEqual(await adapter.get(meta, 1), { id: 1, handle: 'sdk-get' });
+			assert.deepEqual(await adapter.getMany(meta, [1]), [{ id: 1, handle: 'sdk-many' }]);
+			assert.deepEqual(
+				await adapter.query(meta, { where: [], or: [], sort: [], include: [] }),
+				{ list: [{ id: 1, handle: 'sdk-query' }], count: 1, more: false }
+			);
+		}
+
+		let getterCalls = 0;
+		for (const name of ['EvilDocumentSnapshot', 'DocumentSnapshotX', '__DocumentSnapshot', 'Document_Snapshot']) {
+			const Impostor = renamed(name, {
+				exists: { get: () => (getterCalls++, true) },
+				data: { value: () => ({ id: 1, handle: 'impostor' }) }
+			});
+			const adapter = await createFirestoreStoreAdapter({
+				client: firestoreClient({
+					collection: () => ({ doc: () => ({ get: async () => new Impostor() }) }),
+					getAll: async () => []
+				})
+			});
+			await assert.rejects(() => adapter.get(meta, 1), /Firestore document snapshot\.exists must be a data property/);
+		}
+		assert.equal(getterCalls, 0);
+	});
+
 	test('Firestore adapter rejects own accessor snapshot fields without invoking them', async () => {
 		let getterCalls = 0;
 		let docSnapshot: any = Object.defineProperty({}, 'exists', {
