@@ -1,7 +1,15 @@
 import { isDeepStrictEqual } from 'node:util';
 import { snapshotArrayInput } from './array-input.js';
 import { ActiveContext, getDefaultContext } from './context.js';
-import { ActiveTsCommittedWriteError, ActiveTsConfigurationError, ActiveTsConflictError, ActiveTsNotFoundError, ActiveTsValidationError, safeErrorMessage } from './errors.js';
+import {
+	ActiveTsCommittedWriteError,
+	ActiveTsConfigurationError,
+	ActiveTsConflictError,
+	ActiveTsNotFoundError,
+	ActiveTsUnknownTransactionOutcomeError,
+	ActiveTsValidationError,
+	safeErrorMessage
+} from './errors.js';
 import { LazyRef } from './lazy-ref.js';
 import { isPartialModel } from './partial-model.js';
 import { findTypedViewDetails, type TypedView } from './typed-view.js';
@@ -1458,7 +1466,31 @@ async function writeWithConflictInvalidation(
 				throw new AggregateError([error, invalidationError], 'Store write conflicted and entity cache invalidation failed.');
 			}
 		}
+		// An unknown commit outcome (for example a lost reply to the Commit of the
+		// transaction a Datastore version-checked write runs in) may have applied
+		// the write. Evict as the transaction APIs do, and keep the unknown error
+		// itself so callers can still recognize it and reconcile.
+		if (error instanceof ActiveTsUnknownTransactionOutcomeError) {
+			try {
+				await context.invalidateModelExternal(model, id);
+			} catch (invalidationError) {
+				attachUnknownOutcomeCacheInvalidationError(error, invalidationError);
+			}
+		}
 		throw error;
+	}
+}
+
+function attachUnknownOutcomeCacheInvalidationError(error: ActiveTsUnknownTransactionOutcomeError, invalidationError: unknown) {
+	try {
+		defineDataProperty(
+			error,
+			'cacheInvalidationError',
+			new AggregateError([invalidationError], 'active-ts cache invalidation failed after an unknown write outcome.'),
+			{ enumerable: false, configurable: true }
+		);
+	} catch {
+		// A frozen unknown-outcome error stays authoritative and unchanged.
 	}
 }
 
