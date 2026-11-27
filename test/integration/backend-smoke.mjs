@@ -738,6 +738,22 @@ if (targets.has('datastore')) {
 		await adapter.delete(nativeMeta, 9001).catch(() => undefined);
 		await alternateNamespaceAdapter.delete(nativeMeta, 9001).catch(() => undefined);
 	}
+	// Untyped filters are applied in process over every candidate page. A native
+	// order on an untyped sort field would drop entities that lack it.
+	try {
+		await adapter.create(nativeMeta, 9101, { id: 9101, group: 'sorted', rank: 'b' });
+		await adapter.create(nativeMeta, 9102, { id: 9102, group: 'sorted' });
+		await adapter.create(nativeMeta, 9103, { id: 9103, group: 'sorted', rank: 'a' });
+		const ranked = await adapter.query(nativeMeta, {
+			where: [{ field: 'group', op: '=', value: 'sorted' }],
+			or: [],
+			sort: [{ field: 'rank', direction: 'asc' }],
+			include: []
+		});
+		assert.deepEqual(ranked.list.map((row) => row.id), [9102, 9103, 9101]);
+	} finally {
+		await adapter.bulk.deleteMany(nativeMeta, [9101, 9102, 9103]).catch(() => undefined);
+	}
 	try {
 		await diagnosticAdapter.create(nativeMeta, 1, { id: 1, handle: 'native-one', score: 11 });
 		const native = await diagnosticAdapter.query(nativeMeta, {
