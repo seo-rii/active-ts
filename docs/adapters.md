@@ -206,8 +206,9 @@ each indexed field. Models that declare an ancestor resolver emit both
 `ancestor: yes` and `ancestor: no` variants because active-ts supports scoped
 and unscoped queries for those kinds; ordinary models emit only
 `ancestor: no`. Because active-ts appends the model id as an ascending stable
-tie-breaker for sorted limited queries, Datastore schema plans and generated
-`index.yaml` entries include that id field when it is not already declared.
+tie-breaker for sorted limited or offset queries, Datastore schema plans and
+generated `index.yaml` entries include that id field when it is not already
+declared.
 `context.schemaPlan([Model])`, direct `store.schema.plan([meta])`, and
 `context.schemaApply([Model], { mode: 'safe' })` report Datastore composite
 indexes as `status: 'manual'` deployment intent; they do not create remote

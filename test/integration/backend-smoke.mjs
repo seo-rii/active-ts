@@ -994,6 +994,17 @@ if (targets.has('datastore')) {
 		await diagnosticAdapter.delete(aggregateMeta, 1).catch(() => undefined);
 		await diagnosticAdapter.delete(aggregateMeta, 2).catch(() => undefined);
 	}
+	// Datastore breaks ties by key, and the key for id 10 sorts before id 2.
+	try {
+		await diagnosticAdapter.create(aggregateMeta, 2, { id: 2, score: 5 });
+		await diagnosticAdapter.create(aggregateMeta, 10, { id: 10, score: 5 });
+		const offsetPage = await diagnosticAdapter.query(aggregateMeta, {
+			where: [], or: [], sort: [{ field: 'score', direction: 'asc' }], include: [], offset: 1
+		});
+		assert.deepEqual(offsetPage.list.map((row) => row.id), [10]);
+	} finally {
+		await adapter.bulk.deleteMany(aggregateMeta, [2, 10]).catch(() => undefined);
+	}
 	try {
 		const created = await BulkRecord.createMany([
 			{ id: 71, handle: 'created-a', secret: 'alpha' },
@@ -1438,6 +1449,18 @@ if (targets.has('firestore')) {
 		} finally {
 			await adapter.delete(aggregateMeta, 1).catch(() => undefined);
 			await adapter.delete(aggregateMeta, 2).catch(() => undefined);
+		}
+		// Firestore breaks ties by document name, and "number:10" sorts before "number:2".
+		try {
+			await adapter.create(aggregateMeta, 2, { id: 2, score: 5 });
+			await adapter.create(aggregateMeta, 10, { id: 10, score: 5 });
+			const offsetPage = await adapter.query(aggregateMeta, {
+				where: [], or: [], sort: [{ field: 'score', direction: 'asc' }], include: [], offset: 1
+			});
+			assert.deepEqual(offsetPage.list.map((row) => row.id), [10]);
+		} finally {
+			await adapter.delete(aggregateMeta, 2).catch(() => undefined);
+			await adapter.delete(aggregateMeta, 10).catch(() => undefined);
 		}
 		try {
 			await BulkRecord.createMany([
