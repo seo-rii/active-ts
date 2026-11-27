@@ -677,7 +677,10 @@ read-write transaction: it reads the entity, compares `version`, and commits the
 write. A concurrent change after that read aborts the commit, which is reported
 as `ActiveTsConflictError`. Inside a transaction the comparison uses the
 transaction's own read, or the row it already wrote. Each such save costs a
-BeginTransaction, Lookup and Commit instead of one Commit.
+BeginTransaction, Lookup and Commit instead of one Commit. When that Commit's
+outcome is unknown, `save()` and `delete()` raise
+`ActiveTsUnknownTransactionOutcomeError` and evict the entity's cache entry, as
+the transaction APIs do; a failed eviction is attached as `cacheInvalidationError`.
 
 Firestore runs a version-checked `update()` or `delete()` outside a transaction
 through `client.runTransaction()`: it reads the document, compares `version`, and

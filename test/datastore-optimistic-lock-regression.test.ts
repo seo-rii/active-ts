@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import {
 	ActiveTsConflictError,
 	ActiveTsNotFoundError,
+	ActiveTsUnknownTransactionOutcomeError,
+	MemoryCacheAdapter,
 	Model,
 	createActiveTs,
 	defineModel,
@@ -46,6 +48,7 @@ function fakeDatastore({ transactions = true } = {}) {
 	const calls: string[] = [];
 	let beforeCommit: (() => void) | undefined;
 	let abortNextCommit = false;
+	let loseNextCommitReply = false;
 	const write = (operation: string, entity: { key: unknown; data: Record<string, unknown> }) => {
 		const key = keyId(entity.key);
 		if (operation === 'insert' && rows.has(key)) throw Object.assign(new Error('already exists'), { code: 6 });
@@ -122,6 +125,11 @@ function fakeDatastore({ transactions = true } = {}) {
 						}
 					}
 					for (const apply of writes) apply();
+					if (loseNextCommitReply) {
+						// The commit was applied, but its reply was lost.
+						loseNextCommitReply = false;
+						throw Object.assign(new Error('deadline exceeded'), { code: 4 });
+					}
 				},
 				rollback: async () => {
 					calls.push('tx.rollback');
@@ -139,6 +147,9 @@ function fakeDatastore({ transactions = true } = {}) {
 		},
 		abortNextCommit() {
 			abortNextCommit = true;
+		},
+		loseNextCommitReply() {
+			loseNextCommitReply = true;
 		}
 	};
 }
@@ -280,4 +291,70 @@ test('Datastore retries a version-checked write aborted by contention alone', as
 		ActiveTsConflictError
 	);
 	assert.deepEqual(fake.row(1), { id: 1, title: 'other writer', version: 3 });
+});
+
+class CachedLockedNote extends Model<LockedData> {}
+defineModel<LockedData>({ name: 'datastore_optimistic_cached_note', cache: { ttl: 60 } })
+	.id('id')
+	.attach(CachedLockedNote);
+
+for (const operation of ['save', 'delete'] as const) {
+	test(`Datastore evicts the entity cache when a version-checked ${operation} has an unknown commit outcome`, async () => {
+		const fake = fakeDatastore();
+		const context = createActiveTs({
+			stores: { default: await createDatastoreStoreAdapter({ client: fake.client }) },
+			caches: { default: new MemoryCacheAdapter() }
+		});
+		const Note = CachedLockedNote.use(context);
+		await Note.create({ id: 7, title: 'draft', version: 1 });
+		const loaded = (await Note.find(7).load())!;
+		assert.deepEqual(loaded.data, { id: 7, title: 'draft', version: 1 }, 'the entity is cached');
+
+		loaded.data.title = 'published';
+		fake.loseNextCommitReply();
+		await assert.rejects(
+			() => (operation === 'save' ? loaded.save() : loaded.delete()),
+			(error: unknown) => error instanceof ActiveTsUnknownTransactionOutcomeError && error.phase === 'commit'
+		);
+		const stored = fake.rows.get(JSON.stringify(['datastore_optimistic_cached_note', 'number:7']));
+		if (operation === 'save') assert.deepEqual(stored, { id: 7, title: 'published', version: 2 }, 'the commit applied');
+		else assert.equal(stored, undefined, 'the commit applied');
+
+		// The save may have committed, so the pre-save cache entry must not be served.
+		const reread = await Note.find(7).load();
+		if (operation === 'save') assert.deepEqual(reread?.data, { id: 7, title: 'published', version: 2 });
+		else assert.equal(reread, null);
+	});
+}
+
+test('Datastore keeps the unknown outcome error when its cache eviction fails', async () => {
+	const fake = fakeDatastore();
+	class FailingCache extends MemoryCacheAdapter {
+		fail = false;
+		override async deleteMany(keys: string[]) {
+			if (this.fail) throw new Error('cache unavailable');
+			await super.deleteMany(keys);
+		}
+	}
+	const cache = new FailingCache();
+	const context = createActiveTs({
+		stores: { default: await createDatastoreStoreAdapter({ client: fake.client }) },
+		caches: { default: cache }
+	});
+	const Note = CachedLockedNote.use(context);
+	await Note.create({ id: 8, title: 'draft', version: 1 });
+	const loaded = (await Note.find(8).load())!;
+	loaded.data.title = 'published';
+	fake.loseNextCommitReply();
+	cache.fail = true;
+	await assert.rejects(() => loaded.save(), (error: unknown) => {
+		assert.ok(error instanceof ActiveTsUnknownTransactionOutcomeError);
+		const diagnostic = Object.getOwnPropertyDescriptor(error, 'cacheInvalidationError');
+		assert.ok(diagnostic && diagnostic.value instanceof AggregateError && diagnostic.enumerable === false);
+		assert.match((diagnostic.value as AggregateError).errors[0].message, /cache unavailable/);
+		return true;
+	});
+	cache.fail = false;
+	// The failed eviction keeps the key protected, so reads go to the store.
+	assert.deepEqual((await Note.find(8).load())?.data, { id: 8, title: 'published', version: 2 });
 });
