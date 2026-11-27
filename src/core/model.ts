@@ -38,6 +38,7 @@ import {
 	assertModelSnapshotRelationsAllowed,
 	MODEL_DATASTORE_WRITE_ANCESTOR,
 	MODEL_PERSISTED_TOKEN,
+	MODEL_PLAN_RELATION,
 	trackTransactionModel,
 	invalidateModelRelations,
 	type ModelConstructorOptions
@@ -127,6 +128,12 @@ export abstract class Model<TData extends Record<string, any> = Record<string, a
 	private [MODEL_DATASTORE_WRITE_ANCESTOR]?: DatastoreKey;
 	private readonly plannedRelations = new Set<string>();
 	private readonly relationCache = new Map<string, LazyRef<any>>();
+
+	// Batched includes plan relations on every loaded model. Keeping the name in
+	// plannedRelations lets a relation handle recreated after a save stay planned.
+	private [MODEL_PLAN_RELATION](name: string) {
+		SET_ADD.call(this.plannedRelations, name);
+	}
 
 	constructor(data: TData, context?: ActiveContext, options: ModelConstructorOptions = {}) {
 		if (context !== undefined && !(context instanceof ActiveContext)) {

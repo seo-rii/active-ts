@@ -148,7 +148,8 @@ import {
 import {
 	markDatastoreHistoricalModel,
 	MODEL_DATASTORE_WRITE_ANCESTOR,
-	MODEL_PERSISTED_TOKEN
+	MODEL_PERSISTED_TOKEN,
+	MODEL_PLAN_RELATION
 } from './model-internal.js';
 
 const RELATION_INSTANTIATION_DATA = new WeakMap<object, Record<string, any>>();
@@ -1923,6 +1924,7 @@ export async function preloadIncludes(
 		try {
 			for (const item of list) {
 				item.ref(relationName).markPlanned();
+				item[MODEL_PLAN_RELATION](relationName);
 				await context.runHooks('beforeRelationLoad', {
 					model: ownerMeta,
 					target: item,
