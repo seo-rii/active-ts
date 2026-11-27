@@ -2815,6 +2815,8 @@ function createDatastoreAdapter(
 					} catch (error) {
 						if (!started) throw error;
 						if (committing) {
+							await transaction.rollbackAfterFailedCommit(() =>
+								mergeDatastoreGaxOptions(callGaxOptions('rollback'), nativeRollbackGaxOptions));
 							if (isDatastoreAbortedError(error)) {
 								if (attempt < maxAttempts) {
 									await waitForDatastoreTransactionRetry(
@@ -3807,6 +3809,7 @@ function createDatastoreAdapter(
 				} catch (error) {
 					if (!started) throw error;
 					if (committing) {
+						await transaction.rollbackAfterFailedCommit(() => callGaxOptions('rollback'));
 						if (isDatastoreAbortedError(error)) throw datastoreTransactionConflict(error);
 						if (isDatastoreDefiniteCommitFailure(error)) throw error;
 						throw markTransactionRollbackSkipped(error);
@@ -4790,10 +4793,37 @@ function normalizeDatastoreTransaction(transaction: unknown, rootClient: Normali
 	const update = datastoreMethod(transaction, 'update', 'Datastore transaction.update');
 	const upsert = datastoreOptionalMethod(transaction, 'upsert', 'Datastore transaction.upsert')
 		?? datastoreOptionalMethod(transaction, 'save', 'Datastore transaction.save');
+	// Set when the last commit() failed after the SDK asked for its own
+	// Rollback and the adapter took that Rollback over.
+	let rollbackOwed = false;
 	return Object.freeze({
 		run,
-		commit,
+		async commit(...args: unknown[]) {
+			rollbackOwed = false;
+			const restore = deferSdkCommitRollback(transaction, rollback, () => { rollbackOwed = true; });
+			try {
+				const result = await commit(...args);
+				rollbackOwed = false;
+				return result;
+			} finally {
+				restore?.();
+			}
+		},
 		rollback,
+		// Sends the Rollback the SDK asked for after a failed Commit, with the
+		// options gaxOptions() returns when it is sent. Like the SDK's own
+		// rollback, a failure here never replaces the commit error.
+		async rollbackAfterFailedCommit(gaxOptions: () => Record<string, unknown> | undefined) {
+			if (!rollbackOwed) return;
+			rollbackOwed = false;
+			try {
+				const options = gaxOptions();
+				await (options === undefined ? rollback() : rollback(options));
+			} catch {
+				// The commit error stays authoritative; an unsent or failed Rollback
+				// leaves the transaction to expire on the server.
+			}
+		},
 		client: normalizeDatastoreClient({
 			key: rootClient.key,
 			int: rootClient.int,
@@ -4808,6 +4838,49 @@ function normalizeDatastoreTransaction(transaction: unknown, rootClient: Normali
 			upsert
 		})
 	});
+}
+
+// After any failed Commit, @google-cloud/datastore's Transaction rolls back by
+// itself: its private commit path calls `this.rollback(callback)` and settles
+// commit() only when that Rollback returns. The call has no call options, so it
+// ignores the gaxOptions provider and waits up to the SDK's default Rollback
+// deadline (60 s). While commit() runs, the adapter shadows rollback() on the
+// transaction object it created: the SDK's callback-only call returns at once
+// without an RPC, and the adapter sends that Rollback itself once commit()
+// settles, in the caller's async context. Calls with options still reach the
+// SDK. A transaction that cannot take the shadow (frozen or non-extensible)
+// keeps the SDK's own Rollback, so a Rollback is never sent twice.
+function deferSdkCommitRollback(
+	transaction: object,
+	rollback: (...args: any[]) => any,
+	onDeferred: () => void
+): (() => void) | undefined {
+	const previous = Object.getOwnPropertyDescriptor(transaction, 'rollback');
+	const shadow = function (...args: unknown[]) {
+		if (args.length === 1 && typeof args[0] === 'function') {
+			onDeferred();
+			return (args[0] as () => unknown)();
+		}
+		return rollback(...args);
+	};
+	try {
+		Object.defineProperty(transaction, 'rollback', {
+			value: shadow,
+			enumerable: false,
+			configurable: true,
+			writable: true
+		});
+	} catch {
+		return undefined;
+	}
+	return () => {
+		try {
+			if (previous) Object.defineProperty(transaction, 'rollback', previous);
+			else delete (transaction as { rollback?: unknown }).rollback;
+		} catch {
+			// The transaction is single-use; a shadow left behind is never called again.
+		}
+	};
 }
 
 function createDatastoreTransactionNativeReadClient(client: NormalizedDatastoreClient): NormalizedDatastoreClient {
