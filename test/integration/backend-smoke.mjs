@@ -738,6 +738,15 @@ if (targets.has('datastore')) {
 		await adapter.delete(nativeMeta, 9001).catch(() => undefined);
 		await alternateNamespaceAdapter.delete(nativeMeta, 9001).catch(() => undefined);
 	}
+	// The SDK sends integer-valued numbers as 64-bit integers from their decimal
+	// string: 1e21 would be stored as 1 and 2 ** 60 would not read back.
+	try {
+		const unsafeIntegerValues = { id: 9002, exponent: 1e21, power: 2 ** 60, maximum: Number.MAX_VALUE, nested: { values: [2 ** 53, 7] } };
+		await adapter.create(nativeMeta, 9002, unsafeIntegerValues);
+		assert.deepEqual(await adapter.get(nativeMeta, 9002), unsafeIntegerValues);
+	} finally {
+		await adapter.delete(nativeMeta, 9002).catch(() => undefined);
+	}
 	try {
 		await diagnosticAdapter.create(nativeMeta, 1, { id: 1, handle: 'native-one', score: 11 });
 		const native = await diagnosticAdapter.query(nativeMeta, {
