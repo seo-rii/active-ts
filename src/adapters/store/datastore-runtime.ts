@@ -3203,14 +3203,18 @@ function createDatastoreAdapter(
 			}
 			for (const where of plan.where)
 				query = normalizeDatastoreQuery(applyDatastoreWhere(query, where), 'Datastore query');
-			for (const sort of plan.sort)
-				query = normalizeDatastoreQuery(
-					datastoreMethod(query, 'order', 'Datastore query.order')(
-						assertSafeDatastoreField(sort.field, 'Datastore sort field'),
-						{ descending: sort.direction === 'desc' }
-					),
-					'Datastore query'
-				);
+			// Portable filtering reads every candidate page and sorts in process. A
+			// native order would also drop entities missing an untyped sort field.
+			if (!portableScalarFilter) {
+				for (const sort of plan.sort)
+					query = normalizeDatastoreQuery(
+						datastoreMethod(query, 'order', 'Datastore query.order')(
+							assertSafeDatastoreField(sort.field, 'Datastore sort field'),
+							{ descending: sort.direction === 'desc' }
+						),
+						'Datastore query'
+					);
+			}
 			if (keyOnlyProjection)
 				query = normalizeDatastoreQuery(
 					datastoreMethod(query, 'select', 'Datastore query.select')('__key__'),
