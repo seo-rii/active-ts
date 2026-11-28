@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { Datastore } from '@google-cloud/datastore';
 import {
 	ActiveTsCommittedTransactionError,
 	ActiveTsConfigurationError,
@@ -407,8 +408,10 @@ test('Datastore ID repair apply rechecks payloads and preserves explicit index e
 	const logs: TransactionLog[] = [];
 	const manifest = keyWinsManifest();
 	const sdkKey = Symbol('datastore-key');
+	// Repair reads with wrapNumbers, so the SDK returns stored integers as Int wrappers.
+	const nestedInteger = Datastore.int(1);
 	const firstEntity = Object.defineProperty(
-		{ id: '17', body: 'first', nested: { value: 1 } },
+		{ id: '17', body: 'first', nested: { value: nestedInteger } },
 		sdkKey,
 		{ value: { kind: 'repair_record', id: 17 }, enumerable: true }
 	);
@@ -460,9 +463,10 @@ test('Datastore ID repair apply rechecks payloads and preserves explicit index e
 			path: ['repair_parent', 9, 'repair_record', 17],
 			namespace: 'tenant'
 		},
-		data: { id: 17, body: 'first', nested: { value: 1 } },
+		data: { id: 17, body: 'first', nested: { value: nestedInteger } },
 		excludeFromIndexes: ['body', 'details[].note']
 	});
+	assert.equal(logs[0].update[0].data.nested.value, nestedInteger);
 	assert.equal(Object.getPrototypeOf(logs[0].update[0].data), null);
 	assert.deepEqual(Object.getOwnPropertySymbols(logs[0].update[0].data), []);
 	assert.equal(logs[1].update.length, 0);

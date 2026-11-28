@@ -846,6 +846,77 @@ if (targets.has('datastore')) {
 			await sdkAdapter.close();
 		}
 	}
+	// The ID repair helpers read SDK entities and write them back. The SDK would
+	// write an integer-valued double as an integer: 10 would leave the double
+	// range, 1e21 would be stored as 1 and 2 ** 60 would not read back.
+	{
+		const repairKind = `integration_datastore_repair_numbers_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
+		class IntegrationDatastoreRepairNumberRecord extends Model {}
+		defineModel({ name: repairKind })
+			.id('id')
+			.fieldType('price', 'number')
+			.validate((input) => input)
+			.attach(IntegrationDatastoreRepairNumberRecord);
+		const repairAdapter = await createDatastoreStoreAdapter({ client, namespace, keyEncoding: 'native', typedNumbers: 'double' });
+		const repairMeta = createActiveTs({ stores: { default: repairAdapter } }).meta(IntegrationDatastoreRepairNumberRecord);
+		const repairTarget = `datastore:${googleProjectId}/(default)@${process.env.DATASTORE_EMULATOR_HOST ?? 'googleapis.com'}`;
+		const repairKey = (id) => client.key({ namespace, path: [repairKind, id] });
+		const values = { price: 10, exponent: 1e21, power: 2 ** 60, maximum: Number.MAX_VALUE, nested: { values: [2 ** 53, 7, 1e21] }, count: 7 };
+		// Another writer's rows with the adapter's number encoding but a string payload ID.
+		const saveDrifted = (id) => client.save({ key: repairKey(id), data: {
+			id: String(id), price: client.double(10), exponent: client.double(1e21), power: client.double(2 ** 60),
+			maximum: client.double(Number.MAX_VALUE), nested: { values: [client.double(2 ** 53), 7, client.double(1e21)] }, count: 7
+		} });
+		// With wrapNumbers the SDK returns a stored integer as an Int and a stored double as a number.
+		const storedTypes = async (id) => {
+			const [entity] = await client.get(repairKey(id), { wrapNumbers: true });
+			const type = (value) => client.isInt(value) ? `integer:${value.value}` : `${typeof value}:${value}`;
+			return [entity.price, entity.exponent, entity.power, entity.maximum, ...entity.nested.values, entity.count].map(type);
+		};
+		const adapterTypes = ['number:10', 'number:1e+21', 'number:1152921504606847000', 'number:1.7976931348623157e+308',
+			'number:9007199254740992', 'integer:7', 'number:1e+21', 'integer:7'];
+		const rawIds = async (field, value) => {
+			const [entities] = await client.runQuery(client.createQuery(namespace, repairKind).filter(field, '=', value));
+			return entities.map((entity) => entity.id).sort();
+		};
+		const inventoryAndRepair = async (policyOptions) => {
+			const issues = [];
+			const report = await inventoryDatastoreIds({ client, kind: repairKind, namespace, onIssue: (issue) => issues.push(issue) });
+			assert.equal(report.counts['type-mismatch'], 1);
+			const manifest = createDatastoreIdRepairManifest({ report, issues, target: repairTarget, excludeFromIndexes: [], ...policyOptions });
+			assert.deepEqual(await applyDatastoreIdRepairManifest({ client, manifest, target: repairTarget, confirm: manifest.digest }),
+				{ total: 1, processed: 1, repaired: 1, alreadyRepaired: 0, indeterminate: 0 });
+		};
+		try {
+			await repairAdapter.create(repairMeta, 1, { id: 1, ...values });
+			await repairAdapter.create(repairMeta, 2, { id: 2, price: 9.99 });
+			assert.deepEqual(await storedTypes(1), adapterTypes);
+			await saveDrifted(3);
+			assert.deepEqual(await storedTypes(3), adapterTypes);
+			await inventoryAndRepair({ policy: 'key-wins' });
+			assert.deepEqual(await storedTypes(3), adapterTypes, 'key-wins keeps stored doubles');
+			assert.deepEqual(await repairAdapter.get(repairMeta, 3), { id: 3, ...values });
+
+			await saveDrifted(4);
+			await inventoryAndRepair({ policy: 'payload-wins', allowKeyMoves: true, descendantPolicy: 'verified-none' });
+			assert.equal((await client.get(repairKey(4)))[0], undefined);
+			assert.deepEqual(await storedTypes('4'), adapterTypes, 'payload-wins keeps stored doubles');
+			assert.deepEqual(await repairAdapter.get(repairMeta, '4'), { id: '4', ...values });
+
+			assert.deepEqual(await rawIds('price', client.double(10)), [1, 3, '4']);
+			assert.deepEqual(await rawIds('price', 10), []);
+			assert.deepEqual(await rawIds('exponent', client.double(1e21)), [1, 3, '4']);
+			assert.deepEqual(await rawIds('power', client.double(2 ** 60)), [1, 3, '4']);
+			const above = await repairAdapter.query(repairMeta, {
+				where: [{ field: 'price', op: '>', value: 9.5 }], or: [], sort: [{ field: 'price', direction: 'asc' }], include: []
+			});
+			assert.deepEqual(above.list.map((row) => row.price), [9.99, 10, 10, 10]);
+			const final = await inventoryDatastoreIds({ client, kind: repairKind, namespace });
+			assert.deepEqual([final.scanned, final.counts.match], [4, 4]);
+		} finally {
+			await client.delete([1, 2, 3, 4, '4'].map(repairKey)).catch(() => undefined);
+		}
+	}
 	// Untyped filters are applied in process over every candidate page. A native
 	// order on an untyped sort field would drop entities that lack it.
 	try {

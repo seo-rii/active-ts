@@ -360,6 +360,15 @@ export async function applyDatastoreIdRepairManifest(
 		return sdkKey({ ...options, path });
 	};
 	const get = requiredMethod(rawClient, 'get', 'Datastore ID repair client.get');
+	const double: DatastoreDouble = (value, context) => {
+		const sdkDouble = optionalDataMember(rawClient, 'double', 'Datastore ID repair client.double');
+		if (typeof sdkDouble !== 'function') {
+			throw new ActiveTsConfigurationError(
+				`${context} holds an integer-valued Datastore double; client.double must be a function to write it back as a double.`
+			);
+		}
+		return sdkDouble.call(rawClient, value);
+	};
 	const transactionFactory = requiredMethod(
 		rawClient,
 		'transaction',
@@ -370,7 +379,7 @@ export async function applyDatastoreIdRepairManifest(
 	);
 	let repaired = 0;
 	let alreadyRepaired = 0;
-	await preflightRepairManifest(manifest, key, get);
+	await preflightRepairManifest(manifest, key, get, double);
 	for (let index = 0; index < manifest.operations.length; index++) {
 		try {
 			const result = await applyRepairOperation(
@@ -379,7 +388,8 @@ export async function applyDatastoreIdRepairManifest(
 				index,
 				key,
 				transactionFactory,
-				transactionOptions
+				transactionOptions,
+				double
 			);
 			if (result === 'repaired') repaired++;
 			else alreadyRepaired++;
@@ -1000,7 +1010,8 @@ function normalizeRepairManifest(value: unknown): DatastoreIdRepairManifest {
 async function preflightRepairManifest(
 	manifest: DatastoreIdRepairManifest,
 	keyFactory: (...args: any[]) => any,
-	get: (...args: any[]) => any
+	get: (...args: any[]) => any,
+	double: DatastoreDouble
 ) {
 	for (let index = 0; index < manifest.operations.length; index++) {
 		const operation = manifest.operations[index];
@@ -1022,6 +1033,10 @@ async function preflightRepairManifest(
 				`Datastore ID repair preflight ${index} payload changed after inventory.`
 			);
 		}
+		// Fail before the first commit if a later row cannot be written back unchanged.
+		if (!alreadyRepaired) {
+			snapshotEntityForWrite(source, `Datastore ID repair preflight ${index} source`, manifest.idField, double);
+		}
 		if (manifest.policy !== 'payload-wins') continue;
 		const targetKey = keyFactory(inventoryKeyToSdkOptions(operation.target));
 		const target = await transactionGet(get, targetKey, `Datastore ID repair preflight ${index} target read`);
@@ -1037,7 +1052,8 @@ async function applyRepairOperation(
 	index: number,
 	keyFactory: (...args: any[]) => any,
 	transactionFactory: (...args: any[]) => any,
-	transactionOptions: ReturnType<typeof normalizeTransactionOptions>
+	transactionOptions: ReturnType<typeof normalizeTransactionOptions>,
+	double: DatastoreDouble
 ): Promise<'repaired' | 'already-repaired'> {
 	const rawTransaction = transactionFactory({ readOnly: false });
 	if (!rawTransaction || typeof rawTransaction !== 'object' || Array.isArray(rawTransaction)) {
@@ -1081,7 +1097,12 @@ async function applyRepairOperation(
 				`Datastore ID repair operation ${index} payload changed after inventory.`
 			);
 		}
-		const data = snapshotEntityForWrite(source, `Datastore ID repair operation ${index} source`);
+		const data = snapshotEntityForWrite(
+			source,
+			`Datastore ID repair operation ${index} source`,
+			manifest.idField,
+			double
+		);
 		defineDataProperty(data, manifest.idField, operation.replacementId, {
 			enumerable: true,
 			configurable: true,
@@ -1137,7 +1158,10 @@ async function transactionGet(
 	key: unknown,
 	context: string
 ) {
-	const result = snapshotArrayInput<unknown>(await get(key), `${context} result`);
+	// The SDK decodes integers and doubles to the same JavaScript number. With
+	// wrapNumbers it returns every stored integer as its Int wrapper instead, so
+	// a plain number in the result was stored as a double.
+	const result = snapshotArrayInput<unknown>(await get(key, { wrapNumbers: true }), `${context} result`);
 	if (!Object.prototype.hasOwnProperty.call(result, 0)) {
 		throw new ActiveTsValidationError(`${context} result[0] is required.`);
 	}
@@ -1154,7 +1178,14 @@ function payloadFromEntity(entity: Record<string, unknown>, idField: string, con
 	if (!descriptor || !('value' in descriptor) || !descriptor.enumerable) {
 		return { type: 'invalid' as const };
 	}
-	const value = descriptor.value;
+	let value = descriptor.value;
+	const integerText = sdkIntegerText(value);
+	if (integerText !== undefined) {
+		// Inventory reads without wrapNumbers, where the SDK decodes a safe integer
+		// to a number and fails on any other integer.
+		value = Number(integerText);
+		if (!Number.isSafeInteger(value) || String(value) !== integerText) return { type: 'invalid' as const };
+	}
 	if (typeof value !== 'string' && typeof value !== 'number') return { type: 'invalid' as const };
 	try {
 		assertSafeEntityId(value, `${context}.${idField}`);
@@ -1177,7 +1208,12 @@ function sameRepairPayload(
 	return actual.type === expected.type && 'value' in actual && actual.value === expected.value;
 }
 
-function snapshotEntityForWrite(entity: Record<string, unknown>, context: string) {
+function snapshotEntityForWrite(
+	entity: Record<string, unknown>,
+	context: string,
+	idField: string,
+	double: DatastoreDouble
+) {
 	const prototype = Object.getPrototypeOf(entity);
 	if (prototype !== Object.prototype && prototype !== null) {
 		throw new ActiveTsValidationError(`${context} must be a plain entity object.`);
@@ -1193,7 +1229,11 @@ function snapshotEntityForWrite(entity: Record<string, unknown>, context: string
 		if (!descriptor.enumerable) {
 			throw new ActiveTsValidationError(`${context}.${property} must be enumerable.`);
 		}
-		defineDataProperty(snapshot, property, descriptor.value, {
+		// The repair replaces the ID field, so only the other values keep their encoding.
+		const value = property === idField
+			? descriptor.value
+			: preserveDatastoreDoubles(descriptor.value, double, `${context}.${property}`);
+		defineDataProperty(snapshot, property, value, {
 			enumerable: true,
 			configurable: true,
 			writable: true
@@ -1201,6 +1241,51 @@ function snapshotEntityForWrite(entity: Record<string, unknown>, context: string
 	}
 	// SDK key metadata is a symbol field and is not part of the persisted payload.
 	return snapshot;
+}
+
+type DatastoreDouble = (value: number, context: string) => unknown;
+
+// An entity read with wrapNumbers holds each stored integer as an SDK Int
+// wrapper, which the SDK writes back as the same integer, and each stored
+// double as a plain number. The SDK writes an integer-valued number such as
+// 10, 1e21, 2 ** 60 or -0 as an integer, so wrap those numbers as doubles.
+// Nested entities and arrays decode to plain objects and arrays; every other
+// value, including Int wrappers, keys, dates and buffers, is written as read.
+function preserveDatastoreDoubles(value: unknown, double: DatastoreDouble, context: string): unknown {
+	if (typeof value === 'number') return Number.isInteger(value) ? double(value, context) : value;
+	if (!value || typeof value !== 'object') return value;
+	if (Array.isArray(value)) {
+		const copy: unknown[] = [];
+		for (let index = 0; index < value.length; index++) {
+			copy[index] = preserveDatastoreDoubles(value[index], double, `${context}[${index}]`);
+		}
+		return copy;
+	}
+	const prototype = Object.getPrototypeOf(value);
+	if (prototype !== Object.prototype && prototype !== null) return value;
+	const copy: Record<string, unknown> = {};
+	const record = value as Record<string, unknown>;
+	const properties = Object.keys(record);
+	for (let index = 0; index < properties.length; index++) {
+		const property = properties[index];
+		defineDataProperty(
+			copy,
+			property,
+			preserveDatastoreDoubles(record[property], double, `${context}.${property}`),
+			{ enumerable: true, configurable: true, writable: true }
+		);
+	}
+	return copy;
+}
+
+// The decimal text of an SDK Int wrapper, which extends Number.
+function sdkIntegerText(value: unknown): string | undefined {
+	if (!(value instanceof Number)) return undefined;
+	const type = Object.getOwnPropertyDescriptor(value, 'type');
+	const text = Object.getOwnPropertyDescriptor(value, 'value');
+	if (!type || !('value' in type) || type.value !== 'DatastoreInt') return undefined;
+	if (!text || !('value' in text) || typeof text.value !== 'string') return undefined;
+	return text.value;
 }
 
 function normalizeExcludeFromIndexes(
