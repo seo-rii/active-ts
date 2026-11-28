@@ -459,7 +459,28 @@ a parent key.
 `excludeFromIndexes` is mandatory because the Datastore SDK does not return the
 original per-property exclusion flags when it reads an entity. Supply the exact
 unindexed-field list so a rewrite neither creates unwanted indexes nor fails on
-large values. If a later operation fails after earlier per-row
+large values.
+
+The SDK decodes stored integers and doubles to the same JavaScript number and
+writes any integer-valued number back as an integer, so a plain copy would store
+the double `10` as an integer, `1e21` as the integer `1`, and `2 ** 60` as an
+integer the SDK cannot read back. Apply therefore reads each entity with the
+SDK's `wrapNumbers: true` option and writes every property other than the ID
+field with its stored number type: integers stay integers, including those
+outside JavaScript's safe-integer range, and doubles stay doubles, including
+integer-valued ones such as `10`, `1e21`, `2 ** 60`, and `-0`, which it wraps
+with the client's `double()` helper. Preflight rejects a manifest with
+`ActiveTsConfigurationError` before the first transaction if such a value needs
+`double()` and the client has none. Pass the `@google-cloud/datastore` client or
+one whose client and transaction `get()` honor `wrapNumbers`: a client that
+ignores it returns integers as plain numbers, which the helper would write back
+as doubles. The repaired ID field takes the replacement ID in the SDK's
+encoding, so a number ID is stored as an integer. Other SDK conversions still
+apply: a geo point decodes to a plain object and is written back as an embedded
+entity, and a timestamp decodes to a `Date`, which drops digits below a
+millisecond. Migrate kinds with such values separately.
+
+If a later operation fails after earlier per-row
 transactions committed, the helper throws `ActiveTsCommittedTransactionError`;
 its `result` reports processed, repaired, already-repaired, and indeterminate
 counts. A commit RPC can fail after the server committed, so an indeterminate
@@ -657,8 +678,11 @@ and extrema still place such entities below every double. Rewrite every
 existing entity of each affected kind through an adapter with
 `typedNumbers: 'double'` before routing reads to it, for example by reading each
 row and writing it back with `update()` or `bulk.upsertMany()`, and keep every
-writer on the same setting. The ID repair helpers copy raw SDK entities without
-this option, so rewrite the rows they repair as well.
+writer on the same setting. The ID repair helpers keep each stored number's
+type, so a repair neither migrates a row nor undoes its migration. The one
+exception is the ID field a repair rewrites: a number ID is stored as an
+integer, so if the model declares `fieldType()` with `'number'` on its ID
+field, rewrite the rows a repair gives a number ID.
 
 If an ancestor-backed Datastore model declares search indexes, set
 `datastore.ancestorFields` to the payload fields needed by the ancestor resolver.
