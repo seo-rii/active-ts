@@ -266,6 +266,27 @@ buffer mutations, so their options reach the Commit. Explicit transaction
 `native` options win over the provider for the same key. ID inventory and
 repair helpers do not call the provider.
 
+After any failed Commit, a `@google-cloud/datastore` transaction sends its
+own Rollback without call options and rejects `commit()` only once that
+Rollback returns, so it can wait up to the SDK's default 60-second Rollback
+deadline. The adapter takes that Rollback over for transactions and atomic bulk
+mutations: while a Commit runs, it shadows `rollback()` on the transaction
+object it created, so the SDK's call returns without an RPC. After the Commit
+fails, the adapter sends the one Rollback itself, before it retries or reports
+the failure, with the provider's `rollback` options merged under
+`native.rollbackGaxOptions`, in the caller's async context. Commit failures
+keep their classification: `ABORTED` is still retried or reported as a
+conflict, a definitive rejection is still the SDK error, and any other failure
+is still an unknown outcome. A failed Rollback, or a provider that throws for
+it, does not replace the commit error; when the provider throws, the adapter
+skips the Rollback and the transaction expires on the server. A frozen or
+non-extensible transaction object keeps the SDK's own Rollback, without
+options, and the adapter sends none, so a Rollback is never sent twice. A
+client whose `commit()` does not roll back by itself still gets no Rollback
+after a failed Commit. ID repair transactions do not take the Rollback over:
+after a failed repair Commit, the SDK's Rollback does not carry the helper's
+`rollbackGaxOptions`.
+
 Datastore key encoding is selected once per adapter. The default
 `keyEncoding: 'active-ts'` preserves active-ts's canonical physical names:
 numeric `17` is stored as the Datastore name `number:17`, while string `"17"`
