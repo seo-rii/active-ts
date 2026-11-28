@@ -1466,6 +1466,28 @@ if (targets.has('firestore')) {
 			await adapter.delete(aggregateMeta, 1).catch(() => undefined);
 			await adapter.delete(aggregateMeta, 2).catch(() => undefined);
 		}
+		// Firestore `!=` and `in` never match null, while the portable operators
+		// do; the adapter adds an OR with `== null`.
+		try {
+			await adapter.create(nativeMeta, 1, { id: 1, status: 'open' });
+			await adapter.create(nativeMeta, 2, { id: 2, status: null });
+			await adapter.create(nativeMeta, 3, { id: 3, status: 'closed' });
+			await adapter.create(nativeMeta, 4, { id: 4 });
+			const statusIds = async (where) => (await adapter.query(nativeMeta, { where, or: [], sort: [], include: [] }))
+				.list.map((row) => row.id).sort((left, right) => left - right);
+			assert.deepEqual(await statusIds([{ field: 'status', op: '!=', value: 'open' }]), [2, 3]);
+			assert.deepEqual(await statusIds([{ field: 'status', op: 'in', value: ['open', null] }]), [1, 2]);
+			assert.deepEqual(
+				await adapter.aggregate(nativeMeta, {
+					where: [{ field: 'status', op: '!=', value: 'open' }],
+					or: [],
+					aggregates: [{ op: 'count', as: 'count' }]
+				}),
+				{ count: 2 }
+			);
+		} finally {
+			for (const id of [1, 2, 3, 4]) await adapter.delete(nativeMeta, id).catch(() => undefined);
+		}
 		try {
 			await BulkRecord.createMany([
 				{ id: 71, handle: 'created-a', secret: 'alpha' },

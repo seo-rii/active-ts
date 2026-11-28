@@ -809,6 +809,15 @@ injected session implementation does reject `abortTransaction()`, active-ts
 reports `ActiveTsUnknownTransactionOutcomeError` with `phase === "abort"`.
 MongoDB transactions require a replica set or sharded cluster.
 
+Firestore `!=` and `in` filters never match a field whose value is `null`,
+while portable `!=` with a non-null value and `in` lists containing `null` do.
+The Firestore adapter sends those filters as an OR with `== null`, which
+needs the SDK `Filter` class. An adapter that creates its client loads it from
+`@google-cloud/firestore`; with an injected client it uses the installed SDK's
+export, or pass it as the `filter` option alongside `aggregateField`. When no
+`Filter` class is available, those filters are rejected instead of omitting
+null rows. Missing fields still match neither filter.
+
 Firestore adapters expose active-ts transaction support through
 `client.runTransaction()`. Transaction-scoped `get`, `getMany`, `query`,
 `create`, `update`, and `delete` calls run through the SDK transaction object.
