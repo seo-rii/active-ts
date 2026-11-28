@@ -781,6 +781,38 @@ function applyDatastoreWhere(query: any, where: QueryPlan['where'][number]) {
 	return datastoreMethod(query, 'filter', 'Datastore query.filter')(field, where.op, where.value);
 }
 
+// A portable candidate query filters every page in process, so its native
+// filters must only select candidates and never omit a portable match.
+// Datastore orders every integer below every double: a fractional lower bound
+// skips larger integers, and an integer upper bound skips smaller doubles.
+// Widen such bounds to the other representation; the in-process filter
+// applies the exact bound.
+function datastoreCandidateWhere(where: QueryPlan['where'][number]): QueryPlan['where'] {
+	const lower = (value: unknown): QueryPlan['where'][number] | undefined =>
+		typeof value === 'number' && !Number.isInteger(value)
+			? { field: where.field, op: '>=', value: Math.floor(value) }
+			: undefined;
+	// A fractional operand is sent as a double; past 2 ** 52 none is left, so
+	// such an integer upper bound is dropped from the native query.
+	const upper = (value: unknown): QueryPlan['where'] | undefined => {
+		if (typeof value !== 'number' || !Number.isInteger(value)) return undefined;
+		const fractional = value + 0.5;
+		return Number.isInteger(fractional) ? [] : [{ field: where.field, op: '<', value: fractional }];
+	};
+	if (where.op === '>' || where.op === '>=') {
+		const widened = lower(where.value);
+		return widened ? [widened] : [where];
+	}
+	if (where.op === '<' || where.op === '<=') return upper(where.value) ?? [where];
+	if (where.op === 'between') {
+		return [
+			lower(where.value) ?? { field: where.field, op: '>=', value: where.value },
+			...(upper(where.value2) ?? [{ field: where.field, op: '<=', value: where.value2 }])
+		];
+	}
+	return [where];
+}
+
 function datastorePlanNeedsPortableScalarFilter(model: ResolvedModelMeta, plan: Pick<QueryPlan, 'where'>) {
 	for (let index = 0; index < plan.where.length; index++) {
 		const condition = plan.where[index];
@@ -3201,8 +3233,11 @@ function createDatastoreAdapter(
 					'Datastore query'
 				);
 			}
-			for (const where of plan.where)
-				query = normalizeDatastoreQuery(applyDatastoreWhere(query, where), 'Datastore query');
+			for (const where of plan.where) {
+				const nativeWhere = portableScalarFilter ? datastoreCandidateWhere(where) : [where];
+				for (const candidate of nativeWhere)
+					query = normalizeDatastoreQuery(applyDatastoreWhere(query, candidate), 'Datastore query');
+			}
 			// Portable filtering reads every candidate page and sorts in process. A
 			// native order would also drop entities missing an untyped sort field.
 			if (!portableScalarFilter) {

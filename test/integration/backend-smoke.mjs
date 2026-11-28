@@ -763,6 +763,20 @@ if (targets.has('datastore')) {
 	} finally {
 		await adapter.bulk.deleteMany(nativeMeta, [9101, 9102, 9103]).catch(() => undefined);
 	}
+	// Datastore orders every integer below every double. Untyped numeric range
+	// filters only select candidates, so their native bounds must keep both.
+	try {
+		for (const [index, amount] of [1, 1.5, 2, 2.5].entries()) {
+			await adapter.create(nativeMeta, 9201 + index, { id: 9201 + index, amount });
+		}
+		const amounts = async (where) => (await adapter.query(nativeMeta, { where, or: [], sort: [], include: [] }))
+			.list.map((row) => row.amount).sort((left, right) => left - right);
+		assert.deepEqual(await amounts([{ field: 'amount', op: '>', value: 1.2 }]), [1.5, 2, 2.5]);
+		assert.deepEqual(await amounts([{ field: 'amount', op: '<', value: 2 }]), [1, 1.5]);
+		assert.deepEqual(await amounts([{ field: 'amount', op: 'between', value: 1.2, value2: 2 }]), [1.5, 2]);
+	} finally {
+		await adapter.bulk.deleteMany(nativeMeta, [9201, 9202, 9203, 9204]).catch(() => undefined);
+	}
 	try {
 		await diagnosticAdapter.create(nativeMeta, 1, { id: 1, handle: 'native-one', score: 11 });
 		const native = await diagnosticAdapter.query(nativeMeta, {

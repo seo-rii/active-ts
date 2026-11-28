@@ -1362,7 +1362,9 @@ Datastore array properties have different scalar-filter semantics from the
 portable active-ts evaluator. For scalar fields without `fieldType()` metadata,
 the adapter therefore treats native `=`, `in`, `between`, and range filters only
 as candidate selectors, reads every candidate page, applies portable filtering
-and stable sorting, and only then applies `offset` and `limit`. Untyped `!=` and
+and stable sorting, and only then applies `offset` and `limit`. Datastore orders
+every integer below every double, so a candidate's numeric range bounds are
+widened to cover both representations before the exact portable comparison. Untyped `!=` and
 `isNotNull`, and every `isNull`, can require a whole-kind scan because a native
 filter may omit portable matches; these paths require
 `allowQueryScanFallback: true`. All portable post-filter paths reject
