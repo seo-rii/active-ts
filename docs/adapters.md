@@ -21,6 +21,10 @@ After a Firestore adapter starts closing a client it owns, its reads, queries,
 writes and transactions reject immediately: the Firestore SDK otherwise leaves
 reads issued after `terminate()` pending forever.
 
+In Workers, adapters receive an injected client, so `close()` is a no-op there;
+see [closing clients in Workers](workers.md#closing-clients-in-workers) for who
+owns the client and when to close it.
+
 Adapters isolate active-ts from backend SDKs. Applications register adapters in
 an `ActiveContext`; models select adapters by metadata or by context defaults.
 
@@ -266,6 +270,27 @@ options; bulk writes use `save()` and `delete()`. Transaction-scoped writes only
 buffer mutations, so their options reach the Commit. Explicit transaction
 `native` options win over the provider for the same key. ID inventory and
 repair helpers do not call the provider.
+
+After any failed Commit, a `@google-cloud/datastore` transaction sends its
+own Rollback without call options and rejects `commit()` only once that
+Rollback returns, so it can wait up to the SDK's default 60-second Rollback
+deadline. The adapter takes that Rollback over for transactions and atomic bulk
+mutations: while a Commit runs, it shadows `rollback()` on the transaction
+object it created, so the SDK's call returns without an RPC. After the Commit
+fails, the adapter sends the one Rollback itself, before it retries or reports
+the failure, with the provider's `rollback` options merged under
+`native.rollbackGaxOptions`, in the caller's async context. Commit failures
+keep their classification: `ABORTED` is still retried or reported as a
+conflict, a definitive rejection is still the SDK error, and any other failure
+is still an unknown outcome. A failed Rollback, or a provider that throws for
+it, does not replace the commit error; when the provider throws, the adapter
+skips the Rollback and the transaction expires on the server. A frozen or
+non-extensible transaction object keeps the SDK's own Rollback, without
+options, and the adapter sends none, so a Rollback is never sent twice. A
+client whose `commit()` does not roll back by itself still gets no Rollback
+after a failed Commit. ID repair transactions do not take the Rollback over:
+after a failed repair Commit, the SDK's Rollback does not carry the helper's
+`rollbackGaxOptions`.
 
 Datastore key encoding is selected once per adapter. The default
 `keyEncoding: 'active-ts'` preserves active-ts's canonical physical names:
@@ -784,6 +809,15 @@ abort command failures as required by the transactions specification. If an
 injected session implementation does reject `abortTransaction()`, active-ts
 reports `ActiveTsUnknownTransactionOutcomeError` with `phase === "abort"`.
 MongoDB transactions require a replica set or sharded cluster.
+
+Firestore `!=` and `in` filters never match a field whose value is `null`,
+while portable `!=` with a non-null value and `in` lists containing `null` do.
+The Firestore adapter sends those filters as an OR with `== null`, which
+needs the SDK `Filter` class. An adapter that creates its client loads it from
+`@google-cloud/firestore`; with an injected client it uses the installed SDK's
+export, or pass it as the `filter` option alongside `aggregateField`. When no
+`Filter` class is available, those filters are rejected instead of omitting
+null rows. Missing fields still match neither filter.
 
 Firestore adapters expose active-ts transaction support through
 `client.runTransaction()`. Transaction-scoped `get`, `getMany`, `query`,

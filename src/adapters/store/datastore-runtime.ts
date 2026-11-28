@@ -663,6 +663,9 @@ function datastoreProjectionFields(
 	const safeFields = datastoreFieldList(uniqueStrings(fields), context);
 	for (let fieldIndex = 0; fieldIndex < safeFields.length; fieldIndex++) {
 		const field = safeFields[fieldIndex];
+		// A projection returns an embedded property as one flat "a.b" property
+		// instead of a nested value, so dotted paths read the full entity.
+		if (field.includes('.')) return undefined;
 		for (let whereIndex = 0; whereIndex < where.length; whereIndex++) {
 			const condition = where[whereIndex];
 			if (condition.field !== field) continue;
@@ -686,6 +689,62 @@ function datastoreKindName(model: ResolvedModelMeta) {
 	);
 }
 
+const DATASTORE_ENCODED_PROPERTY = { enumerable: true, configurable: true, writable: true } as const;
+
+function isPlainDatastoreRecord(value: object) {
+	const prototype = Object.getPrototypeOf(value);
+	return prototype === Object.prototype || prototype === null;
+}
+
+function encodeDatastoreUnsafeIntegerNumbers(
+	value: unknown,
+	double: ((value: number) => unknown) | undefined,
+	context: string
+): unknown {
+	if (typeof value === 'number') {
+		if (!Number.isInteger(value) || Number.isSafeInteger(value)) return value;
+		if (!double) {
+			throw new ActiveTsValidationError(
+				`${context} contains ${value}, an integer-valued number outside the safe-integer range, which Datastore cannot store exactly without client.double().`
+			);
+		}
+		return double(value);
+	}
+	if (!value || typeof value !== 'object') return value;
+	if (Array.isArray(value)) {
+		let copy: unknown[] | undefined;
+		for (let index = 0; index < value.length; index++) {
+			const item = value[index];
+			const encoded = encodeDatastoreUnsafeIntegerNumbers(item, double, context);
+			if (encoded === item && copy === undefined) continue;
+			if (copy === undefined) {
+				copy = [];
+				for (let previous = 0; previous < index; previous++) copy[previous] = value[previous];
+			}
+			copy[index] = encoded;
+		}
+		return copy ?? value;
+	}
+	if (!isPlainDatastoreRecord(value)) return value;
+	let copy: Record<string, unknown> | undefined;
+	const record = value as Record<string, unknown>;
+	const keys = Object.keys(record);
+	for (let index = 0; index < keys.length; index++) {
+		const key = keys[index];
+		const item = record[key];
+		const encoded = encodeDatastoreUnsafeIntegerNumbers(item, double, context);
+		if (encoded === item) continue;
+		if (copy === undefined) {
+			copy = {};
+			for (let previous = 0; previous < keys.length; previous++) {
+				defineDataProperty(copy, keys[previous], record[keys[previous]], DATASTORE_ENCODED_PROPERTY);
+			}
+		}
+		defineDataProperty(copy, key, encoded, DATASTORE_ENCODED_PROPERTY);
+	}
+	return copy ?? value;
+}
+
 function applyDatastoreWhere(query: any, where: QueryPlan['where'][number]) {
 	const field = assertSafeDatastoreField(where.field, 'Datastore query field');
 	if (where.op === 'in') return datastoreMethod(query, 'filter', 'Datastore query.filter')(field, 'IN', where.value);
@@ -706,6 +765,19 @@ function applyDatastoreWhere(query: any, where: QueryPlan['where'][number]) {
 		throw new ActiveTsConfigurationError(`Datastore adapter does not support ${where.op} queries.`);
 	if (where.op === 'startsWith')
 		throw new ActiveTsConfigurationError('Datastore adapter does not support safe startsWith queries.');
+	if (where.op === '<' || where.op === '<=') {
+		// Datastore orders null below every other value and does not restrict an
+		// upper bound to the operand's type, so `< value` also matches null.
+		// Portable range filters never match null; bound the range from below.
+		return datastoreMethod(
+			normalizeDatastoreQuery(
+				datastoreMethod(query, 'filter', 'Datastore query.filter')(field, '>', null),
+				'Datastore query'
+			),
+			'filter',
+			'Datastore query.filter'
+		)(field, where.op, where.value);
+	}
 	return datastoreMethod(query, 'filter', 'Datastore query.filter')(field, where.op, where.value);
 }
 
@@ -1618,6 +1690,11 @@ function createDatastoreAdapter(
 		const ancestor = datastoreAncestorForWrite(model, id, data, ancestorOverride);
 		return makeEntityKeyFromAncestor(model, id, ancestor);
 	};
+	// The SDK encodes every integer-valued number as a 64-bit integer from its
+	// decimal string, so 1e21 is stored as 1 and 2 ** 60 as a different integer.
+	// Store those numbers as doubles, the exact JavaScript value.
+	const encodeDatastoreValue = (value: unknown, context: string) =>
+		encodeDatastoreUnsafeIntegerNumbers(value, rootClient.double, context);
 	const entityPayloadFromAncestor = (
 		model: ResolvedModelMeta,
 		id: EntityId,
@@ -1627,7 +1704,7 @@ function createDatastoreAdapter(
 		const excludeFromIndexes = datastoreExcludeFromIndexes(model);
 		const entity: { key: unknown; data: any; excludeFromIndexes?: string[] } = {
 			key: makeEntityKeyFromAncestor(model, id, ancestor),
-			data
+			data: encodeDatastoreValue(data, `${model.name} Datastore entity`)
 		};
 		if (excludeFromIndexes) entity.excludeFromIndexes = excludeFromIndexes;
 		return entity;
@@ -2815,6 +2892,8 @@ function createDatastoreAdapter(
 					} catch (error) {
 						if (!started) throw error;
 						if (committing) {
+							await transaction.rollbackAfterFailedCommit(() =>
+								mergeDatastoreGaxOptions(callGaxOptions('rollback'), nativeRollbackGaxOptions));
 							if (isDatastoreAbortedError(error)) {
 								if (attempt < maxAttempts) {
 									await waitForDatastoreTransactionRetry(
@@ -3124,14 +3203,18 @@ function createDatastoreAdapter(
 			}
 			for (const where of plan.where)
 				query = normalizeDatastoreQuery(applyDatastoreWhere(query, where), 'Datastore query');
-			for (const sort of plan.sort)
-				query = normalizeDatastoreQuery(
-					datastoreMethod(query, 'order', 'Datastore query.order')(
-						assertSafeDatastoreField(sort.field, 'Datastore sort field'),
-						{ descending: sort.direction === 'desc' }
-					),
-					'Datastore query'
-				);
+			// Portable filtering reads every candidate page and sorts in process. A
+			// native order would also drop entities missing an untyped sort field.
+			if (!portableScalarFilter) {
+				for (const sort of plan.sort)
+					query = normalizeDatastoreQuery(
+						datastoreMethod(query, 'order', 'Datastore query.order')(
+							assertSafeDatastoreField(sort.field, 'Datastore sort field'),
+							{ descending: sort.direction === 'desc' }
+						),
+						'Datastore query'
+					);
+			}
 			if (keyOnlyProjection)
 				query = normalizeDatastoreQuery(
 					datastoreMethod(query, 'select', 'Datastore query.select')('__key__'),
@@ -3807,6 +3890,7 @@ function createDatastoreAdapter(
 				} catch (error) {
 					if (!started) throw error;
 					if (committing) {
+						await transaction.rollbackAfterFailedCommit(() => callGaxOptions('rollback'));
 						if (isDatastoreAbortedError(error)) throw datastoreTransactionConflict(error);
 						if (isDatastoreDefiniteCommitFailure(error)) throw error;
 						throw markTransactionRollbackSkipped(error);
@@ -4717,6 +4801,7 @@ function normalizeDatastoreClient(client: unknown) {
 	}
 	const key = datastoreMethod(client, 'key', 'Datastore adapter client.key');
 	const int = datastoreOptionalMethod(client, 'int', 'Datastore adapter client.int');
+	const double = datastoreOptionalMethod(client, 'double', 'Datastore adapter client.double');
 	const get = datastoreMethod(client, 'get', 'Datastore adapter client.get');
 	const deleteEntity = datastoreMethod(client, 'delete', 'Datastore adapter client.delete');
 	const createQuery = datastoreMethod(client, 'createQuery', 'Datastore adapter client.createQuery');
@@ -4753,6 +4838,7 @@ function normalizeDatastoreClient(client: unknown) {
 		},
 		key,
 		int,
+		double,
 		get,
 		delete: deleteEntity,
 		createQuery,
@@ -4790,13 +4876,41 @@ function normalizeDatastoreTransaction(transaction: unknown, rootClient: Normali
 	const update = datastoreMethod(transaction, 'update', 'Datastore transaction.update');
 	const upsert = datastoreOptionalMethod(transaction, 'upsert', 'Datastore transaction.upsert')
 		?? datastoreOptionalMethod(transaction, 'save', 'Datastore transaction.save');
+	// Set when the last commit() failed after the SDK asked for its own
+	// Rollback and the adapter took that Rollback over.
+	let rollbackOwed = false;
 	return Object.freeze({
 		run,
-		commit,
+		async commit(...args: unknown[]) {
+			rollbackOwed = false;
+			const restore = deferSdkCommitRollback(transaction, rollback, () => { rollbackOwed = true; });
+			try {
+				const result = await commit(...args);
+				rollbackOwed = false;
+				return result;
+			} finally {
+				restore?.();
+			}
+		},
 		rollback,
+		// Sends the Rollback the SDK asked for after a failed Commit, with the
+		// options gaxOptions() returns when it is sent. Like the SDK's own
+		// rollback, a failure here never replaces the commit error.
+		async rollbackAfterFailedCommit(gaxOptions: () => Record<string, unknown> | undefined) {
+			if (!rollbackOwed) return;
+			rollbackOwed = false;
+			try {
+				const options = gaxOptions();
+				await (options === undefined ? rollback() : rollback(options));
+			} catch {
+				// The commit error stays authoritative; an unsent or failed Rollback
+				// leaves the transaction to expire on the server.
+			}
+		},
 		client: normalizeDatastoreClient({
 			key: rootClient.key,
 			int: rootClient.int,
+			double: rootClient.double,
 			get,
 			delete: deleteEntity,
 			createQuery: createQuery ?? rootClient.createQuery,
@@ -4808,6 +4922,49 @@ function normalizeDatastoreTransaction(transaction: unknown, rootClient: Normali
 			upsert
 		})
 	});
+}
+
+// After any failed Commit, @google-cloud/datastore's Transaction rolls back by
+// itself: its private commit path calls `this.rollback(callback)` and settles
+// commit() only when that Rollback returns. The call has no call options, so it
+// ignores the gaxOptions provider and waits up to the SDK's default Rollback
+// deadline (60 s). While commit() runs, the adapter shadows rollback() on the
+// transaction object it created: the SDK's callback-only call returns at once
+// without an RPC, and the adapter sends that Rollback itself once commit()
+// settles, in the caller's async context. Calls with options still reach the
+// SDK. A transaction that cannot take the shadow (frozen or non-extensible)
+// keeps the SDK's own Rollback, so a Rollback is never sent twice.
+function deferSdkCommitRollback(
+	transaction: object,
+	rollback: (...args: any[]) => any,
+	onDeferred: () => void
+): (() => void) | undefined {
+	const previous = Object.getOwnPropertyDescriptor(transaction, 'rollback');
+	const shadow = function (...args: unknown[]) {
+		if (args.length === 1 && typeof args[0] === 'function') {
+			onDeferred();
+			return (args[0] as () => unknown)();
+		}
+		return rollback(...args);
+	};
+	try {
+		Object.defineProperty(transaction, 'rollback', {
+			value: shadow,
+			enumerable: false,
+			configurable: true,
+			writable: true
+		});
+	} catch {
+		return undefined;
+	}
+	return () => {
+		try {
+			if (previous) Object.defineProperty(transaction, 'rollback', previous);
+			else delete (transaction as { rollback?: unknown }).rollback;
+		} catch {
+			// The transaction is single-use; a shadow left behind is never called again.
+		}
+	};
 }
 
 function createDatastoreTransactionNativeReadClient(client: NormalizedDatastoreClient): NormalizedDatastoreClient {
@@ -4888,6 +5045,7 @@ function createDatastoreTransactionNativeReadClient(client: NormalizedDatastoreC
 	guarded = Object.freeze({
 		key: (...args: any[]) => client.key(...args),
 		int: client.int ? (...args: any[]) => client.int!(...args) : undefined,
+		double: client.double ? (...args: any[]) => client.double!(...args) : undefined,
 		get: (...args: any[]) => trackRead('get', client.get, args),
 		delete: rejectWrite,
 		createQuery: (...args: any[]) => guardBuilder(client.createQuery(...args), 'query'),
