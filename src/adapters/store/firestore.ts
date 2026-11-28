@@ -334,7 +334,14 @@ function assertFirestoreNativeFunction(plan: QueryPlan | AggregatePlan) {
 function assertFirestoreArrayContainsPlan(plan: QueryPlan | AggregatePlan) {
 	let filters = 0;
 	for (let index = 0; index < plan.where.length; index++) {
-		if (plan.where[index].op === 'arrayContains') filters++;
+		if (plan.where[index].op !== 'arrayContains') continue;
+		filters++;
+		// The SDK accepts only == and != comparisons with null.
+		if (plan.where[index].value === null) {
+			throw new ActiveTsConfigurationError(
+				`Firestore adapter does not support arrayContains null on "${plan.where[index].field}".`
+			);
+		}
 	}
 	if (filters <= 1) return;
 	throw new ActiveTsConfigurationError(
