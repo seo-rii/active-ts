@@ -1014,7 +1014,7 @@ test('built-in store adapters normalize direct query plans before backend calls'
 	});
 	assert.deepEqual(
 		await datastore.query(meta, { ...emptyPlan, select: ['profile.name'] } as any),
-		{ list: [], more: false }
+		{ list: [], count: 0, more: false }
 	);
 	assert.equal(datastore.capabilities?.nestedFields, true);
 	assert.equal(datastoreQueries, 1);

@@ -2642,7 +2642,7 @@ function createDatastoreAdapter(
 										`${model.name} datastore transaction query row`
 									);
 								}
-								const result: QueryResult = { list: rows, more };
+								const result: QueryResult = { list: rows, count: rows.length, more };
 								if (WEAKSET_HAS.call(DATASTORE_SCAN_FALLBACK_INCOMPLETE_RESULTS, base)) {
 									WEAKSET_ADD.call(DATASTORE_SCAN_FALLBACK_INCOMPLETE_RESULTS, result);
 								}
@@ -3188,6 +3188,7 @@ function createDatastoreAdapter(
 				}
 				const result: QueryResult = {
 					list: rows,
+					count: rows.length,
 					more
 				};
 				if (scanResult.incomplete) {
@@ -3352,7 +3353,7 @@ function createDatastoreAdapter(
 							`Datastore query result[${index}]`
 						);
 					}
-					return { list: rows, more };
+					return { list: rows, count: rows.length, more };
 				}
 				const result = datastoreResultTuple(
 				await runDatastoreRead(
@@ -3419,6 +3420,7 @@ function createDatastoreAdapter(
 			}
 			return {
 				list: rows,
+				count: rows.length,
 				...('cursor' in page && page.cursor !== undefined ? { cursor: page.cursor } : {}),
 				more: page.more
 			};

@@ -1438,7 +1438,7 @@ test('Datastore ancestor-transaction mode rejects unscoped portable transaction 
 			meta: { datastoreAncestor: parent }
 		})
 	);
-	assert.deepEqual(result, { list: [{ id: 1, parentId: 10, handle: 'scoped' }], more: false });
+	assert.deepEqual(result, { list: [{ id: 1, parentId: 10, handle: 'scoped' }], count: 1, more: false });
 	assert.equal(calls.includes('runQuery'), true);
 	assert.equal(
 		calls.includes('hasAncestor:{"input":{"path":["parent_record","number:10"]}}'),
@@ -2310,6 +2310,7 @@ test('Datastore transaction queries wait for earlier buffered mutations', async 
 		await create;
 		assert.deepEqual(await query, {
 			list: [{ id: 1, handle: 'created' }],
+			count: 1,
 			more: false
 		});
 		await assert.rejects(
@@ -2519,6 +2520,7 @@ test('Datastore transaction queries and aggregates include buffered writes', asy
 					{ id: 1, handle: 'updated', score: 30 },
 					{ id: 3, handle: 'created', score: 40 }
 				],
+				count: 2,
 				more: false
 			}
 		);
@@ -2605,6 +2607,7 @@ test('Datastore transaction query overlay preserves encoded field-codec predicat
 	await datastore.transaction!(async (tx) => {
 		assert.deepEqual(await tx.query(codecMeta, queryPlan), {
 			list: [{ id: 1, handle: 'stored:alpha' }],
+			count: 1,
 			more: false
 		});
 		assert.deepEqual(await tx.aggregate!(codecMeta, aggregatePlan), { count: 1 });
@@ -2662,6 +2665,7 @@ test('Datastore transaction scoped ancestor overlay matches adapter namespaces',
 			}),
 			{
 				list: [{ id: 1, parentId: 10, handle: 'created' }],
+				count: 1,
 				more: false
 			}
 		);
@@ -2726,6 +2730,7 @@ test('Datastore transaction scoped ancestor overlay applies adapter namespace be
 			}),
 			{
 				list: [{ id: 1, parentId: 10, handle: 'created' }],
+				count: 1,
 				more: false
 			}
 		);
@@ -2785,7 +2790,7 @@ test('Datastore transaction scoped ancestor overlay keeps explicit namespaces is
 				include: [],
 				meta: { datastoreAncestor: tenantParent }
 			}),
-			{ list: [], more: false }
+			{ list: [], count: 0, more: false }
 		);
 	});
 });
@@ -2970,6 +2975,7 @@ test('Datastore transaction root ancestor overlay preserves descendant identitie
 					{ id: 5, rootId: 1, childId: 10, handle: 'left-updated', score: 30 },
 					{ id: 6, rootId: 1, childId: 12, handle: 'created', score: 40 }
 				],
+				count: 2,
 				more: false
 			}
 		);
@@ -3153,6 +3159,7 @@ test('Datastore transaction unscoped ancestor queries preserve ancestor identiti
 					{ id: 5, parentId: 10, handle: 'left-updated', score: 30 },
 					{ id: 6, parentId: 12, handle: 'created', score: 40 }
 				],
+				count: 2,
 				more: false
 			}
 		);
@@ -3222,7 +3229,7 @@ test('Datastore transaction root overlays hide plain model manual ancestor write
 				sort: [],
 				include: []
 			}),
-			{ list: [], more: false }
+			{ list: [], count: 0, more: false }
 		);
 		assert.deepEqual(
 			await tx.aggregate!(typedMeta, {
@@ -3245,6 +3252,7 @@ test('Datastore transaction root overlays hide plain model manual ancestor write
 					{ id: 7, handle: 'manual-ancestor', score: 33 },
 					{ id: 8, handle: 'manual-update', score: 44 }
 				],
+				count: 2,
 				more: false
 			}
 		);
@@ -3378,7 +3386,7 @@ test('Datastore transaction explicit ancestor deletes hide persisted rows withou
 				include: [],
 				meta: { datastoreAncestor: manualParent }
 			}),
-			{ list: [], more: false }
+			{ list: [], count: 0, more: false }
 		);
 	});
 });
@@ -3435,7 +3443,7 @@ test('Datastore transaction explicit ancestor deletes hide keyed persisted rows 
 				include: [],
 				meta: { datastoreAncestor: manualParent }
 			}),
-			{ list: [], more: false }
+			{ list: [], count: 0, more: false }
 		);
 	});
 });
@@ -3543,6 +3551,7 @@ test('Datastore transaction scoped ancestor field-codec rows decode ancestor fie
 			}),
 			{
 				list: [row],
+				count: 1,
 				more: false
 			}
 		);
@@ -3752,6 +3761,7 @@ test('Datastore transaction unscoped ancestor field-codec rows use key metadata 
 			}),
 			{
 				list: [{ id: 1, parentId: 'parent:10', handle: 'stored' }],
+				count: 1,
 				more: false
 			}
 		);
@@ -3858,6 +3868,7 @@ test('Datastore transaction selected projections preserve entity key identity', 
 		});
 		assert.deepEqual(result, {
 			list: [{ id: 1, handle: 'stored' }],
+			count: 1,
 			more: false
 		});
 
@@ -3927,6 +3938,7 @@ test('Datastore transaction selected projections preserve buffered mutation iden
 		});
 		assert.deepEqual(result, {
 			list: [{ id: 1, handle: 'buffered' }],
+			count: 1,
 			more: false
 		});
 
@@ -4655,6 +4667,7 @@ test('Datastore transaction buffered writes ignore stale entity key markers when
 			scopedResult,
 			{
 				list: [{ id: 15, parentId: 10, handle: 'buffered-stale-key' }],
+				count: 1,
 				more: false
 			}
 		);
@@ -4674,7 +4687,7 @@ test('Datastore transaction buffered writes ignore stale entity key markers when
 				include: [],
 				meta: { datastoreAncestor: staleParent }
 			}),
-			{ list: [], more: false }
+			{ list: [], count: 0, more: false }
 		);
 	});
 });
@@ -4727,6 +4740,7 @@ test('Datastore transaction buffered writes ignore stale entity key markers when
 		});
 		assert.deepEqual(result, {
 			list: [{ id: 1, parentId: 11, handle: 'updated' }],
+			count: 1,
 			more: false
 		});
 		const descriptor = Object.getOwnPropertyDescriptor(result.list[0], ACTIVE_TS_ENTITY_KEY);
@@ -6214,6 +6228,7 @@ test('Datastore native key encoding preserves numeric ids, string names, and log
 				{ id: 17, handle: 'numeric' },
 				{ id: '17', handle: 'string' }
 			],
+			count: 2,
 			more: false
 		}
 	);
@@ -8273,7 +8288,7 @@ test('Datastore scoped full rows reject keyless payload ancestors outside scoped
 			select: ['handle'],
 			meta: { datastoreAncestor: scopedAncestor }
 		}),
-		{ list: [{ id: 1, handle: 'partial' }], more: false }
+		{ list: [{ id: 1, handle: 'partial' }], count: 1, more: false }
 	);
 });
 
@@ -8512,7 +8527,7 @@ test('Datastore scoped projection rows reject selected payload ancestors outside
 			select: ['handle'],
 			meta: { datastoreAncestor: scopedAncestor }
 		}),
-		{ list: [{ id: 1, handle: 'partial-selected-row' }], more: false }
+		{ list: [{ id: 1, handle: 'partial-selected-row' }], count: 1, more: false }
 	);
 });
 
@@ -8898,7 +8913,7 @@ test('Datastore scoped keyless payload validation decodes ancestor field codecs'
 			include: [],
 			meta: { datastoreAncestor: scopedAncestor }
 		}),
-		{ list: [row], more: false }
+		{ list: [row], count: 1, more: false }
 	);
 	assert.deepEqual(
 		await datastore.query(meta, {
@@ -8908,7 +8923,7 @@ test('Datastore scoped keyless payload validation decodes ancestor field codecs'
 			include: [],
 			meta: { datastoreAncestor: scopedAncestor }
 		}),
-		{ list: [row], more: false }
+		{ list: [row], count: 1, more: false }
 	);
 	assert.deepEqual(
 		await datastore.aggregate!(meta, {
@@ -9059,7 +9074,7 @@ test('Datastore scoped reads decode field-codec ancestor payloads without ancest
 
 	assert.deepEqual(await datastore.get(meta, 1, { meta: { datastoreAncestor: scopedAncestor } }), row);
 	assert.deepEqual(await datastore.getMany(meta, [1], { meta: { datastoreAncestor: scopedAncestor } }), [row]);
-	assert.deepEqual(await datastore.query(meta, plan), { list: [row], more: false });
+	assert.deepEqual(await datastore.query(meta, plan), { list: [row], count: 1, more: false });
 });
 
 test('Datastore context store results decode nested ancestor field codecs', async () => {
@@ -12634,6 +12649,7 @@ test('Datastore query scan fallback handles emulator unsupported not-equal filte
 			{ id: 1, handle: 'one' },
 			{ id: 4, handle: 'four' }
 		],
+		count: 2,
 		more: false
 	});
 	assert.deepEqual(calls, ['createQuery', 'limit:500', 'runQuery']);
@@ -12683,6 +12699,7 @@ test('Datastore query scan fallback permits in-memory sort plans rejected by Goo
 
 	assert.deepEqual(result, {
 		list: [{ id: 2, handle: 'alpha', optionalMarker: 'set', score: 20 }],
+		count: 1,
 		more: true
 	});
 	const offsetResult = await datastore.query(meta, {
@@ -12695,6 +12712,7 @@ test('Datastore query scan fallback permits in-memory sort plans rejected by Goo
 	});
 	assert.deepEqual(offsetResult, {
 		list: [{ id: 1, handle: 'zeta', optionalMarker: 'set', score: 10 }],
+		count: 1,
 		more: false
 	});
 	assert.deepEqual(calls, [
@@ -12772,6 +12790,7 @@ test('Datastore transaction query scan fallback permits in-memory sort plans rej
 
 	assert.deepEqual(result, {
 		list: [{ id: 2, handle: 'alpha', optionalMarker: 'set', score: 20 }],
+		count: 1,
 		more: true
 	});
 	assert.deepEqual(calls, ['tx.run', 'root.createQuery', 'limit:500', 'tx.runQuery', 'tx.commit']);
@@ -12832,6 +12851,7 @@ test('Datastore query scan fallback reads all pages before filtering and aggrega
 			{ id: 3, handle: 'three' },
 			{ id: 4, handle: 'four' }
 		],
+		count: 2,
 		more: false
 	});
 	assert.deepEqual(calls, ['createQuery', 'limit:500', 'runQuery:0', 'start:cursor-1', 'runQuery:1']);
@@ -12891,7 +12911,7 @@ test('Datastore query scan fallback stops before duplicating repeated cursors', 
 	});
 
 	assert.deepEqual(Object.getOwnPropertySymbols(result), []);
-	assert.deepEqual(result, { list: [{ id: 1, handle: 'page', optionalMarker: 'set' }], more: true });
+	assert.deepEqual(result, { list: [{ id: 1, handle: 'page', optionalMarker: 'set' }], count: 1, more: true });
 	assert.deepEqual(calls, ['createQuery', 'limit:500', 'runQuery:0', 'start:same-cursor', 'runQuery:1']);
 });
 
@@ -12938,6 +12958,7 @@ test('Datastore query scan fallback limit does not pad incomplete scans', async 
 
 	assert.deepEqual(result, {
 		list: [{ id: 1, handle: 'one', optionalMarker: 'set', score: 10 }],
+		count: 1,
 		more: true
 	});
 	assert.deepEqual(calls, ['createQuery', 'limit:500', 'runQuery:0', 'start:same-cursor', 'runQuery:1']);
@@ -13000,7 +13021,7 @@ test('Datastore transaction query scan fallback surfaces incomplete repeated-cur
 	);
 
 	assert.deepEqual(Object.getOwnPropertySymbols(result), []);
-	assert.deepEqual(result, { list: [{ id: 1, handle: 'page', optionalMarker: 'set' }], more: true });
+	assert.deepEqual(result, { list: [{ id: 1, handle: 'page', optionalMarker: 'set' }], count: 1, more: true });
 	assert.deepEqual(calls, [
 		'tx.run',
 		'createQuery',
@@ -17235,7 +17256,7 @@ test('Datastore adapter snapshots client methods at creation', async () => {
 			include: [],
 			limit: 1
 		}),
-		{ list: [], more: false }
+		{ list: [], count: 0, more: false }
 	);
 	assert.deepEqual(calls, [
 		'key:google_regression_record/number:1',
@@ -17266,7 +17287,7 @@ test('Datastore adapter ignores inherited query result metadata', async () => {
 				sort: [],
 				include: []
 			}),
-			{ list: [], more: false }
+			{ list: [], count: 0, more: false }
 		);
 	} finally {
 		delete (Object.prototype as Record<string, unknown>).moreResults;
@@ -17539,7 +17560,7 @@ test('Datastore adapter snapshots backend result arrays before iteration', async
 			sort: [],
 			include: []
 		}),
-		{ list: [{ id: 2, handle: 'two' }], more: false }
+		{ list: [{ id: 2, handle: 'two' }], count: 1, more: false }
 	);
 	assert.equal(mapCalls, 0);
 });
