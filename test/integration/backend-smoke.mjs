@@ -747,6 +747,105 @@ if (targets.has('datastore')) {
 	} finally {
 		await adapter.delete(nativeMeta, 9002).catch(() => undefined);
 	}
+	// Datastore orders every integer below every double, and the SDK writes 10 as
+	// an integer and 9.99 as a double. typedNumbers: 'double' stores and queries
+	// every typed number value as a double; the default keeps the SDK encoding.
+	{
+		const typedNumberKind = `integration_datastore_typed_numbers_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
+		class IntegrationDatastoreTypedNumberRecord extends Model {}
+		defineModel({ name: typedNumberKind })
+			.id('id')
+			.fieldType('price', 'number')
+			.fieldType('metrics.score', 'number')
+			.validate((input) => input)
+			.attach(IntegrationDatastoreTypedNumberRecord);
+		const typedNumberMeta = createActiveTs({ stores: { default: adapter } }).meta(IntegrationDatastoreTypedNumberRecord);
+		const typedNumberRows = [
+			{ id: 1, price: 10, metrics: { score: 10 } },
+			{ id: 2, price: 11.5, metrics: { score: 11.5 } },
+			{ id: 3, price: 9.99, metrics: { score: 9.99 } }
+		];
+		const priceAbove = (field, extra = {}) => ({
+			where: [{ field, op: '>', value: 9.5 }], or: [], sort: [{ field, direction: 'asc' }], include: [], ...extra
+		});
+		const rawPriceIds = async (value) => {
+			const [entities] = await client.runQuery(client.createQuery(namespace, typedNumberKind).filter('price', '=', value));
+			return entities.map((entity) => entity.id).sort();
+		};
+		// Neither adapter enables aggregate scan fallback, so min/max are native lookups.
+		const sdkAdapter = await createDatastoreStoreAdapter({ datastoreOptions: { projectId: googleProjectId }, namespace });
+		const doubleFactory = await createDatastoreNamespaceStoreFactory({
+			datastoreOptions: { projectId: googleProjectId },
+			typedNumbers: 'double'
+		});
+		const doubleAdapter = await doubleFactory.forNamespace(namespace);
+		try {
+			// Default encoding: the integer row still matches an integer operand and
+			// sorts below every double, as documented.
+			for (const row of typedNumberRows) await sdkAdapter.create(typedNumberMeta, row.id, row);
+			assert.deepEqual(await rawPriceIds(10), [1]);
+			assert.deepEqual((await sdkAdapter.query(typedNumberMeta, {
+				where: [{ field: 'price', op: '=', value: 10 }], or: [], sort: [], include: []
+			})).list.map((row) => row.id), [1]);
+			assert.deepEqual((await sdkAdapter.query(typedNumberMeta, priceAbove('price'))).list.map((row) => row.price), [9.99, 11.5]);
+			assert.equal((await sdkAdapter.aggregate(typedNumberMeta, {
+				where: [{ field: 'price', op: '>', value: 9 }], or: [], aggregates: [{ op: 'min', field: 'price', as: 'minimum' }]
+			})).minimum, 10);
+			await sdkAdapter.bulk.deleteMany(typedNumberMeta, typedNumberRows.map((row) => row.id));
+
+			for (const row of typedNumberRows) await doubleAdapter.create(typedNumberMeta, row.id, row);
+			assert.deepEqual(await rawPriceIds(10), [], 'the integer-valued price is stored as a double');
+			assert.deepEqual(await rawPriceIds(client.double(10)), [1]);
+			const stored = await doubleAdapter.get(typedNumberMeta, 1);
+			assert.deepEqual(stored, typedNumberRows[0]);
+			assert.equal(typeof stored.price, 'number');
+			for (const field of ['price', 'metrics.score']) {
+				const sorted = await doubleAdapter.query(typedNumberMeta, priceAbove(field));
+				assert.deepEqual(sorted.list.map((row) => row.price), [9.99, 10, 11.5], field);
+			}
+			assert.deepEqual((await doubleAdapter.query(typedNumberMeta, {
+				...priceAbove('price'), sort: [{ field: 'price', direction: 'desc' }]
+			})).list.map((row) => row.price), [11.5, 10, 9.99]);
+			// The legacy emulator rejects native != and IN filters and aggregation
+			// queries; unit tests cover those operands.
+			for (const [where, ids] of [
+				[{ field: 'price', op: '=', value: 10 }, [1]],
+				[{ field: 'price', op: '<', value: 10 }, [3]],
+				[{ field: 'price', op: '<=', value: 10 }, [1, 3]],
+				[{ field: 'price', op: '>=', value: 10 }, [1, 2]],
+				[{ field: 'price', op: 'between', value: 9.9, value2: 10 }, [1, 3]]
+			]) {
+				const result = await doubleAdapter.query(typedNumberMeta, { where: [where], or: [], sort: [], include: [] });
+				assert.deepEqual(result.list.map((row) => row.id).sort(), ids, JSON.stringify(where));
+			}
+			for (const [op, expected] of [['min', 9.99], ['max', 11.5]]) {
+				const result = await doubleAdapter.aggregate(typedNumberMeta, {
+					where: [{ field: 'price', op: '>', value: 9.5 }], or: [], aggregates: [{ op, field: 'price', as: 'value' }]
+				});
+				assert.equal(result.value, expected, op);
+			}
+			const paged = [];
+			let cursor;
+			for (let page = 0; page < 5; page++) {
+				const result = await doubleAdapter.query(typedNumberMeta, priceAbove('price', { limit: 1, ...(cursor ? { cursor } : {}) }));
+				paged.push(...result.list.map((row) => row.price));
+				if (!result.more) break;
+				assert.ok(result.cursor);
+				cursor = result.cursor;
+			}
+			assert.deepEqual(paged, [9.99, 10, 11.5]);
+			const firstPage = await doubleAdapter.query(typedNumberMeta, priceAbove('price', { limit: 1 }));
+			await assert.rejects(() => sdkAdapter.query(typedNumberMeta, priceAbove('price', { limit: 1, cursor: firstPage.cursor })));
+			await doubleAdapter.transaction(async (tx) => {
+				await tx.update(typedNumberMeta, 2, { id: 2, price: 12, metrics: { score: 12 } });
+			});
+			assert.deepEqual(await rawPriceIds(client.double(12)), [2]);
+		} finally {
+			await doubleAdapter.bulk.deleteMany(typedNumberMeta, typedNumberRows.map((row) => row.id)).catch(() => undefined);
+			await doubleFactory.close();
+			await sdkAdapter.close();
+		}
+	}
 	// Untyped filters are applied in process over every candidate page. A native
 	// order on an untyped sort field would drop entities that lack it.
 	try {

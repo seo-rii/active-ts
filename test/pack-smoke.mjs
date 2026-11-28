@@ -409,7 +409,8 @@ import {
 	type DatastoreStoreAdapter,
 	type DatastoreStoreTransactionOptions,
 	type DatastoreTransactionOptions,
-	type DatastoreTransactionNativeOptions
+	type DatastoreTransactionNativeOptions,
+	type DatastoreTypedNumberEncoding
 } from 'active-ts/adapters/store/datastore';
 import type { FirestoreStoreOptions, FirestoreTransactionNativeOptions } from 'active-ts/adapters/store/firestore';
 import { createRedisValkeyCacheAdapter, type RedisValkeyOptions } from 'active-ts/adapters/cache/redis-valkey';
@@ -717,6 +718,8 @@ const packedDefaultNamespaceStorePromise: Promise<StoreAdapter> = packedDatastor
 // @ts-expect-error namespace selection belongs to forNamespace().
 const invalidDatastoreNamespaceFactoryOptions: DatastoreNamespaceStoreFactoryOptions = { namespace: 'fixed' };
 const datastoreKeyEncoding: DatastoreKeyEncoding = 'native';
+const datastoreTypedNumbers: DatastoreTypedNumberEncoding = 'double';
+const datastoreTypedNumberOptions = { typedNumbers: datastoreTypedNumbers } satisfies DatastoreStoreOptions;
 const datastoreInventoryOptions = {
 	client: {
 		createQuery: () => ({ limit() { return this; } }),
@@ -911,6 +914,7 @@ void datastoreNamespaceFactoryPromise;
 void packedNamespaceStorePromise;
 void invalidDatastoreNamespaceFactoryOptions;
 void datastoreKeyEncoding;
+void datastoreTypedNumberOptions;
 void packedInt64Id;
 void packedSubpathInt64Id;
 void packedInt64Decimal;
