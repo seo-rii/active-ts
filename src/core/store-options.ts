@@ -329,12 +329,14 @@ export function normalizeStoreQueryPlan(
 		native: normalizeStoreNative(ownOptionValue(record, 'native'), `${context}.native`),
 		meta: normalizePlanMeta(ownOptionValue(record, 'meta'), `${context}.meta`)
 	});
-	appendStableLimitSort(normalized, idField);
+	appendStablePageSort(normalized, idField);
 	return copyFieldCodecQueryOperandMarker(plan, normalized);
 }
 
-function appendStableLimitSort(plan: QueryPlan, idField: string) {
-	if (plan.limit === undefined || !plan.sort.length) return;
+// A limit or an offset makes the page boundary depend on how ties are
+// ordered, so sorted pages break ties by id like the memory store does.
+function appendStablePageSort(plan: QueryPlan, idField: string) {
+	if ((plan.limit === undefined && plan.offset === undefined) || !plan.sort.length) return;
 	for (let index = 0; index < plan.sort.length; index++) {
 		if (plan.sort[index].field === idField) return;
 	}
