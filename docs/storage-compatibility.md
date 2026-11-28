@@ -57,7 +57,12 @@ preserves those values and its native key identity. Adapter `update()` and bulk
 upsert write complete entity payloads; they do not fetch and merge omitted
 fields. Undefined object properties are omitted, while explicit `null` is stored.
 Raw binary values are rejected by the portable write contract; configure a
-field codec before saving entities containing blobs. A readable legacy entity
+field codec before saving entities containing blobs. Integer-valued numbers
+outside JavaScript's safe-integer range, such as `1e21` or `2 ** 60`, are
+written as Datastore doubles so they read back unchanged; the SDK would send
+them as 64-bit integers parsed from their decimal text. An injected client
+must expose the SDK's `double()` helper to write them, otherwise the write is
+rejected before any SDK call. A readable legacy entity
 is not automatically writable under the portable contract.
 
 Model validators and pruning remain application-controlled transformations.

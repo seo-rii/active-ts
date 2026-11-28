@@ -82,6 +82,8 @@ export type FirestoreStoreOptions = {
 	client?: any;
 	firestoreOptions?: Record<string, any>;
 	aggregateField?: any;
+	/** The SDK `Filter` class. Defaults to the installed `@google-cloud/firestore` export. */
+	filter?: any;
 	allowAggregateScanFallback?: boolean;
 	cacheScope?: string;
 };
@@ -90,7 +92,7 @@ export type FirestoreTransactionNativeOptions = {
 	readTime?: unknown;
 	maxAttempts?: number;
 };
-const FIRESTORE_OPTION_KEYS = ['client', 'firestoreOptions', 'aggregateField', 'allowAggregateScanFallback', 'cacheScope'] as const;
+const FIRESTORE_OPTION_KEYS = ['client', 'firestoreOptions', 'aggregateField', 'filter', 'allowAggregateScanFallback', 'cacheScope'] as const;
 const FIRESTORE_TRANSACTION_NATIVE_OPTION_KEYS = ['readOnly', 'readTime', 'maxAttempts'] as const;
 type FirestoreTransactionMutation =
 	| { operation: 'create' | 'update'; data: Record<string, unknown> }
@@ -212,8 +214,51 @@ function firestoreDocumentId(id: EntityId) {
 	return `${FIRESTORE_TYPED_ID_PREFIX}${Buffer.from(key, 'utf8').toString('base64url')}`;
 }
 
-function applyFirestoreWhere(query: any, where: QueryPlan['where'][number]) {
+type FirestoreFilterFactory = ReturnType<typeof normalizeFirestoreFilter>;
+
+// Firestore `!=` and `in` never match null, while portable `!= value` and
+// `in [..., null]` do. Express the portable filter as an OR with `== null`.
+function firestoreNullableFilter(
+	where: QueryPlan['where'][number],
+	field: string,
+	nullFreeField: string | undefined
+): { op: '!=' | 'in'; value: unknown; matchesNull: boolean } | undefined {
+	if (where.op === '!=' && where.value !== null) {
+		return { op: '!=', value: where.value, matchesNull: field !== nullFreeField };
+	}
+	if (where.op !== 'in' || !Array.isArray(where.value)) return undefined;
+	const values: unknown[] = [];
+	let matchesNull = false;
+	for (let index = 0; index < where.value.length; index++) {
+		if (where.value[index] === null) matchesNull = true;
+		else values[values.length] = where.value[index];
+	}
+	if (!matchesNull) return undefined;
+	return { op: 'in', value: values, matchesNull: field !== nullFreeField || values.length === 0 };
+}
+
+function applyFirestoreWhere(
+	query: any,
+	where: QueryPlan['where'][number],
+	filterFactory: FirestoreFilterFactory | undefined,
+	nullFreeField?: string
+) {
 	const field = assertSafeFirestoreField(where.field, 'Firestore query field');
+	const nullable = firestoreNullableFilter(where, field, nullFreeField);
+	if (nullable) {
+		const whereMethod = firestoreMethod(query, 'where', 'Firestore query.where');
+		if (!nullable.matchesNull) return whereMethod(field, nullable.op, nullable.value);
+		if (nullable.op === 'in' && !(nullable.value as unknown[]).length) return whereMethod(field, '==', null);
+		if (!filterFactory) {
+			throw new ActiveTsConfigurationError(
+				`Firestore portable "${where.op}" on "${field}" must also match null values, which requires the SDK Filter class. Pass it as the filter adapter option.`
+			);
+		}
+		return whereMethod(filterFactory.or(
+			filterFactory.where(field, nullable.op, nullable.value),
+			filterFactory.where(field, '==', null)
+		));
+	}
 	if (where.op === 'between')
 		return firestoreMethod(
 			normalizeFirestoreObject(
@@ -334,7 +379,14 @@ function assertFirestoreNativeFunction(plan: QueryPlan | AggregatePlan) {
 function assertFirestoreArrayContainsPlan(plan: QueryPlan | AggregatePlan) {
 	let filters = 0;
 	for (let index = 0; index < plan.where.length; index++) {
-		if (plan.where[index].op === 'arrayContains') filters++;
+		if (plan.where[index].op !== 'arrayContains') continue;
+		filters++;
+		// The SDK accepts only == and != comparisons with null.
+		if (plan.where[index].value === null) {
+			throw new ActiveTsConfigurationError(
+				`Firestore adapter does not support arrayContains null on "${plan.where[index].field}".`
+			);
+		}
 	}
 	if (filters <= 1) return;
 	throw new ActiveTsConfigurationError(
@@ -354,12 +406,19 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 	options = validateFirestoreOptions(options);
 	let client = options.client;
 	let AggregateField = options.aggregateField;
+	let FilterClass = options.filter;
 	const allowAggregateScanFallback = options.allowAggregateScanFallback === true;
 	if (!client) {
 		const mod = await optionalImport('@google-cloud/firestore', 'FirestoreStoreAdapter');
 		const Firestore = mod.Firestore;
 		client = new Firestore(options.firestoreOptions ?? {});
 		AggregateField ??= mod.AggregateField;
+		FilterClass ??= mod.Filter;
+	} else if (FilterClass === undefined) {
+		// An injected client normally comes from the installed SDK; without it,
+		// filters that need an OR are rejected when they are used.
+		FilterClass = await optionalImport('@google-cloud/firestore', 'FirestoreStoreAdapter')
+			.then((mod) => mod.Filter, () => undefined);
 	}
 	const rawClient = client;
 	// After terminate(), the Firestore SDK leaves reads pending forever (they
@@ -379,6 +438,7 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 	};
 	client = normalizeFirestoreClient(client);
 	AggregateField = AggregateField === undefined ? undefined : normalizeFirestoreAggregateField(AggregateField);
+	const filterFactory = FilterClass === undefined ? undefined : normalizeFirestoreFilter(FilterClass);
 
 	const adapter: StoreAdapter = {
 		kind: 'firestore',
@@ -498,7 +558,7 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 				`Firestore collection "${model.name}"`
 			);
 			for (const where of plan.where)
-				query = normalizeFirestoreObject(applyFirestoreWhere(query, where), 'Firestore query');
+				query = normalizeFirestoreObject(applyFirestoreWhere(query, where, filterFactory), 'Firestore query');
 			for (const sort of plan.sort)
 				query = normalizeFirestoreObject(
 					firestoreMethod(query, 'orderBy', 'Firestore query.orderBy')(
@@ -575,8 +635,16 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 				client.collection(assertSafeFirestoreCollectionName(model.name)),
 				`Firestore collection "${model.name}"`
 			);
+			// min/max ignore null values, so a filter on the aggregate field itself
+			// keeps Firestore's null-excluding semantics.
+			const minMaxField = specs.length === 1 && (specs[0].op === 'min' || specs[0].op === 'max')
+				? specs[0].field
+				: undefined;
 			for (const where of plan.where) {
-				query = normalizeFirestoreObject(applyFirestoreWhere(query, where), 'Firestore query');
+				query = normalizeFirestoreObject(
+					applyFirestoreWhere(query, where, filterFactory, minMaxField),
+					'Firestore query'
+				);
 			}
 			// Firestore sum/avg silently omit nonnumeric rows; combining fields also
 			// intersects their document sets. Only count has portable native semantics.
@@ -964,7 +1032,7 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 						assertFirestoreQueryLimits(plan);
 						assertGoogleInequalitySortOrder('Firestore', plan, 'orderBy');
 						assertGoogleSortableFieldsDeclared('Firestore', model, plan, 'orderBy');
-						const query = firestoreQueryForPlan(client, model, plan);
+						const query = firestoreQueryForPlan(client, model, plan, filterFactory);
 						await waitForBufferedMutations();
 						assertSdkReadAllowed('query');
 						const snap = normalizeFirestoreObject(
@@ -1229,14 +1297,15 @@ function assertFirestoreSchemaModelsSupported(models: ResolvedModelMeta[]) {
 function firestoreQueryForPlan(
 	client: ReturnType<typeof normalizeFirestoreClient>,
 	model: ResolvedModelMeta,
-	plan: QueryPlan
+	plan: QueryPlan,
+	filterFactory: FirestoreFilterFactory | undefined
 ) {
 	let query: any = normalizeFirestoreObject(
 		client.collection(assertSafeFirestoreCollectionName(model.name)),
 		`Firestore collection "${model.name}"`
 	);
 	for (const where of plan.where)
-		query = normalizeFirestoreObject(applyFirestoreWhere(query, where), 'Firestore query');
+		query = normalizeFirestoreObject(applyFirestoreWhere(query, where, filterFactory), 'Firestore query');
 	for (const sort of plan.sort)
 		query = normalizeFirestoreObject(
 			firestoreMethod(query, 'orderBy', 'Firestore query.orderBy')(
@@ -1302,6 +1371,7 @@ function validateFirestoreOptions(options: FirestoreStoreOptions) {
 	const firestoreOptions = ownFactoryOptionValue(record, 'firestoreOptions', 'Firestore adapter option');
 	const client = ownFactoryOptionValue(record, 'client', 'Firestore adapter option');
 	const aggregateField = ownFactoryOptionValue(record, 'aggregateField', 'Firestore adapter option');
+	const filter = ownFactoryOptionValue(record, 'filter', 'Firestore adapter option');
 	const allowAggregateScanFallback = ownFactoryOptionValue(record, 'allowAggregateScanFallback', 'Firestore adapter option');
 	const cacheScope = ownFactoryOptionValue(record, 'cacheScope', 'Firestore adapter option');
 	const safeFirestoreOptions =
@@ -1313,6 +1383,9 @@ function validateFirestoreOptions(options: FirestoreStoreOptions) {
 	}
 	if (aggregateField !== undefined) {
 		normalizeFirestoreAggregateField(aggregateField);
+	}
+	if (filter !== undefined) {
+		normalizeFirestoreFilter(filter);
 	}
 	if (allowAggregateScanFallback !== undefined && typeof allowAggregateScanFallback !== 'boolean') {
 		throw new ActiveTsConfigurationError('Firestore adapter allowAggregateScanFallback must be a boolean.');
@@ -1326,6 +1399,7 @@ function validateFirestoreOptions(options: FirestoreStoreOptions) {
 		firestoreOptions: safeFirestoreOptions,
 		client,
 		aggregateField,
+		filter,
 		allowAggregateScanFallback,
 		cacheScope
 	} as FirestoreStoreOptions;
@@ -1422,6 +1496,15 @@ function normalizeFirestoreAggregateField(aggregateField: unknown) {
 	const sum = firestoreAggregateFieldMethod(aggregateField, 'sum', 'Firestore adapter aggregateField.sum');
 	const average = firestoreAggregateFieldMethod(aggregateField, 'average', 'Firestore adapter aggregateField.average');
 	return Object.freeze({ count, sum, average });
+}
+
+function normalizeFirestoreFilter(filter: unknown) {
+	if (!filter || (typeof filter !== 'object' && typeof filter !== 'function') || Array.isArray(filter)) {
+		throw new ActiveTsConfigurationError('Firestore adapter filter must be the SDK Filter class.');
+	}
+	const where = firestoreAggregateFieldMethod(filter, 'where', 'Firestore adapter filter.where');
+	const or = firestoreAggregateFieldMethod(filter, 'or', 'Firestore adapter filter.or');
+	return Object.freeze({ where, or });
 }
 
 function normalizeFirestoreObject(value: unknown, context: string) {

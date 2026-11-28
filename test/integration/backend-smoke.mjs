@@ -738,6 +738,15 @@ if (targets.has('datastore')) {
 		await adapter.delete(nativeMeta, 9001).catch(() => undefined);
 		await alternateNamespaceAdapter.delete(nativeMeta, 9001).catch(() => undefined);
 	}
+	// The SDK sends integer-valued numbers as 64-bit integers from their decimal
+	// string: 1e21 would be stored as 1 and 2 ** 60 would not read back.
+	try {
+		const unsafeIntegerValues = { id: 9002, exponent: 1e21, power: 2 ** 60, maximum: Number.MAX_VALUE, nested: { values: [2 ** 53, 7] } };
+		await adapter.create(nativeMeta, 9002, unsafeIntegerValues);
+		assert.deepEqual(await adapter.get(nativeMeta, 9002), unsafeIntegerValues);
+	} finally {
+		await adapter.delete(nativeMeta, 9002).catch(() => undefined);
+	}
 	try {
 		await diagnosticAdapter.create(nativeMeta, 1, { id: 1, handle: 'native-one', score: 11 });
 		const native = await diagnosticAdapter.query(nativeMeta, {
@@ -993,6 +1002,24 @@ if (targets.has('datastore')) {
 	} finally {
 		await diagnosticAdapter.delete(aggregateMeta, 1).catch(() => undefined);
 		await diagnosticAdapter.delete(aggregateMeta, 2).catch(() => undefined);
+	}
+	// Datastore orders null below every value, so a native upper bound on a
+	// typed field also matches null unless the adapter bounds it from below.
+	try {
+		await diagnosticAdapter.create(aggregateMeta, 1, { id: 1, score: 10 });
+		await diagnosticAdapter.create(aggregateMeta, 2, { id: 2, score: 30 });
+		await diagnosticAdapter.create(aggregateMeta, 3, { id: 3, score: null });
+		for (const op of ['<', '<=']) {
+			const below = await diagnosticAdapter.query(aggregateMeta, {
+				where: [{ field: 'score', op, value: 20 }],
+				or: [],
+				sort: [{ field: 'score', direction: 'asc' }],
+				include: []
+			});
+			assert.deepEqual(below.list.map((row) => row.id), [1], `score ${op} 20 must not match null`);
+		}
+	} finally {
+		await adapter.bulk.deleteMany(aggregateMeta, [1, 2, 3]).catch(() => undefined);
 	}
 	// Typed min/max use ordered lookups without the scan fallback. A projection
 	// returns an embedded property as one flat "a.b" property, so nested fields
@@ -1474,6 +1501,28 @@ if (targets.has('firestore')) {
 		} finally {
 			await adapter.delete(aggregateMeta, 1).catch(() => undefined);
 			await adapter.delete(aggregateMeta, 2).catch(() => undefined);
+		}
+		// Firestore `!=` and `in` never match null, while the portable operators
+		// do; the adapter adds an OR with `== null`.
+		try {
+			await adapter.create(nativeMeta, 1, { id: 1, status: 'open' });
+			await adapter.create(nativeMeta, 2, { id: 2, status: null });
+			await adapter.create(nativeMeta, 3, { id: 3, status: 'closed' });
+			await adapter.create(nativeMeta, 4, { id: 4 });
+			const statusIds = async (where) => (await adapter.query(nativeMeta, { where, or: [], sort: [], include: [] }))
+				.list.map((row) => row.id).sort((left, right) => left - right);
+			assert.deepEqual(await statusIds([{ field: 'status', op: '!=', value: 'open' }]), [2, 3]);
+			assert.deepEqual(await statusIds([{ field: 'status', op: 'in', value: ['open', null] }]), [1, 2]);
+			assert.deepEqual(
+				await adapter.aggregate(nativeMeta, {
+					where: [{ field: 'status', op: '!=', value: 'open' }],
+					or: [],
+					aggregates: [{ op: 'count', as: 'count' }]
+				}),
+				{ count: 2 }
+			);
+		} finally {
+			for (const id of [1, 2, 3, 4]) await adapter.delete(nativeMeta, id).catch(() => undefined);
 		}
 		try {
 			await BulkRecord.createMany([
