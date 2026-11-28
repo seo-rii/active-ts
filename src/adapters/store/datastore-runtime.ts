@@ -762,6 +762,19 @@ function applyDatastoreWhere(query: any, where: QueryPlan['where'][number]) {
 		throw new ActiveTsConfigurationError(`Datastore adapter does not support ${where.op} queries.`);
 	if (where.op === 'startsWith')
 		throw new ActiveTsConfigurationError('Datastore adapter does not support safe startsWith queries.');
+	if (where.op === '<' || where.op === '<=') {
+		// Datastore orders null below every other value and does not restrict an
+		// upper bound to the operand's type, so `< value` also matches null.
+		// Portable range filters never match null; bound the range from below.
+		return datastoreMethod(
+			normalizeDatastoreQuery(
+				datastoreMethod(query, 'filter', 'Datastore query.filter')(field, '>', null),
+				'Datastore query'
+			),
+			'filter',
+			'Datastore query.filter'
+		)(field, where.op, where.value);
+	}
 	return datastoreMethod(query, 'filter', 'Datastore query.filter')(field, where.op, where.value);
 }
 

@@ -1003,6 +1003,24 @@ if (targets.has('datastore')) {
 		await diagnosticAdapter.delete(aggregateMeta, 1).catch(() => undefined);
 		await diagnosticAdapter.delete(aggregateMeta, 2).catch(() => undefined);
 	}
+	// Datastore orders null below every value, so a native upper bound on a
+	// typed field also matches null unless the adapter bounds it from below.
+	try {
+		await diagnosticAdapter.create(aggregateMeta, 1, { id: 1, score: 10 });
+		await diagnosticAdapter.create(aggregateMeta, 2, { id: 2, score: 30 });
+		await diagnosticAdapter.create(aggregateMeta, 3, { id: 3, score: null });
+		for (const op of ['<', '<=']) {
+			const below = await diagnosticAdapter.query(aggregateMeta, {
+				where: [{ field: 'score', op, value: 20 }],
+				or: [],
+				sort: [{ field: 'score', direction: 'asc' }],
+				include: []
+			});
+			assert.deepEqual(below.list.map((row) => row.id), [1], `score ${op} 20 must not match null`);
+		}
+	} finally {
+		await adapter.bulk.deleteMany(aggregateMeta, [1, 2, 3]).catch(() => undefined);
+	}
 	try {
 		const created = await BulkRecord.createMany([
 			{ id: 71, handle: 'created-a', secret: 'alpha' },
