@@ -246,6 +246,7 @@ const STORE_CAPABILITY_KEYS: Array<keyof StoreCapabilities> = [
 	'optimisticLock',
 	'nullOperators',
 	'missingFieldNulls',
+	'utf16StringOrder',
 	'native',
 	'datastoreAncestor',
 	'datastoreReadPolicy'

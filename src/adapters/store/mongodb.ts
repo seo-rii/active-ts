@@ -627,6 +627,8 @@ export async function createMongoStoreAdapter(options: MongoStoreOptions): Promi
 				optimisticLock: true,
 				nullOperators: true,
 				missingFieldNulls: true,
+				// Simple collation compares UTF-8 bytes, i.e. Unicode code points.
+				utf16StringOrder: false,
 				native: transactionState === undefined
 			}),
 			async get(model, id, options) {

@@ -114,7 +114,10 @@ export class MemoryStoreAdapter implements StoreAdapter {
 	readonly datastoreProjectId?: string;
 	readonly datastoreDatabaseId?: string | null;
 	readonly datastoreKeyEncoding?: 'active-ts' | 'native';
-	readonly capabilities: Required<Omit<StoreCapabilities, 'datastoreAncestor' | 'datastoreReadPolicy'>> = {
+	// utf16StringOrder stays optional so subclasses that override the full
+	// capability literal keep compiling; omitting it means unsupported.
+	readonly capabilities: Required<Omit<StoreCapabilities, 'datastoreAncestor' | 'datastoreReadPolicy' | 'utf16StringOrder'>> &
+		Pick<StoreCapabilities, 'utf16StringOrder'> = {
 		or: true,
 		contains: false,
 		arrayContains: true,
@@ -134,6 +137,7 @@ export class MemoryStoreAdapter implements StoreAdapter {
 		optimisticLock: true,
 		nullOperators: true,
 		missingFieldNulls: true,
+		utf16StringOrder: true,
 		native: false
 	};
 	private readonly collections = new Map<string, Map<string, any>>();

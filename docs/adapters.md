@@ -60,6 +60,7 @@ and the distinction between support and rejection coverage.
 | `textContains` / `jsonContains` | Yes | No | No | No | No | No |
 | `startsWith` | Yes | Yes | Yes | No | No | Yes |
 | Missing fields match `isNull` | Yes | Yes | Yes | Yes | No | Yes |
+| JavaScript UTF-16 string order (`utf16StringOrder`) | Yes | Yes | No | No | No | Yes |
 | Aggregate helpers | Yes | Yes | Yes | Conditional | Yes | Yes; scalar metadata for min/max |
 | Transactions | Yes | Requires pool `connect()` | Requires client `startSession()` | Requires SDK `transaction()` | Yes | Yes |
 | Transaction point-read conflict detection | Yes | **No** | With transactions | With transactions | Yes | No |
@@ -80,6 +81,24 @@ JavaScript UTF-16 ordering, including supplementary Unicode characters, regardle
 of the database locale. The keys are computed in the query; existing JSON indexes
 and their uniqueness rules stay unchanged, and text ordering can require a sort
 rather than using those indexes. Native SQL keeps its chosen PostgreSQL collation.
+
+`capabilities.utf16StringOrder` marks a store whose portable string sorts,
+range filters, string `min`/`max`, and continuation cursors follow JavaScript's
+UTF-16 code-unit order, as Memory, PostgreSQL, and SQLite do. MongoDB,
+Datastore, and Firestore declare it `false`: they compare strings natively by
+Unicode code point, which is UTF-8 byte order. The two orders agree unless, at
+the first position where two strings differ, one has a character in
+U+E000–U+FFFF (private use, compatibility ideographs, presentation and
+halfwidth/fullwidth forms, U+FFFD) and the other a supplementary character
+(U+10000 and above, such as most emoji). By code point `'\uFFFF' < '\u{10000}'`;
+in UTF-16, where a supplementary character starts with a surrogate from U+D800,
+`'\u{10000}' < '\uE000'`. Equality is unaffected. On those stores, such strings
+sort, page, and form `min`/`max` in code-point order, and a range filter whose
+operand and a stored value fall on opposite sides of that boundary includes or
+omits the value differently from Memory. The per-adapter details follow the
+portable `orderBy()` notes under [aggregate optimization](#aggregate-optimization).
+`runStoreAdapterDifferentialContract()` skips the cases that depend on it
+unless both adapters declare it.
 
 PostgreSQL portable projection is deliberately unsupported in this version.
 Both model `query().select()` and a direct store query with `plan.select` must
@@ -1430,10 +1449,27 @@ materialized and declared in model metadata. Firestore and Datastore also reject
 `orderBy()`/`order()` on an inequality field; add the sort yourself so limited
 pages have a portable ordering contract.
 
+Datastore and Firestore compare strings in native queries by code point, not
+in JavaScript's UTF-16 order (`utf16StringOrder: false`). On Datastore, sorts,
+range filters, typed `min`/`max` lookups, and continuation cursors on
+`fieldType(path, 'string')` fields run natively in that order. A query that
+also has an untyped filter takes the portable candidate path and sorts in
+process in UTF-16 order, but a typed string range filter in it still selects
+candidates natively, so the result keeps only rows that match in both orders:
+`label < '\uE000'` omits `'\u{10000}'`. Query scan fallback and aggregate scan
+fallback compare in process. On Firestore every portable sort and range filter,
+and a single typed `min`/`max` lookup, run natively in code-point order;
+aggregate scan fallback compares in process. Firestore has no portable cursors.
+
 MongoDB portable `orderBy()` follows the same metadata requirement for non-id
 fields. MongoDB's native ordering for missing, null, arrays, objects, and mixed
 scalar values differs from active-ts' portable comparator, so declare sortable
 scalar fields with `fieldType()`.
+
+MongoDB's simple collation compares strings by their UTF-8 bytes, which is
+Unicode code-point order, so its sorts, range filters, and `$min`/`$max`
+aggregates place U+E000–U+FFFF above supplementary characters
+(`utf16StringOrder: false`). MongoDB has no portable cursors.
 
 Datastore typed `min`/`max` with a non-null `!=` operand requires
 `allowAggregateScanFallback: true` unless another predicate already excludes
