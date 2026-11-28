@@ -502,6 +502,9 @@ const storeParityOptions: StoreAdapterDifferentialOptions = {
 	modelName: 'packed_store_parity',
 	reference: new MemoryStoreAdapter()
 };
+const storeParityAggregateRequires: Array<keyof NonNullable<StoreAdapter['capabilities']>> =
+	storeParityFixture.aggregates[0].requires;
+const memoryUtf16StringOrder: boolean | undefined = new MemoryStoreAdapter().capabilities.utf16StringOrder;
 const cacheContract: typeof runCacheAdapterContract = runCacheAdapterContract;
 const searchContract: typeof runSearchAdapterContract = runSearchAdapterContract;
 const adapterSuite: typeof createAdapterContractSuite = createAdapterContractSuite;

@@ -143,6 +143,12 @@ export type StoreCapabilities = Partial<{
 	optimisticLock: boolean;
 	nullOperators: boolean;
 	missingFieldNulls: boolean;
+	/**
+	 * Portable string sorts, range filters, min/max, and cursors compare strings
+	 * by UTF-16 code units, like JavaScript. Stores that compare by Unicode code
+	 * point (UTF-8 byte order) order U+E000-U+FFFF above supplementary characters.
+	 */
+	utf16StringOrder: boolean;
 	native: boolean;
 	datastoreAncestor: boolean;
 	datastoreReadPolicy: boolean;

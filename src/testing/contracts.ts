@@ -132,6 +132,7 @@ const STORE_CONTRACT_CAPABILITY_KEYS = [
 	'optimisticLock',
 	'nullOperators',
 	'missingFieldNulls',
+	'utf16StringOrder',
 	'native',
 	'datastoreAncestor',
 	'datastoreReadPolicy'

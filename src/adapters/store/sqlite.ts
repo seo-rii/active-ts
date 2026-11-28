@@ -39,7 +39,8 @@ const capabilities: Readonly<StoreCapabilities> = Object.freeze({
 	startsWith: true, cursor: false, offset: true, select: true, nestedFields: true,
 	numericComparisons: true, aggregate: true, transaction: true, transactionConflictDetection: false,
 	savepoint: false, uniqueIndex: true, optimisticLock: true, nullOperators: true,
-	missingFieldNulls: true, native: false, datastoreAncestor: false, datastoreReadPolicy: false
+	missingFieldNulls: true, utf16StringOrder: true, native: false, datastoreAncestor: false,
+	datastoreReadPolicy: false
 });
 
 function normalizeOptions(options: SqliteStoreOptions): SqliteStoreOptions {

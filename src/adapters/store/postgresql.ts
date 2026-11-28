@@ -1395,6 +1395,7 @@ async function createPostgresStoreAdapterInternal(
 			optimisticLock: true,
 			nullOperators: true,
 			missingFieldNulls: true,
+			utf16StringOrder: true,
 			native: true
 		},
 		async get(model, id, readOptions) {

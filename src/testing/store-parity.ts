@@ -11,8 +11,12 @@ export type StoreParityFixture = {
 	seed: number;
 	rows: ParityRow[];
 	queries: { name: string; plan: QueryPlan; requires: Capability[] }[];
-	aggregates: { name: string; plan: AggregatePlan }[];
+	aggregates: { name: string; plan: AggregatePlan; requires: Capability[] }[];
 };
+
+// Cases whose result depends on how U+E000-U+FFFF compares with supplementary
+// characters: UTF-16 code units order them below, code points above.
+const UTF16_STRING_ORDER: Capability = 'utf16StringOrder';
 
 /** Reproducible boundary values plus a seeded insertion permutation. No adapter I/O. */
 export function createStoreParityFixture(seed = 0x5eed): StoreParityFixture {
@@ -39,13 +43,16 @@ export function createStoreParityFixture(seed = 0x5eed): StoreParityFixture {
 	const queries: StoreParityFixture['queries'] = [];
 	for (const direction of ['asc', 'desc'] as const) {
 		for (const field of ['label', 'mixed']) {
-			queries.push({ name: `${field}-${direction}`, plan: { ...base, sort: [{ field, direction }] }, requires: [] });
-			queries.push({ name: `${field}-${direction}-page`, plan: { ...base, sort: [{ field, direction }], offset: 2, limit: 3 }, requires: ['offset'] });
+			queries.push({ name: `${field}-${direction}`, plan: { ...base, sort: [{ field, direction }] }, requires: [UTF16_STRING_ORDER] });
+			// Only the descending label page reaches the rows the two orders swap.
+			const pageRequires: Capability[] = field === 'label' && direction === 'desc' ? ['offset', UTF16_STRING_ORDER] : ['offset'];
+			queries.push({ name: `${field}-${direction}-page`, plan: { ...base, sort: [{ field, direction }], offset: 2, limit: 3 }, requires: pageRequires });
 		}
 	}
 	for (const op of ['=', '<', '>', '<=', '>='] as const) {
 		for (const value of ['\uE000', '\u{10000}', 'a\0z']) {
-			queries.push({ name: `label-${op}-${JSON.stringify(value)}`, plan: { ...base, where: [...base.where, { field: 'label', op, value }] }, requires: [] });
+			const requires: Capability[] = op !== '=' && value !== 'a\0z' ? [UTF16_STRING_ORDER] : [];
+			queries.push({ name: `label-${op}-${JSON.stringify(value)}`, plan: { ...base, where: [...base.where, { field: 'label', op, value }] }, requires });
 		}
 	}
 	for (const value of [null, false, 0, '']) {
@@ -57,13 +64,13 @@ export function createStoreParityFixture(seed = 0x5eed): StoreParityFixture {
 	const aggregates: StoreParityFixture['aggregates'] = [{
 		name: 'string-extrema', plan: { where: base.where, or: [], aggregates: [
 			{ op: 'min', field: 'label', as: 'minimum' }, { op: 'max', field: 'label', as: 'maximum' }
-		] }
+		] }, requires: [UTF16_STRING_ORDER]
 	}];
 	for (let group = 0; group < averages.length; group++) {
 		aggregates.push({ name: `average_${group}`, plan: {
 			where: [{ field: 'group', op: '=', value: `average_${group}` }], or: [],
 			aggregates: [{ op: 'avg', field: 'score', as: 'mean' }, { op: 'count', as: 'count' }]
-		} });
+		}, requires: [] });
 	}
 	return { seed, rows, queries, aggregates };
 }
@@ -79,7 +86,9 @@ export type StoreAdapterDifferentialOptions = {
 /**
  * Compare portable boundary behavior with a reference adapter. Uses disposable
  * collections/tables, cleans up inserted rows, and leaves schema cleanup to the
- * caller's integration harness. Never pass a production resource.
+ * caller's integration harness. Never pass a production resource. Cases that
+ * need a capability either adapter does not declare, such as
+ * `utf16StringOrder`, are counted in `skipped`.
  */
 export async function runStoreAdapterDifferentialContract(candidate: StoreAdapter, options: StoreAdapterDifferentialOptions = {}) {
 	const fixture = createStoreParityFixture(options.seed);
@@ -94,6 +103,7 @@ export async function runStoreAdapterDifferentialContract(candidate: StoreAdapte
 	const stores: StoreAdapter[] = [reference, candidate];
 	const created: { store: StoreAdapter; id: number }[] = [];
 	const result = { seed: fixture.seed, queries: 0, aggregates: 0, pages: 0, rejections: 0, skipped: 0 };
+	const unsupported = (requires: Capability[]) => requires.some((flag) => stores.some((store) => store.capabilities?.[flag] !== true));
 	const check = async (name: string, work: () => Promise<void>) => {
 		try { await work(); }
 		catch (cause) { throw new Error(`Store parity ${candidate.kind} seed=${fixture.seed} case=${name}`, { cause }); }
@@ -110,7 +120,7 @@ export async function runStoreAdapterDifferentialContract(candidate: StoreAdapte
 			}
 		}
 		for (const entry of fixture.queries) {
-			if (entry.requires.some((flag) => stores.some((store) => store.capabilities?.[flag] !== true))) { result.skipped++; continue; }
+			if (unsupported(entry.requires)) { result.skipped++; continue; }
 			await check(entry.name, async () => {
 				const expected = await reference.query(model, entry.plan);
 				const actual = await candidate.query(model, entry.plan);
@@ -120,6 +130,7 @@ export async function runStoreAdapterDifferentialContract(candidate: StoreAdapte
 		}
 		if (stores.every((store) => store.capabilities?.aggregate && store.aggregate)) {
 			for (const entry of fixture.aggregates) {
+				if (unsupported(entry.requires)) { result.skipped++; continue; }
 				await check(entry.name, async () => assert.deepEqual(await candidate.aggregate!(model, entry.plan), await reference.aggregate!(model, entry.plan)));
 				result.aggregates++;
 			}
@@ -127,7 +138,10 @@ export async function runStoreAdapterDifferentialContract(candidate: StoreAdapte
 		for (const store of stores) {
 			if (!store.capabilities?.cursor) continue;
 			const plan: QueryPlan = { where: [{ field: 'group', op: '=', value: 'base' }], or: [], sort: [{ field: 'label', direction: 'asc' }], include: [] };
-			const expected = (await reference.query(model, plan)).list;
+			// Without UTF-16 string order on both sides, the label order itself is a
+			// skipped case; the pages must still reproduce the store's own order.
+			const source = unsupported([UTF16_STRING_ORDER]) ? store : reference;
+			const expected = (await source.query(model, plan)).list;
 			for (const limit of [1, 3, 7]) {
 				await check(`${store.kind}-cursor-${limit}`, async () => {
 					const rows: unknown[] = []; let cursor: string | undefined;

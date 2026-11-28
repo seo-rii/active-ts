@@ -1925,6 +1925,8 @@ function createDatastoreAdapter(
 			optimisticLock: transactionFactory !== undefined && !scopedTransaction,
 			nullOperators: true,
 			missingFieldNulls: true,
+			// Native string comparisons use UTF-8 byte (code point) order.
+			utf16StringOrder: false,
 			native: true,
 			datastoreAncestor: true,
 			datastoreReadPolicy: !scopedTransaction

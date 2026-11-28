@@ -464,6 +464,8 @@ export async function createFirestoreStoreAdapter(options: FirestoreStoreOptions
 			optimisticLock: true,
 			nullOperators: true,
 			missingFieldNulls: false,
+			// Native string comparisons use UTF-8 byte (code point) order.
+			utf16StringOrder: false,
 			native: true
 		},
 		async get(model, id, options) {
