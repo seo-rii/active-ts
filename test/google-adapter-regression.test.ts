@@ -15003,7 +15003,8 @@ test('Firestore min and max aggregate fallback avoids incompatible null in filte
 		}),
 		{ lowest: 7 }
 	);
-	assert.deepEqual(calls, ['where:score:in:[null,7]', 'select:id,score', 'get']);
+	// min/max ignore null values, so the null in-list entry is not sent.
+	assert.deepEqual(calls, ['where:score:in:[7]', 'select:id,score', 'get']);
 });
 
 test('Firestore adapter maps already-exists create errors to conflicts', async () => {

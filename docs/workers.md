@@ -48,3 +48,39 @@ A client can be shared when its transport supports that lifecycle. Bind models
 to an explicit request context with `Model.use(context)`; transaction handles,
 viewer state and request I/O belong to their own request. Do not update a global
 default context for concurrent requests.
+
+## Closing clients in Workers
+
+In Workers the convenience entries cannot load the optional SDK, so the
+application constructs the client and passes it in: to
+`active-ts/adapters/store/datastore-injected` for Datastore, or as `client` to
+`createFirestoreStoreAdapter()` from `active-ts/adapters/store/firestore`, which
+has no separate injected entry and does not load the SDK when given a client.
+The Workers fixture does not bundle the Firestore entry.
+
+An injected client stays owned by the application. The adapter's `close()`, and
+a Datastore namespace factory's `close()`, is then a no-op: it does not inspect,
+close or terminate the client, and the adapter keeps working afterwards. The
+Firestore guard that rejects operations once `close()` starts applies only to a
+client the adapter created, so it does not cover an injected client.
+
+Usually you create one client per isolate, in module scope or on first use, and
+reuse it with its adapters across that isolate's requests. Do not close it at
+the end of a request: other requests in the isolate may be using it, and calling
+`store.close?.()` per request releases nothing. Workers do not notify a Worker
+before its isolate is evicted, so a long-lived client simply stays open until
+the isolate goes away.
+
+If the application must close a client itself, for example one it created for a
+single request or one it is replacing, first stop routing work to every context
+and adapter that uses it and wait for their pending operations to settle. Then:
+
+- Datastore: `@google-cloud/datastore` has no top-level `close()`. Its GAPIC
+  clients, one per service and created on first use, live on the client's
+  `clients_` map. Await `close()` on each and leave the map in place, so that
+  later calls on the client reject instead of opening a new GAPIC client.
+- Firestore: call `terminate()`. The Firestore SDK leaves reads issued after
+  `terminate()` pending, surfacing only an unhandled rejection, while writes
+  reject. An adapter over an injected client still sends reads to it, so a read
+  that reaches a terminated client can hold the request until the runtime
+  cancels it.
