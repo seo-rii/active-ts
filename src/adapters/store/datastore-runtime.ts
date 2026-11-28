@@ -663,6 +663,9 @@ function datastoreProjectionFields(
 	const safeFields = datastoreFieldList(uniqueStrings(fields), context);
 	for (let fieldIndex = 0; fieldIndex < safeFields.length; fieldIndex++) {
 		const field = safeFields[fieldIndex];
+		// A projection returns an embedded property as one flat "a.b" property
+		// instead of a nested value, so dotted paths read the full entity.
+		if (field.includes('.')) return undefined;
 		for (let whereIndex = 0; whereIndex < where.length; whereIndex++) {
 			const condition = where[whereIndex];
 			if (condition.field !== field) continue;
