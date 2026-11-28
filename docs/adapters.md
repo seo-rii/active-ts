@@ -476,8 +476,8 @@ advancing SDK `endCursor` fails instead of returning a looping cursor. Cursor
 pagination is intentionally rejected for query scan fallback and buffered
 transaction queries because those paths merge or reorder rows outside one SDK
 query. The envelope's SHA-256 query fingerprint binds accidental reuse to the
-resolved project, database, namespace, model, query, read policy, and key
-encoding. It is a consistency check, not a keyed MAC or an authorization
+resolved project, database, namespace, model, query, read policy, key
+encoding, and `typedNumbers: 'double'` encoding. It is a consistency check, not a keyed MAC or an authorization
 mechanism; do not treat cursor contents as authenticated application input.
 Native query callbacks remain responsible for their own cursor format.
 
@@ -592,6 +592,54 @@ dual-writer window, or implement application-owned invalidation through the
 generic plugin, transaction, and outbox APIs before either side writes shared
 entities. Never assume that cache keys, codecs, or invalidation protocols are
 interchangeable merely because the backing Datastore keys match.
+
+Datastore orders values by type before value, and every integer sorts below
+every double, so the integer `10` sorts below the double `9.99`. The SDK writes
+an integer-valued JavaScript number as an integer and any other number as a
+double. With the default `typedNumbers: 'sdk'`, a `fieldType(path, 'number')`
+field holding both kinds of value is therefore compared by representation in
+native operations: `price > 9.5` over `9.99` and `10` returns only `9.99`, an
+ascending sort returns `10` before `9.99`, a typed `min('price')` returns `10`,
+and continuation cursors page in that order. Equality matches only a value of
+the same representation. Fields without `fieldType()` metadata are not
+affected: their portable candidate filters widen numeric bounds across both
+representations and compare in process.
+
+Set `typedNumbers: 'double'` to store every value of a typed number field as a
+Datastore double:
+
+```ts doc-test=fragment
+const datastore = await createDatastoreStoreAdapter({
+	client,
+	typedNumbers: 'double'
+});
+```
+
+The adapter then wraps every number at each `fieldType(path, 'number')` path
+with the client's `double()` helper. That includes nested dotted paths such as
+`metrics.score` and the numbers in an array at such a path, because Datastore
+indexes each array element under the property name. It applies to create,
+update, bulk upsert, buffered transaction writes, and the adapters that
+`createDatastoreNamespaceStoreFactory()` returns. Native `=`, `!=`, `<`, `<=`,
+`>`, `>=`, `in`, and `between` operands on those fields, including the filters
+of native aggregates and typed `min`/`max` lookups, are sent as doubles too. Native
+filters, sorts, extrema, and cursors then compare those values numerically. Reads
+decode doubles to ordinary JavaScript numbers. Untyped numbers keep the SDK
+encoding. The option requires a client with `double()`; an injected client
+without it is rejected when the adapter or namespace factory is created. Native
+query callbacks receive the plan's plain numbers and must wrap their own
+operands with `client.double()`. Continuation cursors are bound to the setting,
+so an adapter with the other setting rejects them.
+
+Enabling the option on a populated kind is a data migration. A double operand
+does not match an integer-encoded entity: after the switch, `price = 10` no
+longer finds an entity stored with the integer `10`, and range filters, sorts,
+and extrema still place such entities below every double. Rewrite every
+existing entity of each affected kind through an adapter with
+`typedNumbers: 'double'` before routing reads to it, for example by reading each
+row and writing it back with `update()` or `bulk.upsertMany()`, and keep every
+writer on the same setting. The ID repair helpers copy raw SDK entities without
+this option, so rewrite the rows they repair as well.
 
 If an ancestor-backed Datastore model declares search indexes, set
 `datastore.ancestorFields` to the payload fields needed by the ancestor resolver.

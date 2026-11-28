@@ -99,6 +99,7 @@ import {
 import {
 	iterableToArray,
 	MAP_DELETE,
+	MAP_ENTRIES,
 	MAP_GET,
 	MAP_HAS,
 	MAP_SET,
@@ -148,6 +149,16 @@ export type DatastoreGaxOptionsProvider = (
 	call: Readonly<{ operation: DatastoreRpcOperation }>
 ) => object | undefined;
 
+/**
+ * How values of `fieldType(path, 'number')` fields are stored. `'sdk'` (the
+ * default) keeps the SDK encoding: integer-valued numbers are integers and
+ * other numbers are doubles, and Datastore orders every integer below every
+ * double. `'double'` stores and queries every such value as a double, so
+ * native filters, sorts, min/max and cursors compare them numerically; rewrite
+ * existing entities before enabling it on a populated kind.
+ */
+export type DatastoreTypedNumberEncoding = 'sdk' | 'double';
+
 export type DatastoreStoreOptions = {
 	client?: any;
 	datastoreOptions?: Record<string, any>;
@@ -156,6 +167,7 @@ export type DatastoreStoreOptions = {
 	cacheScope?: string;
 	keyEncoding?: DatastoreKeyEncoding;
 	keySymbol?: symbol;
+	typedNumbers?: DatastoreTypedNumberEncoding;
 	allowAggregateScanFallback?: boolean;
 	allowQueryScanFallback?: boolean;
 	requireAncestorTransactionQueries?: boolean;
@@ -167,6 +179,7 @@ export type DatastoreNamespaceStoreFactoryOptions = {
 	cacheScopePrefix?: string;
 	keyEncoding?: DatastoreKeyEncoding;
 	keySymbol?: symbol;
+	typedNumbers?: DatastoreTypedNumberEncoding;
 	allowAggregateScanFallback?: boolean;
 	allowQueryScanFallback?: boolean;
 	requireAncestorTransactionQueries?: boolean;
@@ -470,6 +483,7 @@ const DATASTORE_OPTION_KEYS = [
 	'cacheScope',
 	'keyEncoding',
 	'keySymbol',
+	'typedNumbers',
 	'allowAggregateScanFallback',
 	'allowQueryScanFallback',
 	'requireAncestorTransactionQueries'
@@ -481,6 +495,7 @@ const DATASTORE_NAMESPACE_FACTORY_OPTION_KEYS = [
 	'cacheScopePrefix',
 	'keyEncoding',
 	'keySymbol',
+	'typedNumbers',
 	'allowAggregateScanFallback',
 	'allowQueryScanFallback',
 	'requireAncestorTransactionQueries'
@@ -743,6 +758,80 @@ function encodeDatastoreUnsafeIntegerNumbers(
 		defineDataProperty(copy, key, encoded, DATASTORE_ENCODED_PROPERTY);
 	}
 	return copy ?? value;
+}
+
+// Datastore orders every integer below every double, and the SDK sends
+// integer-valued numbers as integers. With typedNumbers: 'double', every number
+// Datastore indexes under a fieldType(path, 'number') property is a double:
+// the value at that path and, because Datastore indexes each array element
+// under the property name, the numbers inside arrays on the path.
+function encodeDatastoreTypedNumberFields(
+	model: ResolvedModelMeta,
+	data: unknown,
+	double: (value: number) => unknown
+): unknown {
+	let encoded = data;
+	for (const [field, type] of MAP_ENTRIES.call(model.fieldTypes) as Iterable<[string, FieldType]>) {
+		if (type !== 'number') continue;
+		encoded = encodeDatastoreNumbersAtPath(encoded, field.split('.'), 0, double);
+	}
+	return encoded;
+}
+
+function encodeDatastoreNumbersAtPath(
+	value: unknown,
+	path: string[],
+	depth: number,
+	double: (value: number) => unknown
+): unknown {
+	if (Array.isArray(value)) {
+		let copy: unknown[] | undefined;
+		for (let index = 0; index < value.length; index++) {
+			const item = value[index];
+			const encoded = encodeDatastoreNumbersAtPath(item, path, depth, double);
+			if (encoded === item && copy === undefined) continue;
+			if (copy === undefined) {
+				copy = [];
+				for (let previous = 0; previous < index; previous++) copy[previous] = value[previous];
+			}
+			copy[index] = encoded;
+		}
+		return copy ?? value;
+	}
+	if (depth === path.length) return typeof value === 'number' ? double(value) : value;
+	if (!value || typeof value !== 'object' || !isPlainDatastoreRecord(value)) return value;
+	const record = value as Record<string, unknown>;
+	const key = path[depth];
+	if (!Object.prototype.hasOwnProperty.call(record, key)) return value;
+	const item = record[key];
+	const encoded = encodeDatastoreNumbersAtPath(item, path, depth + 1, double);
+	if (encoded === item) return value;
+	const copy: Record<string, unknown> = {};
+	const keys = Object.keys(record);
+	for (let index = 0; index < keys.length; index++) {
+		const property = keys[index];
+		defineDataProperty(copy, property, property === key ? encoded : record[property], DATASTORE_ENCODED_PROPERTY);
+	}
+	return copy;
+}
+
+// Query operands on a double-encoded typed number field must be doubles too,
+// or Datastore compares them as integers below every stored double.
+function encodeDatastoreTypedNumberOperands(
+	model: ResolvedModelMeta,
+	where: QueryPlan['where'][number],
+	double: (value: number) => unknown
+): QueryPlan['where'][number] {
+	if (MAP_GET.call(model.fieldTypes, where.field) !== 'number') return where;
+	const encode = (value: unknown) => typeof value === 'number' ? double(value) : value;
+	if (where.op === 'in' && Array.isArray(where.value)) {
+		const values: unknown[] = [];
+		for (let index = 0; index < where.value.length; index++) values[index] = encode(where.value[index]);
+		return { ...where, value: values };
+	}
+	const encoded = { ...where, value: encode(where.value) };
+	if (Object.prototype.hasOwnProperty.call(where, 'value2')) encoded.value2 = encode(where.value2);
+	return encoded;
 }
 
 function applyDatastoreWhere(query: any, where: QueryPlan['where'][number]) {
@@ -1461,6 +1550,7 @@ export async function createDatastoreStoreAdapter(
 	}
 	const clientKeySymbol = datastoreMember(rawClient, 'KEY', 'Datastore adapter client.KEY');
 	const client = normalizeDatastoreClient(rawClient);
+	assertDatastoreTypedNumberClient(options.typedNumbers, client);
 	const configuredKeySymbol = keySymbol ?? (typeof clientKeySymbol === 'symbol' ? clientKeySymbol : undefined);
 	const datastoreKeySymbol = configuredKeySymbol ?? await resolveDatastoreKeySymbol(loadSdk);
 	const supportsKeyOnlyProjection = configuredKeySymbol !== undefined;
@@ -1537,6 +1627,9 @@ export async function createDatastoreNamespaceStoreFactory(
 			| DatastoreKeyEncoding
 			| undefined,
 		keySymbol: ownFactoryOptionValue(record, 'keySymbol', 'Datastore namespace store factory option') as symbol | undefined,
+		typedNumbers: ownFactoryOptionValue(record, 'typedNumbers', 'Datastore namespace store factory option') as
+			| DatastoreTypedNumberEncoding
+			| undefined,
 		allowAggregateScanFallback: ownFactoryOptionValue(
 			record,
 			'allowAggregateScanFallback',
@@ -1598,6 +1691,7 @@ export async function createDatastoreNamespaceStoreFactory(
 		client: rawClient,
 		keyEncoding: options.keyEncoding ?? 'active-ts',
 		keySymbol,
+		typedNumbers: options.typedNumbers,
 		allowAggregateScanFallback: options.allowAggregateScanFallback,
 		allowQueryScanFallback: options.allowQueryScanFallback,
 		requireAncestorTransactionQueries: options.requireAncestorTransactionQueries,
@@ -1722,11 +1816,24 @@ function createDatastoreAdapter(
 		const ancestor = datastoreAncestorForWrite(model, id, data, ancestorOverride);
 		return makeEntityKeyFromAncestor(model, id, ancestor);
 	};
+	const typedNumberDouble = options.typedNumbers === 'double' ? rootClient.double : undefined;
 	// The SDK encodes every integer-valued number as a 64-bit integer from its
 	// decimal string, so 1e21 is stored as 1 and 2 ** 60 as a different integer.
 	// Store those numbers as doubles, the exact JavaScript value.
-	const encodeDatastoreValue = (value: unknown, context: string) =>
-		encodeDatastoreUnsafeIntegerNumbers(value, rootClient.double, context);
+	const encodeDatastoreValue = (model: ResolvedModelMeta, value: unknown, context: string) =>
+		encodeDatastoreUnsafeIntegerNumbers(
+			typedNumberDouble ? encodeDatastoreTypedNumberFields(model, value, typedNumberDouble) : value,
+			rootClient.double,
+			context
+		);
+	const nativeWhere = (model: ResolvedModelMeta, where: QueryPlan['where'][number]) =>
+		typedNumberDouble ? encodeDatastoreTypedNumberOperands(model, where, typedNumberDouble) : where;
+	// Every stored value of a double-encoded typed number field is a double, so
+	// an exact native bound selects candidates without omitting a match.
+	const candidateWhere = (model: ResolvedModelMeta, where: QueryPlan['where'][number]) =>
+		typedNumberDouble && MAP_GET.call(model.fieldTypes, where.field) === 'number'
+			? [where]
+			: datastoreCandidateWhere(where);
 	const entityPayloadFromAncestor = (
 		model: ResolvedModelMeta,
 		id: EntityId,
@@ -1736,7 +1843,7 @@ function createDatastoreAdapter(
 		const excludeFromIndexes = datastoreExcludeFromIndexes(model);
 		const entity: { key: unknown; data: any; excludeFromIndexes?: string[] } = {
 			key: makeEntityKeyFromAncestor(model, id, ancestor),
-			data: encodeDatastoreValue(data, `${model.name} Datastore entity`)
+			data: encodeDatastoreValue(model, data, `${model.name} Datastore entity`)
 		};
 		if (excludeFromIndexes) entity.excludeFromIndexes = excludeFromIndexes;
 		return entity;
@@ -3209,6 +3316,7 @@ function createDatastoreAdapter(
 						: datastoreKeyWithNamespace(ancestor, adapterNamespace, 'Datastore continuation cursor ancestor'),
 					keyEncoding,
 					keyOnlyProjection,
+					typedNumbers: options.typedNumbers,
 					readOptions: sdkReadOptions
 				});
 					const startCursor = plan.cursor === undefined
@@ -3234,9 +3342,9 @@ function createDatastoreAdapter(
 				);
 			}
 			for (const where of plan.where) {
-				const nativeWhere = portableScalarFilter ? datastoreCandidateWhere(where) : [where];
-				for (const candidate of nativeWhere)
-					query = normalizeDatastoreQuery(applyDatastoreWhere(query, candidate), 'Datastore query');
+				const nativeWheres = portableScalarFilter ? candidateWhere(model, where) : [where];
+				for (const candidate of nativeWheres)
+					query = normalizeDatastoreQuery(applyDatastoreWhere(query, nativeWhere(model, candidate)), 'Datastore query');
 			}
 			// Portable filtering reads every candidate page and sorts in process. A
 			// native order would also drop entities missing an untyped sort field.
@@ -3606,7 +3714,10 @@ function createDatastoreAdapter(
 							);
 						}
 						for (const where of plan.where)
-							query = normalizeDatastoreQuery(applyDatastoreWhere(query, where), 'Datastore aggregate query');
+							query = normalizeDatastoreQuery(
+								applyDatastoreWhere(query, nativeWhere(model, where)),
+								'Datastore aggregate query'
+							);
 						let aggregateQuery = normalizeDatastoreQuery(
 							client.createAggregationQuery!(query),
 							'Datastore aggregate query'
@@ -3694,7 +3805,10 @@ function createDatastoreAdapter(
 							);
 						}
 						for (const where of plan.where)
-							query = normalizeDatastoreQuery(applyDatastoreWhere(query, where), 'Datastore aggregate min/max query');
+							query = normalizeDatastoreQuery(
+								applyDatastoreWhere(query, nativeWhere(model, where)),
+								'Datastore aggregate min/max query'
+							);
 						const field = minMaxOptions.field;
 						if (!minMaxOptions.alreadyExcludesNull) {
 							query = normalizeDatastoreQuery(
@@ -4327,6 +4441,7 @@ function validateDatastoreOptions(options: DatastoreStoreOptions) {
 	const cacheScope = ownFactoryOptionValue(record, 'cacheScope', 'Datastore adapter option');
 	const keyEncoding = ownFactoryOptionValue(record, 'keyEncoding', 'Datastore adapter option');
 	const keySymbol = ownFactoryOptionValue(record, 'keySymbol', 'Datastore adapter option');
+	const typedNumbers = ownFactoryOptionValue(record, 'typedNumbers', 'Datastore adapter option');
 	const client = ownFactoryOptionValue(record, 'client', 'Datastore adapter option');
 	const allowAggregateScanFallback = ownFactoryOptionValue(
 		record,
@@ -4371,8 +4486,14 @@ function validateDatastoreOptions(options: DatastoreStoreOptions) {
 	if (keySymbol !== undefined && typeof keySymbol !== 'symbol') {
 		throw new ActiveTsConfigurationError('Datastore adapter keySymbol must be a symbol.');
 	}
+	if (typedNumbers !== undefined && typedNumbers !== 'sdk' && typedNumbers !== 'double') {
+		throw new ActiveTsConfigurationError('Datastore adapter typedNumbers must be "sdk" or "double".');
+	}
 	if (client !== undefined) {
-		normalizeDatastoreClient(client);
+		assertDatastoreTypedNumberClient(
+			typedNumbers as DatastoreTypedNumberEncoding | undefined,
+			normalizeDatastoreClient(client)
+		);
 	}
 	if (allowAggregateScanFallback !== undefined && typeof allowAggregateScanFallback !== 'boolean') {
 		throw new ActiveTsConfigurationError('Datastore adapter allowAggregateScanFallback must be a boolean.');
@@ -4389,12 +4510,24 @@ function validateDatastoreOptions(options: DatastoreStoreOptions) {
 		cacheScope,
 		keyEncoding,
 		keySymbol,
+		typedNumbers,
 		client,
 		allowAggregateScanFallback,
 		allowQueryScanFallback,
 		requireAncestorTransactionQueries,
 		gaxOptions: gaxOptions as DatastoreGaxOptionsProvider | undefined
 	} as DatastoreStoreOptions;
+}
+
+// Double-encoded typed numbers are written and queried through the SDK's
+// double() wrapper; without it the values would silently stay integers.
+function assertDatastoreTypedNumberClient(
+	typedNumbers: DatastoreTypedNumberEncoding | undefined,
+	client: Pick<NormalizedDatastoreClient, 'double'>
+) {
+	if (typedNumbers === 'double' && client.double === undefined) {
+		throw new ActiveTsConfigurationError('Datastore adapter typedNumbers: "double" requires client.double().');
+	}
 }
 
 function datastoreTransactionOverlayAncestorMatches(
@@ -5139,10 +5272,11 @@ function datastoreContinuationQueryFingerprint(
 		ancestor: DatastoreKey | undefined;
 		keyEncoding: DatastoreKeyEncoding;
 		keyOnlyProjection: boolean;
+		typedNumbers: DatastoreTypedNumberEncoding | undefined;
 		readOptions: DatastoreSdkReadOptions | undefined;
 	}
 ) {
-	const identity = {
+	const identity: Record<string, unknown> = {
 		projectId: physical.projectId,
 		databaseId: physical.databaseId,
 		namespace: physical.namespace,
@@ -5156,6 +5290,9 @@ function datastoreContinuationQueryFingerprint(
 		select: plan.select,
 		readOptions: physical.readOptions
 	};
+	// Cursors from the default encoding keep their fingerprint; a double-encoded
+	// adapter sends different operands, so its cursors do not cross over.
+	if (physical.typedNumbers === 'double') identity.typedNumbers = 'double';
 	return createHash('sha256')
 		.update(datastoreCanonicalValue(identity, 'Datastore continuation cursor query'))
 		.digest('base64url');
